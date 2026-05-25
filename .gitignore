@@ -16,3 +16,4 @@ signal_state.json
 *.bak
 cornix_agent.backup_*.py
 python.empty.bak
+start_mini.bat

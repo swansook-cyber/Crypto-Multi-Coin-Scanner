@@ -103,15 +103,25 @@ No-trade filter behavior:
 
 ## Optional Gemini Commentary
 
-Gemini only summarizes the reason after the scanner has already built a rule-based signal.
+Gemini is optional and may have API costs or quota limits. The scanner is designed to run rule-based without Gemini.
+
+Gemini is never called for every coin or every candidate. The rule engine scans first, then Gemini is called only when a signal already passed the high-quality filters and:
+
+- `confidence >= AI_MIN_CONFIDENCE`
+- `risk_reward >= MIN_RR`
+- `AI_MAX_CALLS_PER_RUN` has not been reached
+
+If Gemini returns 403, 429, or timeout-like errors, AI commentary is disabled for that scan run and the system uses a rule-based summary instead. It does not retry aggressively.
 
 ```env
-USE_AI_COMMENTARY=1
+AI_COMMENTARY=0
+AI_MIN_CONFIDENCE=85
+AI_MAX_CALLS_PER_RUN=1
 GEMINI_API_KEY=your_gemini_key
 GEMINI_MODEL=gemini-2.5-flash
 ```
 
-Leave `GEMINI_API_KEY` empty for rule-based mode.
+Leave `AI_COMMENTARY=0` or `GEMINI_API_KEY` empty for rule-based mode.
 
 ## Optional Fear & Greed Filter
 
@@ -217,7 +227,7 @@ No signals:
 
 Gemini errors:
 
-- Leave `GEMINI_API_KEY` empty to run rule-based only
+- Leave `AI_COMMENTARY=0` or `GEMINI_API_KEY` empty to run rule-based only
 - The scanner does not require AI to work
 
 Charts not sent:

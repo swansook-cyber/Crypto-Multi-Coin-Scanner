@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from requests import Timeout
 from typing import Any
 
 import matplotlib
@@ -108,7 +109,9 @@ class ScannerConfig:
     confidence_override_delta: int
     run_once: bool
     dry_run: bool
-    use_ai_commentary: bool
+    ai_commentary: bool
+    ai_min_confidence: int
+    ai_max_calls_per_run: int
     send_telegram: bool
     send_daily_summary: bool
     close_delay_seconds: int
@@ -148,7 +151,9 @@ class ScannerConfig:
             confidence_override_delta=env_int("CONFIDENCE_OVERRIDE_DELTA", 12),
             run_once=env_bool("RUN_ONCE", False),
             dry_run=env_bool("DRY_RUN", False),
-            use_ai_commentary=env_bool("USE_AI_COMMENTARY", True),
+            ai_commentary=env_bool("AI_COMMENTARY", env_bool("USE_AI_COMMENTARY", False)),
+            ai_min_confidence=env_int("AI_MIN_CONFIDENCE", 85),
+            ai_max_calls_per_run=env_int("AI_MAX_CALLS_PER_RUN", 1),
             send_telegram=env_bool("SEND_TELEGRAM", True),
             send_daily_summary=env_bool("SEND_DAILY_SUMMARY", True),
             close_delay_seconds=env_int("CLOSE_DELAY_SECONDS", 20),
@@ -498,12 +503,31 @@ class AICommentaryEngine:
     def __init__(self, config: ScannerConfig) -> None:
         self.config = config
         self.client = None
-        if config.use_ai_commentary and config.gemini_api_key and genai:
+        self.calls_this_run = 0
+        self.disabled_for_run = False
+        if config.ai_commentary and config.gemini_api_key and genai:
             self.client = genai.Client(api_key=config.gemini_api_key)
 
-    def summarize(self, signal: TradeSignal) -> str:
+    def reset_run_budget(self) -> None:
+        self.calls_this_run = 0
+        self.disabled_for_run = False
+
+    def can_summarize(self, signal: TradeSignal, config: ScannerConfig) -> bool:
         if not self.client:
-            return ""
+            return False
+        if self.disabled_for_run:
+            return False
+        if signal.confidence < config.ai_min_confidence:
+            LOGGER.info("AI skipped: confidence below AI_MIN_CONFIDENCE")
+            return False
+        if self.calls_this_run >= config.ai_max_calls_per_run:
+            LOGGER.info("AI skipped: max calls reached")
+            return False
+        return True
+
+    def summarize(self, signal: TradeSignal) -> str:
+        if not self.client or self.disabled_for_run:
+            return self.rule_based_summary(signal)
         prompt = f"""
 Summarize this Binance Futures rule-based signal in Thai in one short sentence.
 Do not change direction, entry, TP, SL, RR, or confidence. Do not add financial guarantees.
@@ -516,8 +540,29 @@ Regime: {signal.regime}
 Volume spike: {signal.volume_spike}
 Reason: {signal.reason}
 """
-        response = self.client.models.generate_content(model=self.config.gemini_model, contents=prompt)
-        return (response.text or "").strip().replace("\n", " ")[:240]
+        try:
+            self.calls_this_run += 1
+            response = self.client.models.generate_content(model=self.config.gemini_model, contents=prompt)
+            return (response.text or "").strip().replace("\n", " ")[:240] or self.rule_based_summary(signal)
+        except Timeout as exc:
+            self.disabled_for_run = True
+            LOGGER.warning("Gemini timeout; AI commentary disabled for this run: %s", exc)
+            return self.rule_based_summary(signal)
+        except Exception as exc:
+            message = str(exc)
+            if "403" in message or "429" in message or "timeout" in message.lower():
+                self.disabled_for_run = True
+                LOGGER.warning("Gemini limited/blocked; AI commentary disabled for this run: %s", exc)
+                return self.rule_based_summary(signal)
+            LOGGER.warning("AI commentary failed: %s", exc)
+            return self.rule_based_summary(signal)
+
+    @staticmethod
+    def rule_based_summary(signal: TradeSignal) -> str:
+        return (
+            f"Rule-based: {signal.regime}, confidence {signal.confidence}%, "
+            f"RR {signal.rr:.2f}, {signal.reason}"
+        )[:240]
 
 
 class TradeJournalLogger:
@@ -792,6 +837,7 @@ class AgentRunner:
 
     def scan_once(self) -> None:
         self.maybe_send_daily_summary()
+        self.ai_commentary.reset_run_budget()
         if self.config.use_fear_greed:
             try:
                 self.fear_greed_value = self.data_client.fetch_fear_greed()
@@ -817,25 +863,29 @@ class AgentRunner:
             return
 
         signal = self.risk_manager.apply(signal)
-        try:
-            signal.ai_commentary = self.ai_commentary.summarize(signal)
-        except Exception as exc:
-            LOGGER.warning("AI commentary failed for %s: %s", symbol, exc)
-
-        self.journal.log_signal(signal)
+        signal.ai_commentary = self.ai_commentary.rule_based_summary(signal)
 
         if signal.score < self.config.score_threshold:
+            self.journal.log_signal(signal)
             LOGGER.info("%s logged only: score %s below threshold %s", symbol, signal.score, self.config.score_threshold)
             return
         if signal.confidence < self.config.min_confidence:
+            self.journal.log_signal(signal)
             LOGGER.info("%s logged only: confidence %s below minimum %s", symbol, signal.confidence, self.config.min_confidence)
             return
         if signal.rr < self.config.min_rr:
+            self.journal.log_signal(signal)
             LOGGER.info("%s logged only: RR %.2f below minimum %.2f", symbol, signal.rr, self.config.min_rr)
             return
         if self.is_in_cooldown(signal):
+            self.journal.log_signal(signal)
             LOGGER.info("%s skipped: cooldown active", symbol)
             return
+
+        if self.ai_commentary.can_summarize(signal, self.config):
+            signal.ai_commentary = self.ai_commentary.summarize(signal)
+
+        self.journal.log_signal(signal)
 
         try:
             self.chart_exporter.export(symbol, df_1h, signal)
