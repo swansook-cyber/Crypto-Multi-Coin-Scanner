@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+config.bat
+config_template_improved.bat
+cornix_agent.log
+signal_state.json
+
+*.bak
+cornix_agent.backup_*.py
+python.empty.bak
