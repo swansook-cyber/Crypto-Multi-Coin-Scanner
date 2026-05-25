@@ -74,6 +74,14 @@ SEND_TELEGRAM=0
 RUN_ONCE=1
 ```
 
+To test Telegram delivery directly without waiting for a trading signal:
+
+```bat
+python test_telegram.py
+```
+
+This sends a test-only message and, if present, `charts/test_chart.png`. It does not use Gemini and does not write a fake signal to `logs/signals.csv`.
+
 ## Important Config
 
 ```env
