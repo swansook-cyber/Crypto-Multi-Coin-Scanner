@@ -151,8 +151,8 @@ class ScannerConfig:
             confidence_override_delta=env_int("CONFIDENCE_OVERRIDE_DELTA", 12),
             run_once=env_bool("RUN_ONCE", False),
             dry_run=env_bool("DRY_RUN", False),
-            ai_commentary=env_bool("AI_COMMENTARY", env_bool("USE_AI_COMMENTARY", False)),
-            ai_min_confidence=env_int("AI_MIN_CONFIDENCE", 85),
+            ai_commentary=env_bool("AI_COMMENTARY", env_bool("USE_AI_COMMENTARY", True)),
+            ai_min_confidence=env_int("AI_MIN_CONFIDENCE", 88),
             ai_max_calls_per_run=env_int("AI_MAX_CALLS_PER_RUN", 1),
             send_telegram=env_bool("SEND_TELEGRAM", True),
             send_daily_summary=env_bool("SEND_DAILY_SUMMARY", True),
@@ -507,20 +507,27 @@ class AICommentaryEngine:
         self.client = None
         self.calls_this_run = 0
         self.disabled_for_run = False
+        self.unavailable_logged = False
         if config.ai_commentary and config.gemini_api_key and genai:
             self.client = genai.Client(api_key=config.gemini_api_key)
 
     def reset_run_budget(self) -> None:
         self.calls_this_run = 0
         self.disabled_for_run = False
+        self.unavailable_logged = False
 
     def can_summarize(self, signal: TradeSignal, config: ScannerConfig) -> bool:
         if not self.client:
+            if config.ai_commentary and not self.unavailable_logged:
+                LOGGER.info("AI skipped: Gemini unavailable")
+                self.unavailable_logged = True
             return False
         if self.disabled_for_run:
             return False
         if signal.confidence < config.ai_min_confidence:
             LOGGER.info("AI skipped: confidence below AI_MIN_CONFIDENCE")
+            return False
+        if signal.rr < config.min_rr:
             return False
         if self.calls_this_run >= config.ai_max_calls_per_run:
             LOGGER.info("AI skipped: max calls reached")
@@ -529,7 +536,7 @@ class AICommentaryEngine:
 
     def summarize(self, signal: TradeSignal) -> str:
         if not self.client or self.disabled_for_run:
-            return self.rule_based_summary(signal)
+            return ""
         prompt = f"""
 Summarize this Binance Futures rule-based signal in Thai in one short sentence.
 Do not change direction, entry, TP, SL, RR, or confidence. Do not add financial guarantees.
@@ -545,26 +552,24 @@ Reason: {signal.reason}
         try:
             self.calls_this_run += 1
             response = self.client.models.generate_content(model=self.config.gemini_model, contents=prompt)
-            return (response.text or "").strip().replace("\n", " ")[:240] or self.rule_based_summary(signal)
-        except Timeout as exc:
+            return (response.text or "").strip().replace("\n", " ")[:240]
+        except Timeout:
             self.disabled_for_run = True
-            LOGGER.warning("Gemini timeout; AI commentary disabled for this run: %s", exc)
-            return self.rule_based_summary(signal)
+            LOGGER.info("AI skipped: Gemini unavailable")
+            return ""
         except Exception as exc:
             message = str(exc)
-            if "403" in message or "429" in message or "timeout" in message.lower():
+            if (
+                "403" in message
+                or "429" in message
+                or "timeout" in message.lower()
+                or "quota" in message.lower()
+            ):
                 self.disabled_for_run = True
-                LOGGER.warning("Gemini limited/blocked; AI commentary disabled for this run: %s", exc)
-                return self.rule_based_summary(signal)
-            LOGGER.warning("AI commentary failed: %s", exc)
-            return self.rule_based_summary(signal)
-
-    @staticmethod
-    def rule_based_summary(signal: TradeSignal) -> str:
-        return (
-            f"Rule-based: {signal.regime}, confidence {signal.confidence}%, "
-            f"RR {signal.rr:.2f}, {signal.reason}"
-        )[:240]
+                LOGGER.info("AI skipped: Gemini unavailable")
+                return ""
+            LOGGER.info("AI skipped: Gemini unavailable")
+            return ""
 
 
 class TradeJournalLogger:
@@ -894,7 +899,7 @@ class AgentRunner:
             return
 
         signal = self.risk_manager.apply(signal)
-        signal.ai_commentary = self.ai_commentary.rule_based_summary(signal)
+        signal.ai_commentary = ""
 
         if signal.score < self.config.score_threshold:
             self.journal.log_signal(signal)

@@ -119,17 +119,28 @@ Gemini is never called for every coin or every candidate. The rule engine scans 
 - `risk_reward >= MIN_RR`
 - `AI_MAX_CALLS_PER_RUN` has not been reached
 
-If Gemini returns 403, 429, or timeout-like errors, AI commentary is disabled for that scan run and the system uses a rule-based summary instead. It does not retry aggressively.
+If Gemini returns 403, 429, quota, or timeout-like errors, AI commentary is disabled for that scan run. The Telegram alert still shows the rule-based `Reason`, but it will not show a duplicated AI summary. It does not retry aggressively.
 
 ```env
-AI_COMMENTARY=0
-AI_MIN_CONFIDENCE=85
+AI_COMMENTARY=1
+AI_MIN_CONFIDENCE=88
 AI_MAX_CALLS_PER_RUN=1
 GEMINI_API_KEY=your_gemini_key
 GEMINI_MODEL=gemini-2.5-flash
 ```
 
 Leave `AI_COMMENTARY=0` or `GEMINI_API_KEY` empty for rule-based mode.
+
+## Recommended Low-Cost AI Settings
+
+```env
+AI_COMMENTARY=1
+GEMINI_MODEL=gemini-2.5-flash
+AI_MIN_CONFIDENCE=88
+AI_MAX_CALLS_PER_RUN=1
+```
+
+`gemini-2.5-flash` is the practical choice for this scanner because the AI task is only short commentary. Do not call AI for every coin or every candidate; the rule engine is the decision maker, and AI is only a commentary layer for the strongest setups. Keeping `AI_MAX_CALLS_PER_RUN=1` helps control cost, quota usage, and API spam.
 
 ## Optional Fear & Greed Filter
 
