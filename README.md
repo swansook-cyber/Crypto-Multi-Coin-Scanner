@@ -215,6 +215,8 @@ Columns:
 - closed_at
 - max_profit_pct
 - max_drawdown_pct
+- outcome_alert_sent
+- outcome_alert_at
 
 ## Review Signals
 
@@ -223,6 +225,14 @@ Run:
 ```bat
 python review_signals.py
 ```
+
+To update outcomes and send Telegram alerts for newly closed signals:
+
+```bat
+python review_signals.py --notify
+```
+
+For daily use, schedule this command every 15 minutes with Windows Task Scheduler or cron. It does not use Gemini.
 
 It reports:
 
@@ -249,7 +259,12 @@ Config:
 
 ```env
 REVIEW_LOOKAHEAD_HOURS=24
+SEND_OUTCOME_ALERTS=1
 ```
+
+If `SEND_TELEGRAM=0` or `SEND_OUTCOME_ALERTS=0`, review still updates `logs/signals.csv` but does not send outcome alerts.
+
+Outcome alerts are sent once only. After an alert is sent, `outcome_alert_sent=1` and `outcome_alert_at` is recorded.
 
 ## Troubleshooting
 

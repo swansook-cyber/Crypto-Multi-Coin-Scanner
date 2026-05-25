@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import os
 import time
+import argparse
+import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,12 +23,17 @@ BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 OUTCOME_COLUMNS = {
     "result": "OPEN",
     "hit_target": "",
     "closed_at": "",
     "max_profit_pct": "",
     "max_drawdown_pct": "",
+    "outcome_alert_sent": 0,
+    "outcome_alert_at": "",
 }
 
 
@@ -45,6 +53,13 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def build_session() -> requests.Session:
     retry = Retry(
         total=3,
@@ -62,12 +77,101 @@ def build_session() -> requests.Session:
     return session
 
 
+def display_symbol(symbol: str) -> str:
+    cleaned = str(symbol).strip().upper().replace("BINANCE:", "").replace(".P", "")
+    return f"{cleaned}.P"
+
+
+def format_price(value: Any) -> str:
+    price = float(value)
+    if price >= 1000:
+        return f"{price:.2f}"
+    if price >= 10:
+        return f"{price:.3f}"
+    if price >= 1:
+        return f"{price:.4f}"
+    return f"{price:.6f}"
+
+
+def format_period(start_iso: Any, end_iso: Any) -> str:
+    start = pd.to_datetime(start_iso, utc=True, errors="coerce")
+    end = pd.to_datetime(end_iso, utc=True, errors="coerce")
+    if pd.isna(start) or pd.isna(end):
+        return "-"
+    total_minutes = max(0, int((end - start).total_seconds() // 60))
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if hours and minutes:
+        return f"{hours} hr {minutes} min"
+    if hours:
+        return f"{hours} hr"
+    return f"{minutes} min"
+
+
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     for column, default in OUTCOME_COLUMNS.items():
         if column not in df.columns:
             df[column] = default
         df[column] = df[column].astype("object")
     return df
+
+
+def alert_already_sent(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def build_outcome_alert(row: pd.Series) -> str:
+    side = str(row["side"]).upper()
+    result = str(row["result"]).upper()
+    hit_target = str(row.get("hit_target", "")).upper()
+    entry = float(row["entry"])
+    stop_loss = float(row["stop_loss"])
+    tp1 = float(row["tp1"])
+    tp2 = float(row["tp2"])
+    period = format_period(row.get("timestamp"), row.get("closed_at"))
+
+    if result == "WIN":
+        target_price = tp2 if hit_target == "TP2" else tp1
+        profit_pct = (target_price - entry) / entry * 100 if side == "LONG" else (entry - target_price) / entry * 100
+        return (
+            "✅ TAKE PROFIT HIT\n\n"
+            f"🪙 {display_symbol(row['symbol'])}\n"
+            f"📈 Direction: {side}\n"
+            f"🎯 Hit: {hit_target}\n"
+            f"💰 Entry: {format_price(entry)}\n"
+            f"🎯 TP1: {format_price(tp1)}\n"
+            f"🎯 TP2: {format_price(tp2)}\n"
+            f"🛑 SL: {format_price(stop_loss)}\n"
+            f"📊 Profit: +{profit_pct:.2f}%\n"
+            f"⏱ Period: {period}"
+        )
+
+    loss_pct = (entry - stop_loss) / entry * 100 if side == "LONG" else (stop_loss - entry) / entry * 100
+    return (
+        "🛑 STOP LOSS HIT\n\n"
+        f"🪙 {display_symbol(row['symbol'])}\n"
+        f"📈 Direction: {side}\n"
+        f"💰 Entry: {format_price(entry)}\n"
+        f"🛑 SL: {format_price(stop_loss)}\n"
+        f"📉 Loss: -{abs(loss_pct):.2f}%\n"
+        f"⏱ Period: {period}"
+    )
+
+
+def send_telegram_alert(session: requests.Session, message: str) -> bool:
+    if not env_bool("SEND_TELEGRAM", True) or not env_bool("SEND_OUTCOME_ALERTS", True):
+        return False
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        print("Outcome alert skipped: Telegram token/chat id missing")
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    response = session.post(url, data={"chat_id": chat_id, "text": message}, timeout=20)
+    if response.status_code != 200:
+        print(f"Outcome alert failed: {response.text}")
+        return False
+    return True
 
 
 def fetch_klines(session: requests.Session, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
@@ -192,7 +296,14 @@ def print_summary(df: pd.DataFrame) -> None:
         print(f"{row['symbol']} {row['side']} {row['result']} {target}".rstrip())
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Review signal outcomes from Binance Futures candles.")
+    parser.add_argument("--notify", action="store_true", help="Send Telegram alerts for newly closed outcomes.")
+    return parser.parse_args()
+
+
 def main() -> int:
+    args = parse_args()
     load_dotenv(BASE_DIR / ".env")
     lookahead_hours = env_int("REVIEW_LOOKAHEAD_HOURS", 24)
 
@@ -214,7 +325,8 @@ def main() -> int:
     session = build_session()
 
     for index, row in df.iterrows():
-        if str(row.get("result", "OPEN")).upper() != "OPEN":
+        previous_result = str(row.get("result", "OPEN")).upper()
+        if previous_result != "OPEN":
             continue
         try:
             outcome = review_signal(session, row, lookahead_hours)
@@ -227,6 +339,16 @@ def main() -> int:
         df.at[index, "closed_at"] = outcome.closed_at
         df.at[index, "max_profit_pct"] = f"{outcome.max_profit_pct:.2f}"
         df.at[index, "max_drawdown_pct"] = f"{outcome.max_drawdown_pct:.2f}"
+        updated_row = df.loc[index]
+        if (
+            args.notify
+            and outcome.result in {"WIN", "LOSS"}
+            and not alert_already_sent(row.get("outcome_alert_sent", 0))
+        ):
+            sent = send_telegram_alert(session, build_outcome_alert(updated_row))
+            if sent:
+                df.at[index, "outcome_alert_sent"] = 1
+                df.at[index, "outcome_alert_at"] = datetime.now(timezone.utc).isoformat()
         time.sleep(0.2)
 
     df.to_csv(JOURNAL, index=False)
