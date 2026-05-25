@@ -3,7 +3,10 @@ __pycache__/
 *.pyc
 
 config.bat
+.env
+*.env
 config_template_improved.bat
+*.log
 cornix_agent.log
 signal_state.json
 
