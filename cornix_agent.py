@@ -213,6 +213,8 @@ class SymbolFormatter:
     @staticmethod
     def to_binance_symbol(symbol: str) -> str:
         cleaned = symbol.strip().upper()
+        if "=" in cleaned:
+            cleaned = cleaned.split("=", 1)[1]
         cleaned = cleaned.replace("BINANCE:", "").replace(".P", "")
         cleaned = cleaned.replace("/", "").replace("-", "")
         return cleaned
@@ -569,6 +571,7 @@ class TradeJournalLogger:
     FIELDNAMES = [
         "timestamp", "symbol", "side", "entry", "stop_loss", "tp1", "tp2",
         "risk_reward", "confidence", "market_regime", "volume_spike", "score", "ai_summary",
+        "result", "hit_target", "closed_at", "max_profit_pct", "max_drawdown_pct",
     ]
 
     def __init__(self, path: Path = SIGNAL_JOURNAL) -> None:
@@ -578,6 +581,29 @@ class TradeJournalLogger:
             with self.path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
                 writer.writeheader()
+        else:
+            self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        try:
+            df = pd.read_csv(self.path)
+        except pd.errors.EmptyDataError:
+            df = pd.DataFrame(columns=self.FIELDNAMES)
+        changed = False
+        defaults = {
+            "result": "OPEN",
+            "hit_target": "",
+            "closed_at": "",
+            "max_profit_pct": "",
+            "max_drawdown_pct": "",
+        }
+        for column in self.FIELDNAMES:
+            if column not in df.columns:
+                df[column] = defaults.get(column, "")
+                changed = True
+        if changed:
+            df = df[self.FIELDNAMES]
+            df.to_csv(self.path, index=False)
 
     def log_signal(self, signal: TradeSignal) -> None:
         with self.path.open("a", newline="", encoding="utf-8") as handle:
@@ -597,6 +623,11 @@ class TradeJournalLogger:
                     "volume_spike": "YES" if signal.volume_spike else "NO",
                     "score": signal.score,
                     "ai_summary": signal.ai_commentary,
+                    "result": "OPEN",
+                    "hit_target": "",
+                    "closed_at": "",
+                    "max_profit_pct": "",
+                    "max_drawdown_pct": "",
                 }
             )
 

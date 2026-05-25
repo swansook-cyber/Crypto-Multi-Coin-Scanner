@@ -23,7 +23,7 @@ This project does not auto trade. It is a Telegram signal assistant only.
 - `cornix_agent.py` - main scanner
 - `.env.example` - environment config template
 - `requirements.txt` - Python dependencies
-- `review_signals.py` - journal analytics utility
+- `review_signals.py` - outcome tracker for WIN / LOSS / OPEN
 - `logs/signals.csv` - generated signal journal
 - `charts/` - generated chart screenshots
 - `signal_state.json` - generated cooldown and summary state
@@ -199,6 +199,11 @@ Columns:
 - volume_spike
 - score
 - ai_summary
+- result
+- hit_target
+- closed_at
+- max_profit_pct
+- max_drawdown_pct
 
 ## Review Signals
 
@@ -211,12 +216,29 @@ python review_signals.py
 It reports:
 
 - signal count
+- wins
+- losses
+- open trades
+- win rate
 - average RR
-- win-rate proxy
 - best coin
 - worst coin
+- a compact summary table such as `BTCUSDT LONG WIN TP2`
 
-The win-rate number is a journal proxy based on logged RR, not actual exchange fills.
+The review command updates `logs/signals.csv` in place. It uses Binance Futures candles only and does not use Gemini.
+
+Outcome logic:
+
+- LONG: TP1/TP2 before SL is `WIN`; SL before TP is `LOSS`
+- SHORT: TP1/TP2 below entry before SL is `WIN`; SL before TP is `LOSS`
+- Conservative mode: if a candle touches TP and SL in the same candle, SL wins first
+- If no TP/SL is touched within `REVIEW_LOOKAHEAD_HOURS`, result stays `OPEN`
+
+Config:
+
+```env
+REVIEW_LOOKAHEAD_HOURS=24
+```
 
 ## Troubleshooting
 
