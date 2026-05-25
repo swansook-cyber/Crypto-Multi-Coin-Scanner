@@ -1,89 +1,230 @@
 # Crypto Multi-Coin Scanner
 
-AI-assisted Binance Futures signal scanner for 10 symbols. The trading decision is rule-based; Gemini is optional and only adds a short commentary after a setup already passes scoring.
+Telegram signal assistant for Binance Futures. The scanner is rule-based and quality-first. Gemini commentary is optional and never places trades or overrides the rule engine.
 
-## Features
+## What It Does
 
-- Binance Futures candles via `fapi.binance.com`
-- Binance symbol format: `BTCUSDT`
-- TradingView display format: `BINANCE:BTCUSDT.P`
-- Scans only closed 1H candles
-- 1H trend confirmation plus 15m entry confirmation
-- ATR-based TP/SL, not fixed percentages
-- Support and resistance from recent candles
-- Market regime detection: `Trending`, `Sideway`, `High Volatility`
-- Volume spike filter
-- Score threshold and cooldown to prevent duplicate alerts
-- Risk manager display: risk amount, estimated position size, RR
-- Telegram messages formatted for manual review and Cornix-style fields
-- Rule-based mode works without Gemini API key
+- Scans 10 Binance Futures symbols using `BTCUSDT` format
+- Shows TradingView symbols like `BINANCE:BTCUSDT.P`
+- Waits for closed 1H candles, then uses 15m confirmation
+- Sends Telegram alerts only for high-quality signals
+- Logs every generated candidate signal to `logs/signals.csv`
+- Sends a daily Telegram summary at UTC day rollover
+- Exports chart screenshots to `charts/` and sends them with alerts
+- Uses ATR for TP/SL, not fixed percentages
+- Applies no-trade filters for Sideway, low volume, and unusually low ATR
+- Uses cooldown to avoid spam, with override only for much higher confidence
+- Optional Fear & Greed filter can reduce long/short scores
+
+This project does not auto trade. It is a Telegram signal assistant only.
+
+## Files
+
+- `cornix_agent.py` - main scanner
+- `.env.example` - environment config template
+- `requirements.txt` - Python dependencies
+- `review_signals.py` - journal analytics utility
+- `logs/signals.csv` - generated signal journal
+- `charts/` - generated chart screenshots
+- `signal_state.json` - generated cooldown and summary state
 
 ## Setup
 
 1. Install Python 3.12.
-2. Copy `config.example.bat` to `config.bat`.
-3. Edit `config.bat`.
-
-Required for live Telegram delivery:
-
-```bat
-set TELEGRAM_BOT_TOKEN=your_bot_token
-set TELEGRAM_CHAT_ID=your_chat_id
-```
-
-Optional Gemini commentary:
-
-```bat
-set GEMINI_API_KEY=your_gemini_key
-set GEMINI_MODEL=gemini-2.5-flash
-```
-
-Run:
+2. Copy `.env.example` to `.env`.
+3. Edit `.env`.
+4. Run:
 
 ```bat
 run_cornix_agent.bat
 ```
 
-## Important Settings
+Manual install:
 
 ```bat
-set WATCHLIST=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,LTCUSDT,ZECUSDT,HYPEUSDT,LABUSDT
-set SCORE_THRESHOLD=70
-set MIN_RR=1.2
-set COOLDOWN_MINUTES=180
-set RUN_ONCE=0
-set DRY_RUN=0
-set SEND_TELEGRAM=1
-set ACCOUNT_BALANCE_USDT=1000
-set RISK_PER_TRADE_PCT=1
-set MAX_LEVERAGE=10
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements.txt
+python cornix_agent.py
 ```
 
-Use `RUN_ONCE=1` and `DRY_RUN=1` for testing without waiting for the next 1H close or sending Telegram.
+## Telegram Bot Setup
 
-## Signal Logic
+1. Open Telegram and message `@BotFather`.
+2. Create a bot with `/newbot`.
+3. Copy the bot token into `.env`:
 
-The scanner builds a candidate signal only when:
+```env
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+```
 
-- 1H trend aligns with EMA20/EMA50
-- 15m entry confirms with EMA9/EMA21 and RSI
-- Volume spike or breakout improves score
-- Market regime is acceptable
-- ATR is available for TP/SL
-- Score is at least `SCORE_THRESHOLD`
-- RR is at least `MIN_RR`
-- Symbol/direction is not inside cooldown
+4. Send a message to your bot or add it to your channel/group.
+5. Find your chat ID and add:
 
-Gemini cannot override the rule engine. It only writes a brief reason after a signal passes.
+```env
+TELEGRAM_CHAT_ID=your_chat_id_here
+SEND_TELEGRAM=1
+```
 
-## Files
+For testing without sending alerts:
 
-- `cornix_agent.py` - main scanner
-- `config.example.bat` - safe config template
-- `requirements.txt` - Python dependencies
-- `signal_state.json` - cooldown state, created at runtime
-- `cornix_agent.log` - runtime log, created at runtime
+```env
+DRY_RUN=1
+SEND_TELEGRAM=0
+RUN_ONCE=1
+```
+
+## Important Config
+
+```env
+WATCHLIST=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,LTCUSDT,ZECUSDT,HYPEUSDT,LABUSDT
+SCORE_THRESHOLD=70
+MIN_CONFIDENCE=75
+MIN_RR=1.8
+COOLDOWN_MINUTES=240
+CONFIDENCE_OVERRIDE_DELTA=12
+MIN_VOLUME_RATIO=0.80
+MIN_ATR_PCT=0.35
+VOLUME_SPIKE_MULTIPLIER=1.20
+```
+
+Quality filter behavior:
+
+- If score is below `SCORE_THRESHOLD`, the candidate is logged only
+- If confidence is below `MIN_CONFIDENCE`, it is logged only
+- If RR is below `MIN_RR`, it is logged only
+- Telegram receives only high-quality signals
+
+No-trade filter behavior:
+
+- Sideway market: skip
+- Low volume ratio: skip
+- ATR below `MIN_ATR_PCT`: skip
+
+## Optional Gemini Commentary
+
+Gemini only summarizes the reason after the scanner has already built a rule-based signal.
+
+```env
+USE_AI_COMMENTARY=1
+GEMINI_API_KEY=your_gemini_key
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+Leave `GEMINI_API_KEY` empty for rule-based mode.
+
+## Optional Fear & Greed Filter
+
+Uses the public Alternative.me Fear & Greed API.
+
+```env
+USE_FEAR_GREED=1
+FEAR_GREED_GREED_THRESHOLD=75
+FEAR_GREED_FEAR_THRESHOLD=25
+FEAR_GREED_SCORE_ADJUSTMENT=8
+```
+
+Extreme greed reduces long score. Extreme fear reduces short score.
+
+## Telegram Alert Format
+
+Alerts are mobile-friendly and include:
+
+- Long/Short
+- Entry
+- SL
+- TP1/TP2
+- RR
+- Confidence
+- Market regime
+- Volume spike
+- Support/Resistance
+- Reason
+- Chart screenshot
+
+Example:
+
+```text
+🚀 LONG SIGNAL
+🪙 BTCUSDT.P
+
+💰 Entry: 68420
+🛑 SL: 67180
+
+🎯 TP1: 69700
+🎯 TP2: 71000
+
+📈 RR: 1:2.10
+🔥 Confidence: 82%
+```
+
+## Trade Journal
+
+Every generated candidate signal is appended to:
+
+```text
+logs/signals.csv
+```
+
+Columns:
+
+- timestamp
+- symbol
+- side
+- entry
+- stop_loss
+- tp1
+- tp2
+- risk_reward
+- confidence
+- market_regime
+- volume_spike
+- score
+- ai_summary
+
+## Review Signals
+
+Run:
+
+```bat
+python review_signals.py
+```
+
+It reports:
+
+- signal count
+- average RR
+- win-rate proxy
+- best coin
+- worst coin
+
+The win-rate number is a journal proxy based on logged RR, not actual exchange fills.
+
+## Troubleshooting
+
+No Telegram messages:
+
+- Check `SEND_TELEGRAM=1`
+- Check `DRY_RUN=0`
+- Check bot token and chat ID
+- Check `cornix_agent.log`
+
+No signals:
+
+- This is expected when quality filters are strict
+- Try `RUN_ONCE=1` and inspect logs
+- Lower `SCORE_THRESHOLD`, `MIN_CONFIDENCE`, or `MIN_RR` only if you accept more noise
+
+Gemini errors:
+
+- Leave `GEMINI_API_KEY` empty to run rule-based only
+- The scanner does not require AI to work
+
+Charts not sent:
+
+- Check that `matplotlib` installed
+- Check `charts/` for generated PNG files
 
 ## Safety
 
-This tool is for analysis support only. Futures trading is high risk. Always review the chart, market conditions, position size, and leverage before using any signal.
+Futures trading is high risk. This project is for analysis support only. It does not place orders, manage exchange accounts, or guarantee outcomes. Always review the chart and manage risk manually.

@@ -2,12 +2,14 @@
 """
 Crypto Multi-Coin Scanner for Binance Futures.
 
-The rule engine owns signal decisions. Gemini/OpenAI-style AI commentary is
-optional and only summarizes the reason after the score already passes.
+This is a Telegram signal assistant only. It does not place orders. The rule
+engine owns the signal decision; Gemini is optional commentary after a setup is
+already scored.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import math
@@ -18,8 +20,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pandas as pd
 import requests
+from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     from google import genai
@@ -28,8 +37,15 @@ except Exception:  # pragma: no cover - optional dependency path
 
 
 BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / "logs"
+CHART_DIR = BASE_DIR / "charts"
 STATE_FILE = BASE_DIR / "signal_state.json"
-LOG_FILE = BASE_DIR / "cornix_agent.log"
+LOG_FILE = LOG_DIR / "cornix_agent.log"
+SIGNAL_JOURNAL = LOG_DIR / "signals.csv"
+
+LOG_DIR.mkdir(exist_ok=True)
+CHART_DIR.mkdir(exist_ok=True)
+load_dotenv(BASE_DIR / ".env")
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -67,11 +83,7 @@ def setup_logging() -> logging.Logger:
     logger = logging.getLogger("cornix_agent")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
@@ -90,16 +102,27 @@ LOGGER = setup_logging()
 class ScannerConfig:
     watchlist: list[str]
     score_threshold: int
+    min_confidence: int
+    min_rr: float
     cooldown_minutes: int
+    confidence_override_delta: int
     run_once: bool
     dry_run: bool
     use_ai_commentary: bool
     send_telegram: bool
+    send_daily_summary: bool
     close_delay_seconds: int
+    request_delay_seconds: float
     risk_per_trade_pct: float
     account_balance_usdt: float
-    min_rr: float
     max_leverage: int
+    min_volume_ratio: float
+    min_atr_pct: float
+    volume_spike_multiplier: float
+    use_fear_greed: bool
+    fear_greed_greed_threshold: int
+    fear_greed_fear_threshold: int
+    fear_greed_score_adjustment: int
     gemini_api_key: str
     gemini_model: str
     telegram_bot_token: str
@@ -119,16 +142,27 @@ class ScannerConfig:
         return cls(
             watchlist=watchlist[:10],
             score_threshold=env_int("SCORE_THRESHOLD", 70),
-            cooldown_minutes=env_int("COOLDOWN_MINUTES", 180),
+            min_confidence=env_int("MIN_CONFIDENCE", 75),
+            min_rr=env_float("MIN_RR", 1.8),
+            cooldown_minutes=env_int("COOLDOWN_MINUTES", 240),
+            confidence_override_delta=env_int("CONFIDENCE_OVERRIDE_DELTA", 12),
             run_once=env_bool("RUN_ONCE", False),
             dry_run=env_bool("DRY_RUN", False),
             use_ai_commentary=env_bool("USE_AI_COMMENTARY", True),
             send_telegram=env_bool("SEND_TELEGRAM", True),
+            send_daily_summary=env_bool("SEND_DAILY_SUMMARY", True),
             close_delay_seconds=env_int("CLOSE_DELAY_SECONDS", 20),
+            request_delay_seconds=env_float("REQUEST_DELAY_SECONDS", 0.5),
             risk_per_trade_pct=env_float("RISK_PER_TRADE_PCT", 1.0),
             account_balance_usdt=env_float("ACCOUNT_BALANCE_USDT", 1000.0),
-            min_rr=env_float("MIN_RR", 1.2),
             max_leverage=env_int("MAX_LEVERAGE", 10),
+            min_volume_ratio=env_float("MIN_VOLUME_RATIO", 0.80),
+            min_atr_pct=env_float("MIN_ATR_PCT", 0.35),
+            volume_spike_multiplier=env_float("VOLUME_SPIKE_MULTIPLIER", 1.20),
+            use_fear_greed=env_bool("USE_FEAR_GREED", False),
+            fear_greed_greed_threshold=env_int("FEAR_GREED_GREED_THRESHOLD", 75),
+            fear_greed_fear_threshold=env_int("FEAR_GREED_FEAR_THRESHOLD", 25),
+            fear_greed_score_adjustment=env_int("FEAR_GREED_SCORE_ADJUSTMENT", 8),
             gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip(),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -144,6 +178,7 @@ class MarketRegime:
 
 @dataclass
 class TradeSignal:
+    timestamp: datetime
     symbol: str
     tradingview_symbol: str
     direction: str
@@ -157,12 +192,16 @@ class TradeSignal:
     support: float
     resistance: float
     regime: str
+    regime_details: str
     volume_spike: bool
+    volume_ratio: float
+    atr_pct: float
     reason: str
     ai_commentary: str = ""
     risk_amount_usdt: float = 0.0
     position_size_coin: float = 0.0
     position_value_usdt: float = 0.0
+    chart_path: Path | None = None
 
 
 class SymbolFormatter:
@@ -177,14 +216,45 @@ class SymbolFormatter:
     def to_tradingview_symbol(symbol: str) -> str:
         return f"BINANCE:{SymbolFormatter.to_binance_symbol(symbol)}.P"
 
+    @staticmethod
+    def to_display_symbol(symbol: str) -> str:
+        return f"{SymbolFormatter.to_binance_symbol(symbol)}.P"
+
+
+def build_retry_session() -> requests.Session:
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
 
 class MarketDataClient:
     BASE_URL = "https://fapi.binance.com/fapi/v1/klines"
+    FEAR_GREED_URL = "https://api.alternative.me/fng/"
 
-    def __init__(self, session: requests.Session | None = None) -> None:
-        self.session = session or requests.Session()
+    def __init__(self, request_delay_seconds: float, session: requests.Session | None = None) -> None:
+        self.request_delay_seconds = request_delay_seconds
+        self.session = session or build_retry_session()
+        self._last_request_ts = 0.0
+
+    def _rate_limit_pause(self) -> None:
+        elapsed = time.time() - self._last_request_ts
+        if elapsed < self.request_delay_seconds:
+            time.sleep(self.request_delay_seconds - elapsed)
+        self._last_request_ts = time.time()
 
     def fetch_klines(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        self._rate_limit_pause()
         params = {"symbol": SymbolFormatter.to_binance_symbol(symbol), "interval": interval, "limit": limit}
         response = self.session.get(self.BASE_URL, params=params, timeout=15)
         response.raise_for_status()
@@ -217,6 +287,16 @@ class MarketDataClient:
         if len(closed) < limit:
             closed = df.iloc[:-1]
         return closed.tail(limit).reset_index(drop=True)
+
+    def fetch_fear_greed(self) -> int | None:
+        self._rate_limit_pause()
+        response = self.session.get(self.FEAR_GREED_URL, params={"limit": 1, "format": "json"}, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        try:
+            return int(data["data"][0]["value"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
 
 
 class IndicatorEngine:
@@ -272,11 +352,12 @@ class MarketRegimeDetector:
 
 
 class SignalScorer:
-    def __init__(self, support_resistance: SupportResistanceEngine, regime_detector: MarketRegimeDetector) -> None:
+    def __init__(self, config: ScannerConfig, support_resistance: SupportResistanceEngine, regime_detector: MarketRegimeDetector) -> None:
+        self.config = config
         self.support_resistance = support_resistance
         self.regime_detector = regime_detector
 
-    def score(self, symbol: str, df_1h: pd.DataFrame, df_15m: pd.DataFrame) -> TradeSignal | None:
+    def score(self, symbol: str, df_1h: pd.DataFrame, df_15m: pd.DataFrame, fear_greed: int | None = None) -> TradeSignal | None:
         latest_1h = df_1h.iloc[-1]
         latest_15m = df_15m.iloc[-1]
         previous_20 = df_1h.iloc[-21:-1]
@@ -285,36 +366,41 @@ class SignalScorer:
 
         price = float(latest_1h["close"])
         atr = float(latest_1h["atr14"])
+        atr_pct = float(latest_1h["atr_pct"])
+        volume_sma = float(latest_1h["volume_sma20"])
+        volume_ratio = float(latest_1h["volume"] / volume_sma) if volume_sma > 0 else 0.0
         if math.isnan(atr) or atr <= 0:
+            return None
+
+        if self._is_no_trade(regime.name, volume_ratio, atr_pct):
+            LOGGER.info(
+                "%s NO TRADE: regime=%s volume_ratio=%.2f atr_pct=%.2f",
+                symbol,
+                regime.name,
+                volume_ratio,
+                atr_pct,
+            )
             return None
 
         trend_long = latest_1h["close"] > latest_1h["ema20"] > latest_1h["ema50"]
         trend_short = latest_1h["close"] < latest_1h["ema20"] < latest_1h["ema50"]
         entry_long = latest_15m["close"] > latest_15m["ema9"] > latest_15m["ema21"] and latest_15m["rsi14"] >= 52
         entry_short = latest_15m["close"] < latest_15m["ema9"] < latest_15m["ema21"] and latest_15m["rsi14"] <= 48
-        volume_spike = latest_1h["volume"] >= latest_1h["volume_sma20"] * 1.2
+        volume_spike = volume_ratio >= self.config.volume_spike_multiplier
         breakout_long = latest_1h["close"] > previous_20["high"].max()
         breakout_short = latest_1h["close"] < previous_20["low"].min()
 
-        long_score = self._direction_score(
-            trend=trend_long,
-            entry=entry_long,
-            volume_spike=volume_spike,
-            breakout=breakout_long,
-            regime=regime.name,
-            rsi=float(latest_1h["rsi14"]),
-            direction="LONG",
-        )
-        short_score = self._direction_score(
-            trend=trend_short,
-            entry=entry_short,
-            volume_spike=volume_spike,
-            breakout=breakout_short,
-            regime=regime.name,
-            rsi=float(latest_1h["rsi14"]),
-            direction="SHORT",
-        )
+        long_score = self._direction_score(trend_long, entry_long, volume_spike, breakout_long, regime.name, float(latest_1h["rsi14"]), "LONG")
+        short_score = self._direction_score(trend_short, entry_short, volume_spike, breakout_short, regime.name, float(latest_1h["rsi14"]), "SHORT")
 
+        if fear_greed is not None:
+            if fear_greed >= self.config.fear_greed_greed_threshold:
+                long_score -= self.config.fear_greed_score_adjustment
+            if fear_greed <= self.config.fear_greed_fear_threshold:
+                short_score -= self.config.fear_greed_score_adjustment
+
+        long_score = max(0, long_score)
+        short_score = max(0, short_score)
         if long_score < 1 and short_score < 1:
             return None
 
@@ -322,26 +408,27 @@ class SignalScorer:
         score = max(long_score, short_score)
         if direction == "LONG":
             entry = price
-            sl = entry - atr * 1.15
-            tp1 = entry + atr * 1.15
-            tp2 = entry + atr * 1.90
+            sl = entry - atr * 1.0
+            tp1 = entry + atr * 1.2
+            tp2 = entry + atr * 2.0
         else:
             entry = price
-            sl = entry + atr * 1.15
-            tp1 = entry - atr * 1.15
-            tp2 = entry - atr * 1.90
+            sl = entry + atr * 1.0
+            tp1 = entry - atr * 1.2
+            tp2 = entry - atr * 2.0
 
         risk = abs(entry - sl)
         reward = abs(tp2 - entry)
         rr = reward / risk if risk > 0 else 0
-        confidence = min(95, max(1, score + (5 if rr >= 1.4 else 0)))
+        confidence = min(95, max(1, score + (8 if rr >= self.config.min_rr else 0)))
         reason = (
-            f"{regime.name}; 1H trend {'ok' if (trend_long if direction == 'LONG' else trend_short) else 'weak'}; "
-            f"15m confirmation {'ok' if (entry_long if direction == 'LONG' else entry_short) else 'weak'}; "
-            f"volume spike {'yes' if volume_spike else 'no'}; RR {rr:.2f}"
+            f"EMA {'bullish' if direction == 'LONG' else 'bearish'} trend on 1H; "
+            f"15m confirmation {'confirmed' if (entry_long if direction == 'LONG' else entry_short) else 'weak'}; "
+            f"volume ratio {volume_ratio:.2f}; ATR {atr_pct:.2f}%; RR {rr:.2f}"
         )
 
         return TradeSignal(
+            timestamp=datetime.now(timezone.utc),
             symbol=symbol,
             tradingview_symbol=SymbolFormatter.to_tradingview_symbol(symbol),
             direction=direction,
@@ -355,20 +442,22 @@ class SignalScorer:
             support=support,
             resistance=resistance,
             regime=regime.name,
+            regime_details=regime.details,
             volume_spike=volume_spike,
+            volume_ratio=volume_ratio,
+            atr_pct=atr_pct,
             reason=reason,
         )
 
+    def _is_no_trade(self, regime: str, volume_ratio: float, atr_pct: float) -> bool:
+        return (
+            regime == "Sideway"
+            or volume_ratio < self.config.min_volume_ratio
+            or atr_pct < self.config.min_atr_pct
+        )
+
     @staticmethod
-    def _direction_score(
-        trend: bool,
-        entry: bool,
-        volume_spike: bool,
-        breakout: bool,
-        regime: str,
-        rsi: float,
-        direction: str,
-    ) -> int:
+    def _direction_score(trend: bool, entry: bool, volume_spike: bool, breakout: bool, regime: str, rsi: float, direction: str) -> int:
         score = 0
         if trend:
             score += 30
@@ -383,8 +472,7 @@ class SignalScorer:
         elif regime == "High Volatility":
             score -= 10
         elif regime == "Sideway":
-            score -= 5
-
+            score -= 15
         if direction == "LONG" and 50 <= rsi <= 70:
             score += 10
         if direction == "SHORT" and 30 <= rsi <= 50:
@@ -400,11 +488,9 @@ class RiskManager:
         risk_amount = self.config.account_balance_usdt * self.config.risk_per_trade_pct / 100
         per_coin_risk = abs(signal.entry - signal.sl)
         size_coin = risk_amount / per_coin_risk if per_coin_risk > 0 else 0.0
-        position_value = size_coin * signal.entry
-
         signal.risk_amount_usdt = risk_amount
         signal.position_size_coin = size_coin
-        signal.position_value_usdt = position_value
+        signal.position_value_usdt = size_coin * signal.entry
         return signal
 
 
@@ -430,48 +516,142 @@ Regime: {signal.regime}
 Volume spike: {signal.volume_spike}
 Reason: {signal.reason}
 """
-        response = self.client.models.generate_content(
-            model=self.config.gemini_model,
-            contents=prompt,
-        )
+        response = self.client.models.generate_content(model=self.config.gemini_model, contents=prompt)
         return (response.text or "").strip().replace("\n", " ")[:240]
+
+
+class TradeJournalLogger:
+    FIELDNAMES = [
+        "timestamp", "symbol", "side", "entry", "stop_loss", "tp1", "tp2",
+        "risk_reward", "confidence", "market_regime", "volume_spike", "score", "ai_summary",
+    ]
+
+    def __init__(self, path: Path = SIGNAL_JOURNAL) -> None:
+        self.path = path
+        self.path.parent.mkdir(exist_ok=True)
+        if not self.path.exists():
+            with self.path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
+                writer.writeheader()
+
+    def log_signal(self, signal: TradeSignal) -> None:
+        with self.path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
+            writer.writerow(
+                {
+                    "timestamp": signal.timestamp.isoformat(),
+                    "symbol": signal.symbol,
+                    "side": signal.direction,
+                    "entry": format_price(signal.entry),
+                    "stop_loss": format_price(signal.sl),
+                    "tp1": format_price(signal.tp1),
+                    "tp2": format_price(signal.tp2),
+                    "risk_reward": f"{signal.rr:.2f}",
+                    "confidence": signal.confidence,
+                    "market_regime": signal.regime,
+                    "volume_spike": "YES" if signal.volume_spike else "NO",
+                    "score": signal.score,
+                    "ai_summary": signal.ai_commentary,
+                }
+            )
+
+    def summarize_day(self, day: str) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"day": day, "total": 0}
+        df = pd.read_csv(self.path)
+        if df.empty:
+            return {"day": day, "total": 0}
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        day_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == day]
+        if day_df.empty:
+            return {"day": day, "total": 0}
+        top_symbols = day_df["symbol"].value_counts().head(3)
+        return {
+            "day": day,
+            "total": int(len(day_df)),
+            "long_count": int((day_df["side"] == "LONG").sum()),
+            "short_count": int((day_df["side"] == "SHORT").sum()),
+            "avg_confidence": float(pd.to_numeric(day_df["confidence"], errors="coerce").mean()),
+            "avg_rr": float(pd.to_numeric(day_df["risk_reward"], errors="coerce").mean()),
+            "top_symbols": ", ".join(f"{symbol} ({count})" for symbol, count in top_symbols.items()),
+        }
+
+
+class ChartExporter:
+    def export(self, symbol: str, df_1h: pd.DataFrame, signal: TradeSignal) -> Path:
+        chart_df = df_1h.tail(80).copy()
+        fig, ax = plt.subplots(figsize=(12, 7))
+        ax.plot(chart_df["close_time"], chart_df["close"], label="Price", color="#111827", linewidth=1.5)
+        ax.plot(chart_df["close_time"], chart_df["ema20"], label="EMA20", color="#2563eb", linewidth=1.0)
+        ax.plot(chart_df["close_time"], chart_df["ema50"], label="EMA50", color="#f97316", linewidth=1.0)
+        ax.axhline(signal.support, color="#16a34a", linestyle="--", linewidth=1, label="Support")
+        ax.axhline(signal.resistance, color="#dc2626", linestyle="--", linewidth=1, label="Resistance")
+        ax.axhline(signal.entry, color="#7c3aed", linewidth=1.2, label="Entry")
+        ax.axhline(signal.tp1, color="#22c55e", linestyle="-.", linewidth=1, label="TP1")
+        ax.axhline(signal.tp2, color="#15803d", linestyle="-.", linewidth=1, label="TP2")
+        ax.axhline(signal.sl, color="#ef4444", linestyle="-.", linewidth=1, label="SL")
+        ax.set_title(f"{signal.tradingview_symbol} {signal.direction} | RR {signal.rr:.2f} | Confidence {signal.confidence}%")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best")
+        fig.autofmt_xdate()
+        output = CHART_DIR / f"{symbol}_{signal.direction}_{signal.timestamp.strftime('%Y%m%d_%H%M%S')}.png"
+        fig.tight_layout()
+        fig.savefig(output, dpi=140)
+        plt.close(fig)
+        signal.chart_path = output
+        return output
 
 
 class TelegramNotifier:
     def __init__(self, config: ScannerConfig) -> None:
         self.config = config
-        self.session = requests.Session()
+        self.session = build_retry_session()
 
     def build_message(self, signal: TradeSignal) -> str:
-        commentary = f"\nAI Note: {signal.ai_commentary}" if signal.ai_commentary else ""
+        signal_emoji = "🚀" if signal.direction == "LONG" else "🔻"
+        volume_text = "YES" if signal.volume_spike else "NO"
+        commentary = f"\n\n🧠 AI Summary:\n{signal.ai_commentary}" if signal.ai_commentary else ""
         return (
-            f"Crypto Multi-Coin Scanner\n"
-            f"{signal.tradingview_symbol} | TF 1H\n\n"
-            f"Coin: {signal.symbol}\n"
-            f"Direction: {signal.direction}\n"
+            f"{signal_emoji} {signal.direction} SIGNAL\n"
+            f"🪙 {SymbolFormatter.to_display_symbol(signal.symbol)}\n\n"
+            f"💰 Entry: {format_price(signal.entry)}\n"
+            f"🛑 SL: {format_price(signal.sl)}\n\n"
+            f"🎯 TP1: {format_price(signal.tp1)}\n"
+            f"🎯 TP2: {format_price(signal.tp2)}\n\n"
+            f"📈 RR: 1:{signal.rr:.2f}\n"
+            f"🔥 Confidence: {signal.confidence}%\n"
+            f"⭐ Score: {signal.score}\n\n"
+            f"📊 Market: {signal.regime}\n"
+            f"📦 Volume Spike: {volume_text}\n"
+            f"🧱 Support: {format_price(signal.support)}\n"
+            f"🧱 Resistance: {format_price(signal.resistance)}\n\n"
+            f"⚖️ Risk: {signal.risk_amount_usdt:.2f} USDT ({self.config.risk_per_trade_pct:.2f}%)\n"
+            f"📐 Size: {signal.position_size_coin:.6f} {signal.symbol.replace('USDT', '')}\n\n"
+            f"🧠 Reason:\n{signal.reason}"
+            f"{commentary}\n\n"
             f"Exchange: Binance Futures\n"
             f"Leverage: Cross {self.config.max_leverage}x\n"
-            f"Entry: {format_price(signal.entry)}\n"
-            f"Take Profit 1: {format_price(signal.tp1)}\n"
-            f"Take Profit 2: {format_price(signal.tp2)}\n"
-            f"Stop Target: {format_price(signal.sl)}\n\n"
-            f"Support: {format_price(signal.support)}\n"
-            f"Resistance: {format_price(signal.resistance)}\n"
-            f"RR: {signal.rr:.2f}\n"
-            f"Confidence: {signal.confidence}%\n"
-            f"Score: {signal.score}\n"
-            f"Regime: {signal.regime}\n"
-            f"Volume Spike: {'YES' if signal.volume_spike else 'NO'}\n"
-            f"Risk: {signal.risk_amount_usdt:.2f} USDT ({self.config.risk_per_trade_pct:.2f}%)\n"
-            f"Position Size: {signal.position_size_coin:.6f} {signal.symbol.replace('USDT', '')}\n"
-            f"Reason: {signal.reason}"
-            f"{commentary}"
+            f"TradingView: {signal.tradingview_symbol}"
         )
 
-    def send(self, signal: TradeSignal) -> bool:
+    def build_daily_summary_message(self, summary: dict[str, Any]) -> str:
+        return (
+            f"📅 Daily Signal Summary UTC\n"
+            f"Date: {summary.get('day')}\n\n"
+            f"📌 Total signals: {summary.get('total', 0)}\n"
+            f"🚀 Long: {summary.get('long_count', 0)}\n"
+            f"🔻 Short: {summary.get('short_count', 0)}\n"
+            f"🔥 Avg confidence: {summary.get('avg_confidence', 0):.1f}%\n"
+            f"📈 Avg RR: {summary.get('avg_rr', 0):.2f}\n"
+            f"🏆 Top symbols: {summary.get('top_symbols') or '-'}"
+        )
+
+    def send_signal(self, signal: TradeSignal) -> bool:
         message = self.build_message(signal)
         if self.config.dry_run:
-            LOGGER.info("DRY_RUN Telegram message for %s:\n%s", signal.symbol, message)
+            LOGGER.info("DRY_RUN Telegram signal for %s:\n%s", signal.symbol, message)
+            if signal.chart_path:
+                LOGGER.info("DRY_RUN chart path: %s", signal.chart_path)
             return True
         if not self.config.send_telegram:
             LOGGER.info("SEND_TELEGRAM=0, skipped Telegram for %s", signal.symbol)
@@ -480,26 +660,53 @@ class TelegramNotifier:
             LOGGER.warning("Telegram credentials are missing; skipped %s", signal.symbol)
             return False
 
+        if signal.chart_path and signal.chart_path.exists():
+            return self._send_photo(signal.chart_path, message)
+        return self._send_message(message)
+
+    def send_daily_summary(self, summary: dict[str, Any]) -> bool:
+        message = self.build_daily_summary_message(summary)
+        if self.config.dry_run:
+            LOGGER.info("DRY_RUN daily summary:\n%s", message)
+            return True
+        if not self.config.send_telegram or not self.config.send_daily_summary:
+            return True
+        return self._send_message(message)
+
+    def _send_message(self, message: str) -> bool:
         url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
         payload = {"chat_id": self.config.telegram_chat_id, "text": message}
-        response = self.session.post(url, data=payload, timeout=15)
+        response = self.session.post(url, data=payload, timeout=20)
         if response.status_code != 200:
-            LOGGER.error("Telegram send failed for %s: %s", signal.symbol, response.text)
+            LOGGER.error("Telegram message failed: %s", response.text)
             return False
-        LOGGER.info("Telegram signal sent for %s %s", signal.symbol, signal.direction)
+        return True
+
+    def _send_photo(self, chart_path: Path, caption: str) -> bool:
+        url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendPhoto"
+        with chart_path.open("rb") as image:
+            files = {"photo": image}
+            data = {"chat_id": self.config.telegram_chat_id, "caption": caption[:1024]}
+            response = self.session.post(url, data=data, files=files, timeout=30)
+        if response.status_code != 200:
+            LOGGER.error("Telegram photo failed: %s", response.text)
+            return False
         return True
 
 
 class AgentRunner:
     def __init__(self, config: ScannerConfig) -> None:
         self.config = config
-        self.data_client = MarketDataClient()
+        self.data_client = MarketDataClient(config.request_delay_seconds)
         self.indicators = IndicatorEngine()
-        self.scorer = SignalScorer(SupportResistanceEngine(), MarketRegimeDetector())
+        self.scorer = SignalScorer(config, SupportResistanceEngine(), MarketRegimeDetector())
         self.risk_manager = RiskManager(config)
         self.ai_commentary = AICommentaryEngine(config)
+        self.journal = TradeJournalLogger()
+        self.chart_exporter = ChartExporter()
         self.notifier = TelegramNotifier(config)
         self.state = self._load_state()
+        self.fear_greed_value: int | None = None
 
     def _load_state(self) -> dict[str, Any]:
         if not STATE_FILE.exists():
@@ -514,15 +721,30 @@ class AgentRunner:
         STATE_FILE.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
 
     def is_in_cooldown(self, signal: TradeSignal) -> bool:
-        key = f"{signal.symbol}:{signal.direction}"
-        last_sent = self.state.get(key)
-        if not last_sent:
+        data = self.state.get("cooldowns", {}).get(signal.symbol)
+        if not data:
             return False
-        elapsed = time.time() - float(last_sent)
-        return elapsed < self.config.cooldown_minutes * 60
+        elapsed = time.time() - float(data.get("sent_at", 0))
+        if elapsed >= self.config.cooldown_minutes * 60:
+            return False
+        last_confidence = int(data.get("confidence", 0))
+        if signal.confidence >= last_confidence + self.config.confidence_override_delta:
+            LOGGER.info(
+                "%s cooldown override: confidence %s >= previous %s + %s",
+                signal.symbol,
+                signal.confidence,
+                last_confidence,
+                self.config.confidence_override_delta,
+            )
+            return False
+        return True
 
     def mark_sent(self, signal: TradeSignal) -> None:
-        self.state[f"{signal.symbol}:{signal.direction}"] = time.time()
+        self.state.setdefault("cooldowns", {})[signal.symbol] = {
+            "sent_at": time.time(),
+            "direction": signal.direction,
+            "confidence": signal.confidence,
+        }
         self._save_state()
 
     def seconds_until_next_1h_close(self) -> int:
@@ -531,17 +753,33 @@ class AgentRunner:
         wait_seconds = 3600 - seconds_into_hour + self.config.close_delay_seconds
         return max(self.config.close_delay_seconds, wait_seconds)
 
+    def maybe_send_daily_summary(self) -> None:
+        if not self.config.send_daily_summary:
+            return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        last_summary_day = self.state.get("last_summary_day")
+        if last_summary_day is None:
+            self.state["last_summary_day"] = today
+            self._save_state()
+            return
+        if last_summary_day == today:
+            return
+        summary = self.journal.summarize_day(last_summary_day)
+        self.notifier.send_daily_summary(summary)
+        self.state["last_summary_day"] = today
+        self._save_state()
+
     def run_forever(self) -> None:
         LOGGER.info("Watchlist: %s", ", ".join(self.config.watchlist))
         LOGGER.info(
-            "Threshold=%s min_rr=%.2f cooldown=%sm dry_run=%s ai_commentary=%s",
+            "Threshold=%s min_confidence=%s min_rr=%.2f cooldown=%sm dry_run=%s ai_commentary=%s",
             self.config.score_threshold,
+            self.config.min_confidence,
             self.config.min_rr,
             self.config.cooldown_minutes,
             self.config.dry_run,
             bool(self.ai_commentary.client),
         )
-
         if self.config.run_once:
             self.scan_once()
             return
@@ -553,29 +791,29 @@ class AgentRunner:
             self.scan_once()
 
     def scan_once(self) -> None:
+        self.maybe_send_daily_summary()
+        if self.config.use_fear_greed:
+            try:
+                self.fear_greed_value = self.data_client.fetch_fear_greed()
+                LOGGER.info("Fear & Greed value: %s", self.fear_greed_value)
+            except Exception as exc:
+                LOGGER.warning("Fear & Greed fetch failed: %s", exc)
+                self.fear_greed_value = None
+
         LOGGER.info("Scanning latest closed 1H candles")
         for symbol in self.config.watchlist:
             try:
                 self.scan_symbol(symbol)
             except Exception as exc:
                 LOGGER.exception("Scan failed for %s: %s", symbol, exc)
-            time.sleep(0.4)
+            time.sleep(self.config.request_delay_seconds)
 
     def scan_symbol(self, symbol: str) -> None:
         df_1h = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, "1h", 200))
         df_15m = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, "15m", 200))
-        signal = self.scorer.score(symbol, df_1h, df_15m)
+        signal = self.scorer.score(symbol, df_1h, df_15m, self.fear_greed_value)
         if not signal:
             LOGGER.info("%s WAIT: no valid setup", symbol)
-            return
-        if signal.score < self.config.score_threshold:
-            LOGGER.info("%s WAIT: score %s below threshold %s", symbol, signal.score, self.config.score_threshold)
-            return
-        if signal.rr < self.config.min_rr:
-            LOGGER.info("%s WAIT: RR %.2f below minimum %.2f", symbol, signal.rr, self.config.min_rr)
-            return
-        if self.is_in_cooldown(signal):
-            LOGGER.info("%s skipped: cooldown active for %s", symbol, signal.direction)
             return
 
         signal = self.risk_manager.apply(signal)
@@ -584,7 +822,27 @@ class AgentRunner:
         except Exception as exc:
             LOGGER.warning("AI commentary failed for %s: %s", symbol, exc)
 
-        if self.notifier.send(signal) and not self.config.dry_run:
+        self.journal.log_signal(signal)
+
+        if signal.score < self.config.score_threshold:
+            LOGGER.info("%s logged only: score %s below threshold %s", symbol, signal.score, self.config.score_threshold)
+            return
+        if signal.confidence < self.config.min_confidence:
+            LOGGER.info("%s logged only: confidence %s below minimum %s", symbol, signal.confidence, self.config.min_confidence)
+            return
+        if signal.rr < self.config.min_rr:
+            LOGGER.info("%s logged only: RR %.2f below minimum %.2f", symbol, signal.rr, self.config.min_rr)
+            return
+        if self.is_in_cooldown(signal):
+            LOGGER.info("%s skipped: cooldown active", symbol)
+            return
+
+        try:
+            self.chart_exporter.export(symbol, df_1h, signal)
+        except Exception as exc:
+            LOGGER.warning("Chart export failed for %s: %s", symbol, exc)
+
+        if self.notifier.send_signal(signal) and not self.config.dry_run:
             self.mark_sent(signal)
 
 

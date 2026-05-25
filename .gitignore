@@ -5,9 +5,12 @@ __pycache__/
 config.bat
 .env
 *.env
+!.env.example
 config_template_improved.bat
 *.log
 cornix_agent.log
+logs/
+charts/
 signal_state.json
 
 *.bak

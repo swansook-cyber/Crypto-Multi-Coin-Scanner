@@ -2,10 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
-if exist "config.bat" (
-    call "config.bat"
-) else (
-    echo Missing config.bat. Copy config.example.bat to config.bat and edit it first.
+if not exist ".env" (
+    echo Missing .env. Copy .env.example to .env and edit it first.
     pause
     exit /b 1
 )
