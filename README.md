@@ -232,7 +232,13 @@ To update outcomes and send Telegram alerts for newly closed signals:
 python review_signals.py --notify
 ```
 
-For daily use, schedule this command every 15 minutes with Windows Task Scheduler or cron. It does not use Gemini.
+For Windows, you can also run:
+
+```bat
+run_outcome_checker.bat
+```
+
+For daily use, schedule `run_outcome_checker.bat` with Windows Task Scheduler every 15 minutes, or schedule `python review_signals.py --notify` with cron on Linux/macOS. It does not use Gemini.
 
 It reports:
 
@@ -259,6 +265,7 @@ Config:
 
 ```env
 REVIEW_LOOKAHEAD_HOURS=24
+OUTCOME_CHECK_INTERVAL_MINUTES=15
 SEND_OUTCOME_ALERTS=1
 ```
 
