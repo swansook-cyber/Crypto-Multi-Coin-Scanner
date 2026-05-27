@@ -43,7 +43,10 @@ OUTCOME_COLUMNS = {
     "max_drawdown_pct": "",
     "outcome_alert_sent": 0,
     "outcome_alert_at": "",
+    "outcome_id": "",
 }
+
+PROCESSED_OUTCOMES: set[str] = set()
 
 
 @dataclass
@@ -135,8 +138,55 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def reload_journal() -> pd.DataFrame | None:
+    if not JOURNAL.exists():
+        LOGGER.info("No journal found at logs/signals.csv")
+        return None
+    try:
+        df = pd.read_csv(JOURNAL)
+    except pd.errors.EmptyDataError:
+        LOGGER.info("Journal is empty.")
+        return None
+    if df.empty:
+        LOGGER.info("Journal is empty.")
+        return None
+    df = ensure_columns(df)
+    persisted_ids = {
+        str(value).strip()
+        for value in df["outcome_id"].dropna()
+        if has_outcome_id(value)
+    }
+    PROCESSED_OUTCOMES.update(persisted_ids)
+    LOGGER.info("Reloaded journal: %s rows, %s persisted outcome ids", len(df), len(persisted_ids))
+    return df
+
+
+def persist_journal(df: pd.DataFrame) -> None:
+    JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+    with JOURNAL.open("w", newline="", encoding="utf-8") as handle:
+        df.to_csv(handle, index=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    LOGGER.info("CSV persisted: %s", JOURNAL)
+
+
 def alert_already_sent(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def has_outcome_id(value: Any) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    return bool(str(value).strip())
+
+
+def build_outcome_id(row: pd.Series) -> str:
+    symbol = str(row.get("symbol", "")).strip().upper()
+    side = str(row.get("side", "")).strip().upper()
+    entry = str(row.get("entry", "")).strip()
+    result = str(row.get("result", "")).strip().upper()
+    closed_at = str(row.get("closed_at", "")).strip()
+    return f"{symbol}|{side}|{entry}|{result}|{closed_at}"
 
 
 def build_outcome_alert(row: pd.Series) -> str:
@@ -327,60 +377,75 @@ def parse_args() -> argparse.Namespace:
 
 def run_review_cycle(notify: bool, session: requests.Session, lookahead_hours: int, print_report: bool = True) -> ReviewStats:
     stats = ReviewStats()
-    if not JOURNAL.exists():
-        LOGGER.info("No journal found at logs/signals.csv")
+    df = reload_journal()
+    if df is None:
         return stats
 
-    try:
-        df = pd.read_csv(JOURNAL)
-    except pd.errors.EmptyDataError:
-        LOGGER.info("Journal is empty.")
-        return stats
-
-    if df.empty:
-        LOGGER.info("Journal is empty.")
-        return stats
-
-    df = ensure_columns(df)
     open_mask = df["result"].astype(str).str.upper() == "OPEN"
     stats.open_trades = int(open_mask.sum())
 
     for index, row in df.iterrows():
         previous_result = str(row.get("result", "OPEN")).upper()
-        if previous_result != "OPEN":
-            continue
-        try:
-            outcome = review_signal(session, row, lookahead_hours)
-        except (requests.RequestException, ValueError, KeyError) as exc:
-            stats.errors += 1
-            LOGGER.error("Review skipped for %s: %s", row.get("symbol", "UNKNOWN"), exc)
-            continue
-
-        df.at[index, "result"] = outcome.result
-        df.at[index, "hit_target"] = outcome.hit_target
-        df.at[index, "closed_at"] = outcome.closed_at
-        df.at[index, "max_profit_pct"] = f"{outcome.max_profit_pct:.2f}"
-        df.at[index, "max_drawdown_pct"] = f"{outcome.max_drawdown_pct:.2f}"
-        updated_row = df.loc[index]
-        if outcome.result == "WIN":
-            stats.tp_hits += 1
-        elif outcome.result == "LOSS":
-            stats.sl_hits += 1
-
-        if outcome.result in {"WIN", "LOSS"}:
-            if notify and not alert_already_sent(row.get("outcome_alert_sent", 0)):
-                sent = send_telegram_alert(session, build_outcome_alert(updated_row))
-                if sent:
-                    stats.sent_alerts += 1
-                    df.at[index, "outcome_alert_sent"] = 1
-                    df.at[index, "outcome_alert_at"] = datetime.now(timezone.utc).isoformat()
-                else:
-                    stats.skipped_alerts += 1
-            elif alert_already_sent(row.get("outcome_alert_sent", 0)) or not notify:
+        if previous_result == "OPEN":
+            if alert_already_sent(row.get("outcome_alert_sent", 0)) or has_outcome_id(row.get("outcome_id", "")):
                 stats.skipped_alerts += 1
+                LOGGER.info("Outcome duplicate skipped before review: %s", row.get("outcome_id", ""))
+                continue
+            try:
+                outcome = review_signal(session, row, lookahead_hours)
+            except (requests.RequestException, ValueError, KeyError) as exc:
+                stats.errors += 1
+                LOGGER.error("Review skipped for %s: %s", row.get("symbol", "UNKNOWN"), exc)
+                continue
+
+            df.at[index, "result"] = outcome.result
+            df.at[index, "hit_target"] = outcome.hit_target
+            df.at[index, "closed_at"] = outcome.closed_at
+            df.at[index, "max_profit_pct"] = f"{outcome.max_profit_pct:.2f}"
+            df.at[index, "max_drawdown_pct"] = f"{outcome.max_drawdown_pct:.2f}"
+            if outcome.result == "WIN":
+                stats.tp_hits += 1
+            elif outcome.result == "LOSS":
+                stats.sl_hits += 1
+        elif previous_result not in {"WIN", "LOSS"}:
+            continue
+
+        updated_row = df.loc[index]
+        updated_result = str(updated_row.get("result", "")).upper()
+        if updated_result not in {"WIN", "LOSS"}:
+            time.sleep(0.2)
+            continue
+
+        outcome_id = build_outcome_id(updated_row)
+        if alert_already_sent(updated_row.get("outcome_alert_sent", 0)) or has_outcome_id(updated_row.get("outcome_id", "")):
+            stats.skipped_alerts += 1
+            LOGGER.info("Outcome duplicate skipped: %s", updated_row.get("outcome_id", outcome_id))
+            time.sleep(0.2)
+            continue
+        if outcome_id in PROCESSED_OUTCOMES:
+            stats.skipped_alerts += 1
+            LOGGER.info("Outcome duplicate skipped: %s", outcome_id)
+            time.sleep(0.2)
+            continue
+        if not notify:
+            stats.skipped_alerts += 1
+            time.sleep(0.2)
+            continue
+
+        LOGGER.info("Processing outcome_id: %s", outcome_id)
+        sent = send_telegram_alert(session, build_outcome_alert(updated_row))
+        if sent:
+            stats.sent_alerts += 1
+            PROCESSED_OUTCOMES.add(outcome_id)
+            df.at[index, "outcome_alert_sent"] = 1
+            df.at[index, "outcome_alert_at"] = datetime.now(timezone.utc).isoformat()
+            df.at[index, "outcome_id"] = outcome_id
+            persist_journal(df)
+        else:
+            stats.skipped_alerts += 1
         time.sleep(0.2)
 
-    df.to_csv(JOURNAL, index=False)
+    persist_journal(df)
     if print_report:
         print_summary(df)
     return stats

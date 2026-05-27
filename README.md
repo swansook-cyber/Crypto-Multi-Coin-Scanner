@@ -256,6 +256,7 @@ Columns:
 - max_drawdown_pct
 - outcome_alert_sent
 - outcome_alert_at
+- outcome_id
 
 ## Review Signals
 

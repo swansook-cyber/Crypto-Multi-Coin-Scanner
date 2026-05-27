@@ -692,7 +692,7 @@ class TradeJournalLogger:
         "risk_reward", "confidence", "market_regime", "volume_spike", "score", "mfi", "mfi_confirmed", "ai_summary",
         "signal_status", "skip_reason",
         "result", "hit_target", "closed_at", "max_profit_pct", "max_drawdown_pct",
-        "outcome_alert_sent", "outcome_alert_at",
+        "outcome_alert_sent", "outcome_alert_at", "outcome_id",
     ]
 
     def __init__(self, path: Path = SIGNAL_JOURNAL) -> None:
@@ -723,6 +723,7 @@ class TradeJournalLogger:
             "skip_reason": "",
             "outcome_alert_sent": 0,
             "outcome_alert_at": "",
+            "outcome_id": "",
         }
         for column in self.FIELDNAMES:
             if column not in df.columns:
@@ -762,6 +763,7 @@ class TradeJournalLogger:
                     "max_drawdown_pct": "",
                     "outcome_alert_sent": 0,
                     "outcome_alert_at": "",
+                    "outcome_id": "",
                 }
             )
 
