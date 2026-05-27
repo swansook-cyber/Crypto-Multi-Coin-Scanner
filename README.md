@@ -13,6 +13,7 @@ Telegram signal assistant for Binance Futures. The scanner is rule-based and qua
 - Exports chart screenshots to `charts/` and sends them with alerts
 - Uses ATR for TP/SL, not fixed percentages
 - Applies no-trade filters for Sideway, low volume, and unusually low ATR
+- Adds MFI confirmation as a lightweight money-flow layer
 - Uses cooldown to avoid spam, with override only for much higher confidence
 - Optional Fear & Greed filter can reduce long/short scores
 
@@ -94,6 +95,12 @@ CONFIDENCE_OVERRIDE_DELTA=12
 MIN_VOLUME_RATIO=0.80
 MIN_ATR_PCT=0.35
 VOLUME_SPIKE_MULTIPLIER=1.20
+USE_MFI_FILTER=1
+MFI_PERIOD=14
+MFI_BULLISH_THRESHOLD=55
+MFI_BEARISH_THRESHOLD=45
+MFI_SCORE_BONUS=8
+USE_LIQUIDATION_CONTEXT=0
 ```
 
 Quality filter behavior:
@@ -108,6 +115,17 @@ No-trade filter behavior:
 - Sideway market: skip
 - Low volume ratio: skip
 - ATR below `MIN_ATR_PCT`: skip
+
+## Strategy Components
+
+- EMA trend: 1H EMA20/EMA50 define the main direction.
+- ATR volatility: ATR controls TP/SL distance and avoids fixed percentage targets.
+- Volume: volume ratio and spike detection improve signal quality.
+- MTF confirmation: 15m EMA/RSI confirms entry timing inside the 1H trend.
+- MFI confirmation: Money Flow Index confirms buying/selling pressure. LONG setups get a bonus when MFI is above `MFI_BULLISH_THRESHOLD`; SHORT setups get a bonus when MFI is below `MFI_BEARISH_THRESHOLD`. If MFI is against direction, confidence is reduced slightly.
+- Optional liquidation context: disabled by default. It is a lightweight placeholder for future context sources and only adjusts confidence; it is never the main signal source.
+
+The scanner stays lightweight: no websocket stream, no heavy polling, and no realtime orderflow engine. It is intended to run comfortably on a small VPS.
 
 ## Optional Gemini Commentary
 
@@ -167,6 +185,7 @@ Alerts are mobile-friendly and include:
 - Confidence
 - Market regime
 - Volume spike
+- MFI
 - Support/Resistance
 - Reason
 - Chart screenshot
@@ -209,6 +228,8 @@ Columns:
 - market_regime
 - volume_spike
 - score
+- mfi
+- mfi_confirmed
 - ai_summary
 - result
 - hit_target

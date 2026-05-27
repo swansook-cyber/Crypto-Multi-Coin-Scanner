@@ -122,6 +122,13 @@ class ScannerConfig:
     min_volume_ratio: float
     min_atr_pct: float
     volume_spike_multiplier: float
+    use_mfi_filter: bool
+    mfi_period: int
+    mfi_bullish_threshold: float
+    mfi_bearish_threshold: float
+    mfi_score_bonus: int
+    use_liquidation_context: bool
+    liquidation_confidence_penalty: int
     use_fear_greed: bool
     fear_greed_greed_threshold: int
     fear_greed_fear_threshold: int
@@ -164,6 +171,13 @@ class ScannerConfig:
             min_volume_ratio=env_float("MIN_VOLUME_RATIO", 0.80),
             min_atr_pct=env_float("MIN_ATR_PCT", 0.35),
             volume_spike_multiplier=env_float("VOLUME_SPIKE_MULTIPLIER", 1.20),
+            use_mfi_filter=env_bool("USE_MFI_FILTER", True),
+            mfi_period=env_int("MFI_PERIOD", 14),
+            mfi_bullish_threshold=env_float("MFI_BULLISH_THRESHOLD", 55),
+            mfi_bearish_threshold=env_float("MFI_BEARISH_THRESHOLD", 45),
+            mfi_score_bonus=env_int("MFI_SCORE_BONUS", 8),
+            use_liquidation_context=env_bool("USE_LIQUIDATION_CONTEXT", False),
+            liquidation_confidence_penalty=env_int("LIQUIDATION_CONFIDENCE_PENALTY", 5),
             use_fear_greed=env_bool("USE_FEAR_GREED", False),
             fear_greed_greed_threshold=env_int("FEAR_GREED_GREED_THRESHOLD", 75),
             fear_greed_fear_threshold=env_int("FEAR_GREED_FEAR_THRESHOLD", 25),
@@ -201,7 +215,10 @@ class TradeSignal:
     volume_spike: bool
     volume_ratio: float
     atr_pct: float
+    mfi: float
+    mfi_confirmed: bool
     reason: str
+    liquidation_context: str = ""
     ai_commentary: str = ""
     risk_amount_usdt: float = 0.0
     position_size_coin: float = 0.0
@@ -307,6 +324,9 @@ class MarketDataClient:
 
 
 class IndicatorEngine:
+    def __init__(self, mfi_period: int = 14) -> None:
+        self.mfi_period = mfi_period
+
     @staticmethod
     def rsi(close: pd.Series, length: int = 14) -> pd.Series:
         delta = close.diff()
@@ -325,6 +345,17 @@ class IndicatorEngine:
         true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         return true_range.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
 
+    @staticmethod
+    def mfi(df: pd.DataFrame, length: int = 14) -> pd.Series:
+        typical_price = (df["high"] + df["low"] + df["close"]) / 3
+        money_flow = typical_price * df["volume"]
+        positive_flow = money_flow.where(typical_price > typical_price.shift(), 0.0)
+        negative_flow = money_flow.where(typical_price < typical_price.shift(), 0.0)
+        positive_sum = positive_flow.rolling(length, min_periods=length).sum()
+        negative_sum = negative_flow.rolling(length, min_periods=length).sum()
+        money_ratio = positive_sum / negative_sum.replace(0, pd.NA)
+        return 100 - (100 / (1 + money_ratio))
+
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         enriched = df.copy()
         enriched["rsi14"] = self.rsi(enriched["close"])
@@ -333,6 +364,7 @@ class IndicatorEngine:
         enriched["ema21"] = enriched["close"].ewm(span=21, adjust=False).mean()
         enriched["ema50"] = enriched["close"].ewm(span=50, adjust=False).mean()
         enriched["atr14"] = self.atr(enriched)
+        enriched["mfi"] = self.mfi(enriched, self.mfi_period)
         enriched["volume_sma20"] = enriched["volume"].rolling(20).mean()
         enriched["atr_pct"] = enriched["atr14"] / enriched["close"] * 100
         return enriched
@@ -358,11 +390,43 @@ class MarketRegimeDetector:
         return MarketRegime("Sideway", f"EMA gap {ema_gap_pct:.2f}%, ATR {atr_pct:.2f}%")
 
 
+class LiquidationContextFilter:
+    """Lightweight placeholder for future liquidation context sources."""
+
+    def __init__(self, config: ScannerConfig) -> None:
+        self.config = config
+
+    def adjust(self, symbol: str, direction: str, confidence: int, price: float) -> tuple[int, str]:
+        if not self.config.use_liquidation_context:
+            return confidence, ""
+        try:
+            # Production-safe placeholder: no websocket, no heavy polling, no realtime orderflow.
+            # Future integrations can return context such as "short cluster above price".
+            context = self.fetch_context(symbol, price)
+        except Exception as exc:
+            LOGGER.info("Liquidation context unavailable for %s: %s", symbol, exc)
+            return confidence, ""
+        if not context:
+            return confidence, ""
+        adjusted = confidence
+        if direction == "SHORT" and context == "short_cluster_above":
+            adjusted = max(1, confidence - self.config.liquidation_confidence_penalty)
+        elif direction == "LONG" and context == "long_cluster_below":
+            adjusted = max(1, confidence - self.config.liquidation_confidence_penalty)
+        if adjusted != confidence:
+            LOGGER.info("Liquidation context adjusted confidence")
+        return adjusted, context
+
+    def fetch_context(self, symbol: str, price: float) -> str:
+        return ""
+
+
 class SignalScorer:
     def __init__(self, config: ScannerConfig, support_resistance: SupportResistanceEngine, regime_detector: MarketRegimeDetector) -> None:
         self.config = config
         self.support_resistance = support_resistance
         self.regime_detector = regime_detector
+        self.liquidation_context = LiquidationContextFilter(config)
 
     def score(self, symbol: str, df_1h: pd.DataFrame, df_15m: pd.DataFrame, fear_greed: int | None = None) -> TradeSignal | None:
         latest_1h = df_1h.iloc[-1]
@@ -374,6 +438,7 @@ class SignalScorer:
         price = float(latest_1h["close"])
         atr = float(latest_1h["atr14"])
         atr_pct = float(latest_1h["atr_pct"])
+        mfi = float(latest_1h["mfi"]) if not pd.isna(latest_1h["mfi"]) else 50.0
         volume_sma = float(latest_1h["volume_sma20"])
         volume_ratio = float(latest_1h["volume"] / volume_sma) if volume_sma > 0 else 0.0
         if math.isnan(atr) or atr <= 0:
@@ -408,11 +473,27 @@ class SignalScorer:
 
         long_score = max(0, long_score)
         short_score = max(0, short_score)
+
+        long_mfi_confirmed = self.config.use_mfi_filter and mfi >= self.config.mfi_bullish_threshold
+        short_mfi_confirmed = self.config.use_mfi_filter and mfi <= self.config.mfi_bearish_threshold
+        if long_mfi_confirmed:
+            long_score += self.config.mfi_score_bonus
+            LOGGER.info("MFI bullish confirmation")
+        elif self.config.use_mfi_filter and mfi <= self.config.mfi_bearish_threshold:
+            long_score = max(0, long_score - self.config.mfi_score_bonus)
+
+        if short_mfi_confirmed:
+            short_score += self.config.mfi_score_bonus
+            LOGGER.info("MFI bearish confirmation")
+        elif self.config.use_mfi_filter and mfi >= self.config.mfi_bullish_threshold:
+            short_score = max(0, short_score - self.config.mfi_score_bonus)
+
         if long_score < 1 and short_score < 1:
             return None
 
         direction = "LONG" if long_score >= short_score else "SHORT"
         score = max(long_score, short_score)
+        mfi_confirmed = long_mfi_confirmed if direction == "LONG" else short_mfi_confirmed
         if direction == "LONG":
             entry = price
             sl = entry - atr * 1.0
@@ -428,10 +509,20 @@ class SignalScorer:
         reward = abs(tp2 - entry)
         rr = reward / risk if risk > 0 else 0
         confidence = min(95, max(1, score + (8 if rr >= self.config.min_rr else 0)))
+        if self.config.use_mfi_filter and not mfi_confirmed:
+            confidence = max(1, confidence - 4)
+        confidence, liquidation_context = self.liquidation_context.adjust(symbol, direction, confidence, price)
+        mfi_reason = (
+            "MFI bullish confirmation"
+            if direction == "LONG" and mfi_confirmed
+            else "MFI bearish confirmation"
+            if direction == "SHORT" and mfi_confirmed
+            else f"MFI neutral/against {mfi:.1f}"
+        )
         reason = (
             f"EMA {'bullish' if direction == 'LONG' else 'bearish'} trend on 1H; "
             f"15m confirmation {'confirmed' if (entry_long if direction == 'LONG' else entry_short) else 'weak'}; "
-            f"volume ratio {volume_ratio:.2f}; ATR {atr_pct:.2f}%; RR {rr:.2f}"
+            f"volume ratio {volume_ratio:.2f}; ATR {atr_pct:.2f}%; {mfi_reason}; RR {rr:.2f}"
         )
 
         return TradeSignal(
@@ -453,6 +544,9 @@ class SignalScorer:
             volume_spike=volume_spike,
             volume_ratio=volume_ratio,
             atr_pct=atr_pct,
+            mfi=mfi,
+            mfi_confirmed=mfi_confirmed,
+            liquidation_context=liquidation_context,
             reason=reason,
         )
 
@@ -575,8 +669,9 @@ Reason: {signal.reason}
 class TradeJournalLogger:
     FIELDNAMES = [
         "timestamp", "symbol", "side", "entry", "stop_loss", "tp1", "tp2",
-        "risk_reward", "confidence", "market_regime", "volume_spike", "score", "ai_summary",
+        "risk_reward", "confidence", "market_regime", "volume_spike", "score", "mfi", "mfi_confirmed", "ai_summary",
         "result", "hit_target", "closed_at", "max_profit_pct", "max_drawdown_pct",
+        "outcome_alert_sent", "outcome_alert_at",
     ]
 
     def __init__(self, path: Path = SIGNAL_JOURNAL) -> None:
@@ -601,6 +696,10 @@ class TradeJournalLogger:
             "closed_at": "",
             "max_profit_pct": "",
             "max_drawdown_pct": "",
+            "mfi": "",
+            "mfi_confirmed": "",
+            "outcome_alert_sent": 0,
+            "outcome_alert_at": "",
         }
         for column in self.FIELDNAMES:
             if column not in df.columns:
@@ -627,12 +726,16 @@ class TradeJournalLogger:
                     "market_regime": signal.regime,
                     "volume_spike": "YES" if signal.volume_spike else "NO",
                     "score": signal.score,
+                    "mfi": f"{signal.mfi:.2f}",
+                    "mfi_confirmed": "YES" if signal.mfi_confirmed else "NO",
                     "ai_summary": signal.ai_commentary,
                     "result": "OPEN",
                     "hit_target": "",
                     "closed_at": "",
                     "max_profit_pct": "",
                     "max_drawdown_pct": "",
+                    "outcome_alert_sent": 0,
+                    "outcome_alert_at": "",
                 }
             )
 
@@ -654,6 +757,8 @@ class TradeJournalLogger:
             "short_count": int((day_df["side"] == "SHORT").sum()),
             "avg_confidence": float(pd.to_numeric(day_df["confidence"], errors="coerce").mean()),
             "avg_rr": float(pd.to_numeric(day_df["risk_reward"], errors="coerce").mean()),
+            "avg_mfi": float(pd.to_numeric(day_df.get("mfi"), errors="coerce").mean()) if "mfi" in day_df else 0.0,
+            "mfi_confirmed_count": int((day_df.get("mfi_confirmed", "") == "YES").sum()) if "mfi_confirmed" in day_df else 0,
             "top_symbols": ", ".join(f"{symbol} ({count})" for symbol, count in top_symbols.items()),
         }
 
@@ -704,6 +809,7 @@ class TelegramNotifier:
             f"⭐ Score: {signal.score}\n\n"
             f"📊 Market: {signal.regime}\n"
             f"📦 Volume Spike: {volume_text}\n"
+            f"📈 MFI: {signal.mfi:.1f}\n"
             f"🧱 Support: {format_price(signal.support)}\n"
             f"🧱 Resistance: {format_price(signal.resistance)}\n\n"
             f"⚖️ Risk: {signal.risk_amount_usdt:.2f} USDT ({self.config.risk_per_trade_pct:.2f}%)\n"
@@ -724,6 +830,8 @@ class TelegramNotifier:
             f"🔻 Short: {summary.get('short_count', 0)}\n"
             f"🔥 Avg confidence: {summary.get('avg_confidence', 0):.1f}%\n"
             f"📈 Avg RR: {summary.get('avg_rr', 0):.2f}\n"
+            f"📈 Avg MFI: {summary.get('avg_mfi', 0):.1f}\n"
+            f"🔥 MFI-confirmed signals: {summary.get('mfi_confirmed_count', 0)}\n"
             f"🏆 Top symbols: {summary.get('top_symbols') or '-'}"
         )
 
@@ -779,7 +887,7 @@ class AgentRunner:
     def __init__(self, config: ScannerConfig) -> None:
         self.config = config
         self.data_client = MarketDataClient(config.request_delay_seconds)
-        self.indicators = IndicatorEngine()
+        self.indicators = IndicatorEngine(config.mfi_period)
         self.scorer = SignalScorer(config, SupportResistanceEngine(), MarketRegimeDetector())
         self.risk_manager = RiskManager(config)
         self.ai_commentary = AICommentaryEngine(config)
