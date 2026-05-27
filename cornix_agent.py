@@ -107,6 +107,13 @@ class ScannerConfig:
     min_rr: float
     cooldown_minutes: int
     confidence_override_delta: int
+    loss_cooldown_minutes: int
+    max_signals_per_scan: int
+    max_signals_per_direction_per_candle: int
+    max_major_correlated_signals: int
+    use_btc_regime_filter: bool
+    btc_sideway_penalty: int
+    btc_low_vol_skip: bool
     run_once: bool
     dry_run: bool
     ai_commentary: bool
@@ -156,6 +163,13 @@ class ScannerConfig:
             min_rr=env_float("MIN_RR", 1.8),
             cooldown_minutes=env_int("COOLDOWN_MINUTES", 240),
             confidence_override_delta=env_int("CONFIDENCE_OVERRIDE_DELTA", 12),
+            loss_cooldown_minutes=env_int("LOSS_COOLDOWN_MINUTES", 180),
+            max_signals_per_scan=env_int("MAX_SIGNALS_PER_SCAN", 3),
+            max_signals_per_direction_per_candle=env_int("MAX_SIGNALS_PER_DIRECTION_PER_CANDLE", 2),
+            max_major_correlated_signals=env_int("MAX_MAJOR_CORRELATED_SIGNALS", 1),
+            use_btc_regime_filter=env_bool("USE_BTC_REGIME_FILTER", True),
+            btc_sideway_penalty=env_int("BTC_SIDEWAY_PENALTY", 10),
+            btc_low_vol_skip=env_bool("BTC_LOW_VOL_SKIP", True),
             run_once=env_bool("RUN_ONCE", False),
             dry_run=env_bool("DRY_RUN", False),
             ai_commentary=env_bool("AI_COMMENTARY", env_bool("USE_AI_COMMENTARY", True)),
@@ -224,6 +238,12 @@ class TradeSignal:
     position_size_coin: float = 0.0
     position_value_usdt: float = 0.0
     chart_path: Path | None = None
+
+
+@dataclass
+class BtcMarketContext:
+    regime: str
+    atr_pct: float
 
 
 class SymbolFormatter:
@@ -670,6 +690,7 @@ class TradeJournalLogger:
     FIELDNAMES = [
         "timestamp", "symbol", "side", "entry", "stop_loss", "tp1", "tp2",
         "risk_reward", "confidence", "market_regime", "volume_spike", "score", "mfi", "mfi_confirmed", "ai_summary",
+        "signal_status", "skip_reason",
         "result", "hit_target", "closed_at", "max_profit_pct", "max_drawdown_pct",
         "outcome_alert_sent", "outcome_alert_at",
     ]
@@ -698,6 +719,8 @@ class TradeJournalLogger:
             "max_drawdown_pct": "",
             "mfi": "",
             "mfi_confirmed": "",
+            "signal_status": "",
+            "skip_reason": "",
             "outcome_alert_sent": 0,
             "outcome_alert_at": "",
         }
@@ -709,7 +732,8 @@ class TradeJournalLogger:
             df = df[self.FIELDNAMES]
             df.to_csv(self.path, index=False)
 
-    def log_signal(self, signal: TradeSignal) -> None:
+    def log_signal(self, signal: TradeSignal, signal_status: str = "sent", skip_reason: str = "") -> None:
+        result = "OPEN" if signal_status == "sent" else "SKIPPED"
         with self.path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
             writer.writerow(
@@ -729,7 +753,9 @@ class TradeJournalLogger:
                     "mfi": f"{signal.mfi:.2f}",
                     "mfi_confirmed": "YES" if signal.mfi_confirmed else "NO",
                     "ai_summary": signal.ai_commentary,
-                    "result": "OPEN",
+                    "signal_status": signal_status,
+                    "skip_reason": skip_reason,
+                    "result": result,
                     "hit_target": "",
                     "closed_at": "",
                     "max_profit_pct": "",
@@ -738,6 +764,29 @@ class TradeJournalLogger:
                     "outcome_alert_at": "",
                 }
             )
+
+    def is_recent_loss(self, signal: TradeSignal, minutes: int) -> bool:
+        if not self.path.exists():
+            return False
+        try:
+            df = pd.read_csv(self.path)
+        except (pd.errors.EmptyDataError, FileNotFoundError):
+            return False
+        required = {"symbol", "side", "result", "hit_target", "closed_at"}
+        if df.empty or not required.issubset(df.columns):
+            return False
+        closed_at = pd.to_datetime(df["closed_at"], utc=True, errors="coerce")
+        mask = (
+            (df["symbol"].astype(str).str.upper() == signal.symbol.upper())
+            & (df["side"].astype(str).str.upper() == signal.direction.upper())
+            & (df["result"].astype(str).str.upper() == "LOSS")
+            & (df["hit_target"].astype(str).str.upper() == "SL")
+            & closed_at.notna()
+        )
+        if not mask.any():
+            return False
+        latest_loss = closed_at[mask].max()
+        return pd.Timestamp.now(tz="UTC") - latest_loss < pd.Timedelta(minutes=minutes)
 
     def summarize_day(self, day: str) -> dict[str, Any]:
         if not self.path.exists():
@@ -749,16 +798,23 @@ class TradeJournalLogger:
         day_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == day]
         if day_df.empty:
             return {"day": day, "total": 0}
-        top_symbols = day_df["symbol"].value_counts().head(3)
+        sent_df = day_df[day_df.get("signal_status", "sent").fillna("sent") == "sent"] if "signal_status" in day_df else day_df
+        top_symbols = sent_df["symbol"].value_counts().head(3)
+        statuses = day_df.get("signal_status", pd.Series([], dtype=str)).fillna("")
         return {
             "day": day,
             "total": int(len(day_df)),
-            "long_count": int((day_df["side"] == "LONG").sum()),
-            "short_count": int((day_df["side"] == "SHORT").sum()),
-            "avg_confidence": float(pd.to_numeric(day_df["confidence"], errors="coerce").mean()),
-            "avg_rr": float(pd.to_numeric(day_df["risk_reward"], errors="coerce").mean()),
-            "avg_mfi": float(pd.to_numeric(day_df.get("mfi"), errors="coerce").mean()) if "mfi" in day_df else 0.0,
-            "mfi_confirmed_count": int((day_df.get("mfi_confirmed", "") == "YES").sum()) if "mfi_confirmed" in day_df else 0,
+            "sent_total": int(len(sent_df)),
+            "long_count": int((sent_df["side"] == "LONG").sum()),
+            "short_count": int((sent_df["side"] == "SHORT").sum()),
+            "avg_confidence": float(pd.to_numeric(sent_df["confidence"], errors="coerce").mean()) if not sent_df.empty else 0.0,
+            "avg_rr": float(pd.to_numeric(sent_df["risk_reward"], errors="coerce").mean()) if not sent_df.empty else 0.0,
+            "avg_mfi": float(pd.to_numeric(sent_df.get("mfi"), errors="coerce").mean()) if "mfi" in sent_df and not sent_df.empty else 0.0,
+            "mfi_confirmed_count": int((sent_df.get("mfi_confirmed", "") == "YES").sum()) if "mfi_confirmed" in sent_df else 0,
+            "skipped_loss_cooldown": int((statuses == "skipped_loss_cooldown").sum()),
+            "skipped_correlation": int((statuses == "skipped_correlation").sum()),
+            "skipped_btc_regime": int((statuses == "skipped_btc_regime").sum()),
+            "skipped_not_top_candidate": int((statuses == "skipped_not_top_candidate").sum()),
             "top_symbols": ", ".join(f"{symbol} ({count})" for symbol, count in top_symbols.items()),
         }
 
@@ -826,12 +882,17 @@ class TelegramNotifier:
             f"📅 Daily Signal Summary UTC\n"
             f"Date: {summary.get('day')}\n\n"
             f"📌 Total signals: {summary.get('total', 0)}\n"
+            f"✅ Sent signals: {summary.get('sent_total', 0)}\n"
             f"🚀 Long: {summary.get('long_count', 0)}\n"
             f"🔻 Short: {summary.get('short_count', 0)}\n"
             f"🔥 Avg confidence: {summary.get('avg_confidence', 0):.1f}%\n"
             f"📈 Avg RR: {summary.get('avg_rr', 0):.2f}\n"
             f"📈 Avg MFI: {summary.get('avg_mfi', 0):.1f}\n"
             f"🔥 MFI-confirmed signals: {summary.get('mfi_confirmed_count', 0)}\n"
+            f"🧊 Skipped loss cooldown: {summary.get('skipped_loss_cooldown', 0)}\n"
+            f"🔗 Skipped correlation: {summary.get('skipped_correlation', 0)}\n"
+            f"₿ Skipped BTC regime: {summary.get('skipped_btc_regime', 0)}\n"
+            f"🏅 Skipped not top: {summary.get('skipped_not_top_candidate', 0)}\n"
             f"🏆 Top symbols: {summary.get('top_symbols') or '-'}"
         )
 
@@ -991,53 +1052,129 @@ class AgentRunner:
                 self.fear_greed_value = None
 
         LOGGER.info("Scanning latest closed 1H candles")
+        candidates: list[TradeSignal] = []
         for symbol in self.config.watchlist:
             try:
-                self.scan_symbol(symbol)
+                signal = self.scan_symbol(symbol)
+                if signal:
+                    candidates.append(signal)
             except Exception as exc:
                 LOGGER.exception("Scan failed for %s: %s", symbol, exc)
             time.sleep(self.config.request_delay_seconds)
 
-    def scan_symbol(self, symbol: str) -> None:
+        self.process_candidates(candidates)
+
+    def scan_symbol(self, symbol: str) -> TradeSignal | None:
         df_1h = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, "1h", 200))
         df_15m = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, "15m", 200))
         signal = self.scorer.score(symbol, df_1h, df_15m, self.fear_greed_value)
         if not signal:
             LOGGER.info("%s WAIT: no valid setup", symbol)
-            return
+            return None
 
         signal = self.risk_manager.apply(signal)
         signal.ai_commentary = ""
+        return signal
 
-        if signal.score < self.config.score_threshold:
-            self.journal.log_signal(signal)
-            LOGGER.info("%s logged only: score %s below threshold %s", symbol, signal.score, self.config.score_threshold)
+    def process_candidates(self, candidates: list[TradeSignal]) -> None:
+        if not candidates:
             return
-        if signal.confidence < self.config.min_confidence:
-            self.journal.log_signal(signal)
-            LOGGER.info("%s logged only: confidence %s below minimum %s", symbol, signal.confidence, self.config.min_confidence)
-            return
-        if signal.rr < self.config.min_rr:
-            self.journal.log_signal(signal)
-            LOGGER.info("%s logged only: RR %.2f below minimum %.2f", symbol, signal.rr, self.config.min_rr)
-            return
-        if self.is_in_cooldown(signal):
-            self.journal.log_signal(signal)
-            LOGGER.info("%s skipped: cooldown active", symbol)
-            return
+        btc_context = self.get_btc_context()
+        eligible: list[TradeSignal] = []
+        for signal in candidates:
+            if signal.score < self.config.score_threshold:
+                self.journal.log_signal(signal, "logged_quality_filter", "score_below_threshold")
+                LOGGER.info("%s logged only: score %s below threshold %s", signal.symbol, signal.score, self.config.score_threshold)
+                continue
+            if signal.confidence < self.config.min_confidence:
+                self.journal.log_signal(signal, "logged_quality_filter", "confidence_below_minimum")
+                LOGGER.info("%s logged only: confidence %s below minimum %s", signal.symbol, signal.confidence, self.config.min_confidence)
+                continue
+            if signal.rr < self.config.min_rr:
+                self.journal.log_signal(signal, "logged_quality_filter", "rr_below_minimum")
+                LOGGER.info("%s logged only: RR %.2f below minimum %.2f", signal.symbol, signal.rr, self.config.min_rr)
+                continue
+            if self.journal.is_recent_loss(signal, self.config.loss_cooldown_minutes):
+                self.journal.log_signal(signal, "skipped_loss_cooldown", "recent_sl_same_symbol_direction")
+                LOGGER.info("%s skipped: loss cooldown active for %s", signal.symbol, signal.direction)
+                continue
+            if self.apply_btc_regime_filter(signal, btc_context):
+                continue
+            eligible.append(signal)
 
-        if self.ai_commentary.can_summarize(signal, self.config):
-            signal.ai_commentary = self.ai_commentary.summarize(signal)
+        selected = self.select_top_candidates(eligible)
+        for signal in selected:
+            if self.is_in_cooldown(signal):
+                self.journal.log_signal(signal, "skipped_not_top_candidate", "send_cooldown_active")
+                LOGGER.info("%s skipped: cooldown active", signal.symbol)
+                continue
+            if self.ai_commentary.can_summarize(signal, self.config):
+                signal.ai_commentary = self.ai_commentary.summarize(signal)
+            self.journal.log_signal(signal, "sent", "")
+            try:
+                self.chart_exporter.export(signal.symbol, self.indicators.add_indicators(self.data_client.fetch_closed_klines(signal.symbol, "1h", 120)), signal)
+            except Exception as exc:
+                LOGGER.warning("Chart export failed for %s: %s", signal.symbol, exc)
+            if self.notifier.send_signal(signal) and not self.config.dry_run:
+                self.mark_sent(signal)
 
-        self.journal.log_signal(signal)
-
+    def get_btc_context(self) -> BtcMarketContext | None:
+        if not self.config.use_btc_regime_filter:
+            return None
         try:
-            self.chart_exporter.export(symbol, df_1h, signal)
+            df_btc = self.indicators.add_indicators(self.data_client.fetch_closed_klines("BTCUSDT", "1h", 120))
+            regime = MarketRegimeDetector().detect(df_btc)
+            return BtcMarketContext(regime=regime.name, atr_pct=float(df_btc.iloc[-1]["atr_pct"]))
         except Exception as exc:
-            LOGGER.warning("Chart export failed for %s: %s", symbol, exc)
+            LOGGER.warning("BTC regime filter unavailable: %s", exc)
+            return None
 
-        if self.notifier.send_signal(signal) and not self.config.dry_run:
-            self.mark_sent(signal)
+    def apply_btc_regime_filter(self, signal: TradeSignal, btc_context: BtcMarketContext | None) -> bool:
+        if not btc_context or signal.symbol == "BTCUSDT":
+            return False
+        if btc_context.regime == "Sideway":
+            signal.confidence = max(1, signal.confidence - self.config.btc_sideway_penalty)
+            signal.reason += f"; BTC sideway penalty -{self.config.btc_sideway_penalty}"
+            if signal.confidence < self.config.min_confidence:
+                self.journal.log_signal(signal, "skipped_btc_regime", "btc_sideway_confidence_below_minimum")
+                LOGGER.info("%s skipped: BTC sideway regime filter", signal.symbol)
+                return True
+        if self.config.btc_low_vol_skip and btc_context.atr_pct < self.config.min_atr_pct:
+            self.journal.log_signal(signal, "skipped_btc_regime", "btc_low_volatility")
+            LOGGER.info("%s skipped: BTC low volatility filter", signal.symbol)
+            return True
+        return False
+
+    def select_top_candidates(self, candidates: list[TradeSignal]) -> list[TradeSignal]:
+        major_symbols = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "LTCUSDT"}
+        ranked = sorted(
+            candidates,
+            key=lambda item: (item.score, item.confidence, int(item.volume_spike), item.rr),
+            reverse=True,
+        )
+        selected: list[TradeSignal] = []
+        direction_counts: dict[str, int] = {}
+        major_direction_counts: dict[str, int] = {}
+        for signal in ranked:
+            direction_count = direction_counts.get(signal.direction, 0)
+            major_count = major_direction_counts.get(signal.direction, 0)
+            if direction_count >= self.config.max_signals_per_direction_per_candle:
+                self.journal.log_signal(signal, "skipped_correlation", "max_signals_per_direction_per_candle")
+                LOGGER.info("%s skipped: direction cap/correlation filter", signal.symbol)
+                continue
+            if signal.symbol in major_symbols and major_count >= self.config.max_major_correlated_signals:
+                self.journal.log_signal(signal, "skipped_correlation", "max_major_correlated_signals")
+                LOGGER.info("%s skipped: major correlation filter", signal.symbol)
+                continue
+            if len(selected) >= self.config.max_signals_per_scan:
+                self.journal.log_signal(signal, "skipped_not_top_candidate", "not_in_top_candidates")
+                LOGGER.info("%s skipped: not a top candidate", signal.symbol)
+                continue
+            selected.append(signal)
+            direction_counts[signal.direction] = direction_count + 1
+            if signal.symbol in major_symbols:
+                major_direction_counts[signal.direction] = major_count + 1
+        return selected
 
 
 def main() -> None:

@@ -92,6 +92,13 @@ MIN_CONFIDENCE=75
 MIN_RR=1.8
 COOLDOWN_MINUTES=240
 CONFIDENCE_OVERRIDE_DELTA=12
+LOSS_COOLDOWN_MINUTES=180
+MAX_SIGNALS_PER_SCAN=3
+MAX_SIGNALS_PER_DIRECTION_PER_CANDLE=2
+MAX_MAJOR_CORRELATED_SIGNALS=1
+USE_BTC_REGIME_FILTER=1
+BTC_SIDEWAY_PENALTY=10
+BTC_LOW_VOL_SKIP=1
 MIN_VOLUME_RATIO=0.80
 MIN_ATR_PCT=0.35
 VOLUME_SPIKE_MULTIPLIER=1.20
@@ -109,12 +116,23 @@ Quality filter behavior:
 - If confidence is below `MIN_CONFIDENCE`, it is logged only
 - If RR is below `MIN_RR`, it is logged only
 - Telegram receives only high-quality signals
+- Only the strongest `MAX_SIGNALS_PER_SCAN` candidates are sent each scan
+- Major correlated coins (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `LTCUSDT`) are capped by direction
+- If the same symbol and direction recently hit SL, loss cooldown blocks repeats
 
 No-trade filter behavior:
 
 - Sideway market: skip
 - Low volume ratio: skip
 - ATR below `MIN_ATR_PCT`: skip
+
+Overtrade controls:
+
+- `LOSS_COOLDOWN_MINUTES` blocks the same symbol + direction after a recent SL.
+- `MAX_SIGNALS_PER_DIRECTION_PER_CANDLE` limits same-direction exposure in one scan.
+- `MAX_MAJOR_CORRELATED_SIGNALS` keeps highly correlated majors from firing together.
+- `USE_BTC_REGIME_FILTER` reduces altcoin confidence when BTC is sideway and can skip weak altcoin setups when BTC volatility is too low.
+- `MAX_SIGNALS_PER_SCAN` sends only the best ranked setups after all candidates are scored.
 
 ## Strategy Components
 
