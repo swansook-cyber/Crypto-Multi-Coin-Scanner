@@ -259,25 +259,44 @@ Columns:
 
 ## Review Signals
 
-Run:
+Run once:
 
 ```bat
 python review_signals.py
 ```
 
-To update outcomes and send Telegram alerts for newly closed signals:
+To run once and send Telegram alerts for newly closed signals:
 
 ```bat
 python review_signals.py --notify
 ```
 
+For production use, keep the outcome checker open like the scanner. Set:
+
+```env
+OUTCOME_LOOP_MODE=1
+OUTCOME_LOOP_INTERVAL_SECONDS=900
+```
+
+Then run:
+
+```bat
+python review_signals.py
+```
+
+When loop mode is enabled, `review_signals.py` keeps running, reviews open trades every 15 minutes by default, sends outcome alerts when TP/SL is hit, logs the next run time, and continues after Binance or Telegram errors. It does not use Gemini.
+
 For Windows, you can also run:
 
 ```bat
-run_outcome_checker.bat
+run_outcome_checker_loop.bat
 ```
 
-For daily use, schedule `run_outcome_checker.bat` with Windows Task Scheduler every 15 minutes, or schedule `python review_signals.py --notify` with cron on Linux/macOS. It does not use Gemini.
+Daily operation:
+
+- Scanner: keep `cornix_agent.py` running.
+- Outcome checker: keep `review_signals.py` running with `OUTCOME_LOOP_MODE=1`.
+- Task Scheduler is no longer required for the outcome checker.
 
 It reports:
 
@@ -305,6 +324,8 @@ Config:
 ```env
 REVIEW_LOOKAHEAD_HOURS=24
 OUTCOME_CHECK_INTERVAL_MINUTES=15
+OUTCOME_LOOP_MODE=1
+OUTCOME_LOOP_INTERVAL_SECONDS=900
 SEND_OUTCOME_ALERTS=1
 ```
 

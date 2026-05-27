@@ -7,6 +7,7 @@ import os
 import time
 import argparse
 import sys
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,14 @@ from urllib3.util.retry import Retry
 BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
+ERROR_RETRY_SECONDS = 60
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+LOGGER = logging.getLogger("outcome_checker")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -44,6 +53,16 @@ class Outcome:
     closed_at: str
     max_profit_pct: float
     max_drawdown_pct: float
+
+
+@dataclass
+class ReviewStats:
+    open_trades: int = 0
+    tp_hits: int = 0
+    sl_hits: int = 0
+    skipped_alerts: int = 0
+    sent_alerts: int = 0
+    errors: int = 0
 
 
 def env_int(name: str, default: int) -> int:
@@ -164,12 +183,16 @@ def send_telegram_alert(session: requests.Session, message: str) -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
-        print("Outcome alert skipped: Telegram token/chat id missing")
+        LOGGER.warning("Outcome alert skipped: Telegram token/chat id missing")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    response = session.post(url, data={"chat_id": chat_id, "text": message}, timeout=20)
+    try:
+        response = session.post(url, data={"chat_id": chat_id, "text": message}, timeout=20)
+    except requests.RequestException as exc:
+        LOGGER.error("Outcome alert failed: %s", exc)
+        return False
     if response.status_code != 200:
-        print(f"Outcome alert failed: {response.text}")
+        LOGGER.error("Outcome alert failed: %s", response.text)
         return False
     return True
 
@@ -302,27 +325,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    load_dotenv(BASE_DIR / ".env")
-    lookahead_hours = env_int("REVIEW_LOOKAHEAD_HOURS", 24)
-
+def run_review_cycle(notify: bool, session: requests.Session, lookahead_hours: int, print_report: bool = True) -> ReviewStats:
+    stats = ReviewStats()
     if not JOURNAL.exists():
-        print("No journal found at logs/signals.csv")
-        return 0
+        LOGGER.info("No journal found at logs/signals.csv")
+        return stats
 
     try:
         df = pd.read_csv(JOURNAL)
     except pd.errors.EmptyDataError:
-        print("Journal is empty.")
-        return 0
+        LOGGER.info("Journal is empty.")
+        return stats
 
     if df.empty:
-        print("Journal is empty.")
-        return 0
+        LOGGER.info("Journal is empty.")
+        return stats
 
     df = ensure_columns(df)
-    session = build_session()
+    open_mask = df["result"].astype(str).str.upper() == "OPEN"
+    stats.open_trades = int(open_mask.sum())
 
     for index, row in df.iterrows():
         previous_result = str(row.get("result", "OPEN")).upper()
@@ -331,7 +352,8 @@ def main() -> int:
         try:
             outcome = review_signal(session, row, lookahead_hours)
         except (requests.RequestException, ValueError, KeyError) as exc:
-            print(f"Review skipped for {row.get('symbol', 'UNKNOWN')}: {exc}")
+            stats.errors += 1
+            LOGGER.error("Review skipped for %s: %s", row.get("symbol", "UNKNOWN"), exc)
             continue
 
         df.at[index, "result"] = outcome.result
@@ -340,19 +362,68 @@ def main() -> int:
         df.at[index, "max_profit_pct"] = f"{outcome.max_profit_pct:.2f}"
         df.at[index, "max_drawdown_pct"] = f"{outcome.max_drawdown_pct:.2f}"
         updated_row = df.loc[index]
-        if (
-            args.notify
-            and outcome.result in {"WIN", "LOSS"}
-            and not alert_already_sent(row.get("outcome_alert_sent", 0))
-        ):
-            sent = send_telegram_alert(session, build_outcome_alert(updated_row))
-            if sent:
-                df.at[index, "outcome_alert_sent"] = 1
-                df.at[index, "outcome_alert_at"] = datetime.now(timezone.utc).isoformat()
+        if outcome.result == "WIN":
+            stats.tp_hits += 1
+        elif outcome.result == "LOSS":
+            stats.sl_hits += 1
+
+        if outcome.result in {"WIN", "LOSS"}:
+            if notify and not alert_already_sent(row.get("outcome_alert_sent", 0)):
+                sent = send_telegram_alert(session, build_outcome_alert(updated_row))
+                if sent:
+                    stats.sent_alerts += 1
+                    df.at[index, "outcome_alert_sent"] = 1
+                    df.at[index, "outcome_alert_at"] = datetime.now(timezone.utc).isoformat()
+                else:
+                    stats.skipped_alerts += 1
+            elif alert_already_sent(row.get("outcome_alert_sent", 0)) or not notify:
+                stats.skipped_alerts += 1
         time.sleep(0.2)
 
     df.to_csv(JOURNAL, index=False)
-    print_summary(df)
+    if print_report:
+        print_summary(df)
+    return stats
+
+
+def run_loop(notify: bool, lookahead_hours: int, interval_seconds: int) -> int:
+    LOGGER.info("Outcome checker started")
+    while True:
+        session = build_session()
+        try:
+            stats = run_review_cycle(notify=notify, session=session, lookahead_hours=lookahead_hours, print_report=False)
+            LOGGER.info(
+                "Open trades: %s | TP hits: %s | SL hits: %s | skipped alerts: %s | sent alerts: %s | errors: %s",
+                stats.open_trades,
+                stats.tp_hits,
+                stats.sl_hits,
+                stats.skipped_alerts,
+                stats.sent_alerts,
+                stats.errors,
+            )
+            LOGGER.info("Next outcome check in %s seconds", interval_seconds)
+            time.sleep(interval_seconds)
+        except Exception as exc:
+            LOGGER.exception("Outcome checker loop error: %s", exc)
+            LOGGER.info("Retrying outcome checker in %s seconds", ERROR_RETRY_SECONDS)
+            time.sleep(ERROR_RETRY_SECONDS)
+
+
+def main() -> int:
+    args = parse_args()
+    load_dotenv(BASE_DIR / ".env")
+    lookahead_hours = env_int("REVIEW_LOOKAHEAD_HOURS", 24)
+    interval_seconds = env_int(
+        "OUTCOME_LOOP_INTERVAL_SECONDS",
+        env_int("OUTCOME_CHECK_INTERVAL_MINUTES", 15) * 60,
+    )
+    loop_mode = env_bool("OUTCOME_LOOP_MODE", False)
+
+    if loop_mode:
+        return run_loop(notify=True, lookahead_hours=lookahead_hours, interval_seconds=interval_seconds)
+
+    session = build_session()
+    run_review_cycle(notify=args.notify, session=session, lookahead_hours=lookahead_hours, print_report=True)
     return 0
 
 
