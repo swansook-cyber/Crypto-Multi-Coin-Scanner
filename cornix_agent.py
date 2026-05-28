@@ -115,6 +115,18 @@ class ScannerConfig:
     use_btc_regime_filter: bool
     btc_sideway_penalty: int
     btc_low_vol_skip: bool
+    use_candle_body_filter: bool
+    min_body_ratio: float
+    use_wick_filter: bool
+    max_opposite_wick_ratio: float
+    use_atr_expansion_filter: bool
+    min_atr_expansion_ratio: float
+    use_losing_streak_protection: bool
+    max_symbol_loss_streak: int
+    symbol_pause_after_loss_minutes: int
+    use_daily_risk_guard: bool
+    max_daily_losses: int
+    max_daily_signals: int
     run_once: bool
     dry_run: bool
     ai_commentary: bool
@@ -171,6 +183,18 @@ class ScannerConfig:
             use_btc_regime_filter=env_bool("USE_BTC_REGIME_FILTER", True),
             btc_sideway_penalty=env_int("BTC_SIDEWAY_PENALTY", 10),
             btc_low_vol_skip=env_bool("BTC_LOW_VOL_SKIP", True),
+            use_candle_body_filter=env_bool("USE_CANDLE_BODY_FILTER", True),
+            min_body_ratio=env_float("MIN_BODY_RATIO", 0.45),
+            use_wick_filter=env_bool("USE_WICK_FILTER", True),
+            max_opposite_wick_ratio=env_float("MAX_OPPOSITE_WICK_RATIO", 0.45),
+            use_atr_expansion_filter=env_bool("USE_ATR_EXPANSION_FILTER", True),
+            min_atr_expansion_ratio=env_float("MIN_ATR_EXPANSION_RATIO", 1.05),
+            use_losing_streak_protection=env_bool("USE_LOSING_STREAK_PROTECTION", True),
+            max_symbol_loss_streak=env_int("MAX_SYMBOL_LOSS_STREAK", 2),
+            symbol_pause_after_loss_minutes=env_int("SYMBOL_PAUSE_AFTER_LOSS_MINUTES", 360),
+            use_daily_risk_guard=env_bool("USE_DAILY_RISK_GUARD", True),
+            max_daily_losses=env_int("MAX_DAILY_LOSSES", 5),
+            max_daily_signals=env_int("MAX_DAILY_SIGNALS", 12),
             run_once=env_bool("RUN_ONCE", False),
             dry_run=env_bool("DRY_RUN", False),
             ai_commentary=env_bool("AI_COMMENTARY", env_bool("USE_AI_COMMENTARY", True)),
@@ -232,6 +256,10 @@ class TradeSignal:
     atr_pct: float
     mfi: float
     mfi_confirmed: bool
+    body_ratio: float
+    opposite_wick_ratio: float
+    atr_expansion_ratio: float
+    quality_flags: str
     reason: str
     liquidation_context: str = ""
     ai_commentary: str = ""
@@ -457,6 +485,9 @@ class SignalScorer:
         regime = self.regime_detector.detect(df_1h)
 
         price = float(latest_1h["close"])
+        candle_open = float(latest_1h["open"])
+        candle_high = float(latest_1h["high"])
+        candle_low = float(latest_1h["low"])
         atr = float(latest_1h["atr14"])
         atr_pct = float(latest_1h["atr_pct"])
         mfi = float(latest_1h["mfi"]) if not pd.isna(latest_1h["mfi"]) else 50.0
@@ -495,6 +526,43 @@ class SignalScorer:
         long_score = max(0, long_score)
         short_score = max(0, short_score)
 
+        candle_range = max(candle_high - candle_low, 0.0)
+        candle_body = abs(price - candle_open)
+        body_ratio = candle_body / candle_range if candle_range > 0 else 0.0
+        upper_wick_ratio = (candle_high - max(candle_open, price)) / candle_range if candle_range > 0 else 0.0
+        lower_wick_ratio = (min(candle_open, price) - candle_low) / candle_range if candle_range > 0 else 0.0
+        atr_mean = float(df_1h["atr14"].iloc[-21:-1].mean())
+        atr_expansion_ratio = atr / atr_mean if atr_mean > 0 and not math.isnan(atr_mean) else 1.0
+        long_quality_flags: list[str] = []
+        short_quality_flags: list[str] = []
+
+        if self.config.use_candle_body_filter:
+            if not (price > candle_open and body_ratio >= self.config.min_body_ratio):
+                long_score = max(0, long_score - 12)
+                long_quality_flags.append("weak_body")
+            else:
+                long_quality_flags.append("strong_body")
+            if not (price < candle_open and body_ratio >= self.config.min_body_ratio):
+                short_score = max(0, short_score - 12)
+                short_quality_flags.append("weak_body")
+            else:
+                short_quality_flags.append("strong_body")
+
+        if self.config.use_wick_filter:
+            if upper_wick_ratio > self.config.max_opposite_wick_ratio:
+                long_score = max(0, long_score - 8)
+                long_quality_flags.append("upper_wick_risk")
+            if lower_wick_ratio > self.config.max_opposite_wick_ratio:
+                short_score = max(0, short_score - 8)
+                short_quality_flags.append("lower_wick_risk")
+
+        if self.config.use_atr_expansion_filter:
+            if atr_expansion_ratio < self.config.min_atr_expansion_ratio:
+                long_score = max(0, long_score - 8)
+                short_score = max(0, short_score - 8)
+                long_quality_flags.append("low_atr_expansion")
+                short_quality_flags.append("low_atr_expansion")
+
         long_mfi_confirmed = self.config.use_mfi_filter and mfi >= self.config.mfi_bullish_threshold
         short_mfi_confirmed = self.config.use_mfi_filter and mfi <= self.config.mfi_bearish_threshold
         if long_mfi_confirmed:
@@ -515,6 +583,8 @@ class SignalScorer:
         direction = "LONG" if long_score >= short_score else "SHORT"
         score = max(long_score, short_score)
         mfi_confirmed = long_mfi_confirmed if direction == "LONG" else short_mfi_confirmed
+        opposite_wick_ratio = upper_wick_ratio if direction == "LONG" else lower_wick_ratio
+        quality_flags = long_quality_flags if direction == "LONG" else short_quality_flags
         if direction == "LONG":
             entry = price
             sl = entry - atr * 1.0
@@ -532,6 +602,12 @@ class SignalScorer:
         confidence = min(95, max(1, score + (8 if rr >= self.config.min_rr else 0)))
         if self.config.use_mfi_filter and not mfi_confirmed:
             confidence = max(1, confidence - 4)
+        if self.config.use_candle_body_filter and "weak_body" in quality_flags:
+            confidence = max(1, confidence - 6)
+        if self.config.use_wick_filter and ("upper_wick_risk" in quality_flags or "lower_wick_risk" in quality_flags):
+            confidence = max(1, confidence - 5)
+        if self.config.use_atr_expansion_filter and "low_atr_expansion" in quality_flags:
+            confidence = max(1, confidence - 5)
         confidence, liquidation_context = self.liquidation_context.adjust(symbol, direction, confidence, price)
         mfi_reason = (
             "MFI bullish confirmation"
@@ -543,7 +619,8 @@ class SignalScorer:
         reason = (
             f"EMA {'bullish' if direction == 'LONG' else 'bearish'} trend on 1H; "
             f"15m confirmation {'confirmed' if (entry_long if direction == 'LONG' else entry_short) else 'weak'}; "
-            f"volume ratio {volume_ratio:.2f}; ATR {atr_pct:.2f}%; {mfi_reason}; RR {rr:.2f}"
+            f"volume ratio {volume_ratio:.2f}; ATR {atr_pct:.2f}%; "
+            f"body {body_ratio:.2f}; ATR expansion {atr_expansion_ratio:.2f}x; {mfi_reason}; RR {rr:.2f}"
         )
 
         return TradeSignal(
@@ -567,6 +644,10 @@ class SignalScorer:
             atr_pct=atr_pct,
             mfi=mfi,
             mfi_confirmed=mfi_confirmed,
+            body_ratio=body_ratio,
+            opposite_wick_ratio=opposite_wick_ratio,
+            atr_expansion_ratio=atr_expansion_ratio,
+            quality_flags=", ".join(quality_flags),
             liquidation_context=liquidation_context,
             reason=reason,
         )
@@ -730,6 +811,7 @@ class TradeJournalLogger:
     FIELDNAMES = [
         "timestamp", "symbol", "side", "entry", "stop_loss", "tp1", "tp2",
         "risk_reward", "confidence", "market_regime", "volume_spike", "score", "mfi", "mfi_confirmed", "ai_summary",
+        "body_ratio", "opposite_wick_ratio", "atr_expansion_ratio", "quality_flags",
         "signal_status", "skip_reason",
         "result", "hit_target", "closed_at", "max_profit_pct", "max_drawdown_pct",
         "outcome_alert_sent", "outcome_alert_at", "outcome_id",
@@ -759,6 +841,10 @@ class TradeJournalLogger:
             "max_drawdown_pct": "",
             "mfi": "",
             "mfi_confirmed": "",
+            "body_ratio": "",
+            "opposite_wick_ratio": "",
+            "atr_expansion_ratio": "",
+            "quality_flags": "",
             "signal_status": "",
             "skip_reason": "",
             "outcome_alert_sent": 0,
@@ -794,6 +880,10 @@ class TradeJournalLogger:
                     "mfi": f"{signal.mfi:.2f}",
                     "mfi_confirmed": "YES" if signal.mfi_confirmed else "NO",
                     "ai_summary": signal.ai_commentary,
+                    "body_ratio": f"{signal.body_ratio:.4f}",
+                    "opposite_wick_ratio": f"{signal.opposite_wick_ratio:.4f}",
+                    "atr_expansion_ratio": f"{signal.atr_expansion_ratio:.4f}",
+                    "quality_flags": signal.quality_flags,
                     "signal_status": signal_status,
                     "skip_reason": skip_reason,
                     "result": result,
@@ -830,6 +920,58 @@ class TradeJournalLogger:
         latest_loss = closed_at[mask].max()
         return pd.Timestamp.now(tz="UTC") - latest_loss < pd.Timedelta(minutes=minutes)
 
+    def symbol_loss_streak_active(self, signal: TradeSignal, max_losses: int, pause_minutes: int) -> bool:
+        if not self.path.exists():
+            return False
+        try:
+            df = pd.read_csv(self.path)
+        except (pd.errors.EmptyDataError, FileNotFoundError):
+            return False
+        required = {"symbol", "result", "closed_at"}
+        if df.empty or not required.issubset(df.columns):
+            return False
+        symbol_df = df[df["symbol"].astype(str).str.upper() == signal.symbol.upper()].copy()
+        symbol_df["closed_at"] = pd.to_datetime(symbol_df["closed_at"], utc=True, errors="coerce")
+        symbol_df = symbol_df[symbol_df["result"].astype(str).str.upper().isin(["WIN", "LOSS"]) & symbol_df["closed_at"].notna()]
+        if symbol_df.empty:
+            return False
+        symbol_df = symbol_df.sort_values("closed_at", ascending=False)
+        streak = 0
+        latest_loss_at = None
+        for _, row in symbol_df.iterrows():
+            if str(row["result"]).upper() != "LOSS":
+                break
+            streak += 1
+            latest_loss_at = row["closed_at"] if latest_loss_at is None else latest_loss_at
+        if streak < max_losses or latest_loss_at is None:
+            return False
+        return pd.Timestamp.now(tz="UTC") - latest_loss_at < pd.Timedelta(minutes=pause_minutes)
+
+    def daily_risk_guard_active(self, max_losses: int, max_signals: int) -> tuple[bool, str]:
+        if not self.path.exists():
+            return False, ""
+        try:
+            df = pd.read_csv(self.path)
+        except (pd.errors.EmptyDataError, FileNotFoundError):
+            return False, ""
+        if df.empty or "timestamp" not in df.columns:
+            return False, ""
+        today = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
+        timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        day_df = df[timestamps.dt.strftime("%Y-%m-%d") == today]
+        if day_df.empty:
+            return False, ""
+        sent_df = day_df[day_df.get("signal_status", "sent").fillna("sent") == "sent"] if "signal_status" in day_df else day_df
+        losses = 0
+        if "result" in df.columns and "closed_at" in df.columns:
+            closed_at = pd.to_datetime(df["closed_at"], utc=True, errors="coerce")
+            losses = int(((df["result"].astype(str).str.upper() == "LOSS") & (closed_at.dt.strftime("%Y-%m-%d") == today)).sum())
+        if losses >= max_losses:
+            return True, "max_daily_losses"
+        if len(sent_df) >= max_signals:
+            return True, "max_daily_signals"
+        return False, ""
+
     def summarize_day(self, day: str) -> dict[str, Any]:
         if not self.path.exists():
             return {"day": day, "total": 0}
@@ -843,6 +985,9 @@ class TradeJournalLogger:
         sent_df = day_df[day_df.get("signal_status", "sent").fillna("sent") == "sent"] if "signal_status" in day_df else day_df
         top_symbols = sent_df["symbol"].value_counts().head(3)
         statuses = day_df.get("signal_status", pd.Series([], dtype=str)).fillna("")
+        results = day_df.get("result", pd.Series([], dtype=str)).fillna("").astype(str).str.upper()
+        closed_at = pd.to_datetime(day_df.get("closed_at", pd.Series([], dtype=str)), utc=True, errors="coerce")
+        daily_losses = int(((results == "LOSS") & (closed_at.dt.strftime("%Y-%m-%d") == day)).sum())
         return {
             "day": day,
             "total": int(len(day_df)),
@@ -857,6 +1002,10 @@ class TradeJournalLogger:
             "skipped_correlation": int((statuses == "skipped_correlation").sum()),
             "skipped_btc_regime": int((statuses == "skipped_btc_regime").sum()),
             "skipped_not_top_candidate": int((statuses == "skipped_not_top_candidate").sum()),
+            "skipped_quality_filter": int((statuses == "logged_quality_filter").sum()),
+            "skipped_daily_risk_guard": int((statuses == "skipped_daily_risk_guard").sum()),
+            "skipped_losing_streak": int((statuses == "skipped_losing_streak").sum()),
+            "daily_losses": daily_losses,
             "top_symbols": ", ".join(f"{symbol} ({count})" for symbol, count in top_symbols.items()),
         }
 
@@ -908,6 +1057,8 @@ class TelegramNotifier:
             f"📊 Market: {signal.regime}\n"
             f"📦 Volume Spike: {volume_text}\n"
             f"📈 MFI: {signal.mfi:.1f}\n"
+            f"🕯 Body: {signal.body_ratio * 100:.0f}%\n"
+            f"🌊 ATR Expansion: {signal.atr_expansion_ratio:.2f}x\n"
             f"🧱 Support: {format_price(signal.support)}\n"
             f"🧱 Resistance: {format_price(signal.resistance)}\n\n"
             f"⚖️ Risk: {signal.risk_amount_usdt:.2f} USDT ({self.config.risk_per_trade_pct:.2f}%)\n"
@@ -931,6 +1082,10 @@ class TelegramNotifier:
             f"📈 Avg RR: {summary.get('avg_rr', 0):.2f}\n"
             f"📈 Avg MFI: {summary.get('avg_mfi', 0):.1f}\n"
             f"🔥 MFI-confirmed signals: {summary.get('mfi_confirmed_count', 0)}\n"
+            f"🛑 Daily losses: {summary.get('daily_losses', 0)}\n"
+            f"🧪 Skipped quality filter: {summary.get('skipped_quality_filter', 0)}\n"
+            f"🧯 Skipped daily risk guard: {summary.get('skipped_daily_risk_guard', 0)}\n"
+            f"🥶 Skipped losing streak: {summary.get('skipped_losing_streak', 0)}\n"
             f"🧊 Skipped loss cooldown: {summary.get('skipped_loss_cooldown', 0)}\n"
             f"🔗 Skipped correlation: {summary.get('skipped_correlation', 0)}\n"
             f"₿ Skipped BTC regime: {summary.get('skipped_btc_regime', 0)}\n"
@@ -1121,6 +1276,16 @@ class AgentRunner:
     def process_candidates(self, candidates: list[TradeSignal]) -> None:
         if not candidates:
             return
+        if self.config.use_daily_risk_guard:
+            risk_guard_active, risk_guard_reason = self.journal.daily_risk_guard_active(
+                self.config.max_daily_losses,
+                self.config.max_daily_signals,
+            )
+            if risk_guard_active:
+                for signal in candidates:
+                    self.journal.log_signal(signal, "skipped_daily_risk_guard", risk_guard_reason)
+                LOGGER.info("Daily risk guard active: %s", risk_guard_reason)
+                return
         btc_context = self.get_btc_context()
         eligible: list[TradeSignal] = []
         for signal in candidates:
@@ -1139,6 +1304,14 @@ class AgentRunner:
             if self.journal.is_recent_loss(signal, self.config.loss_cooldown_minutes):
                 self.journal.log_signal(signal, "skipped_loss_cooldown", "recent_sl_same_symbol_direction")
                 LOGGER.info("%s skipped: loss cooldown active for %s", signal.symbol, signal.direction)
+                continue
+            if self.config.use_losing_streak_protection and self.journal.symbol_loss_streak_active(
+                signal,
+                self.config.max_symbol_loss_streak,
+                self.config.symbol_pause_after_loss_minutes,
+            ):
+                self.journal.log_signal(signal, "skipped_losing_streak", "symbol_loss_streak_pause")
+                LOGGER.info("%s skipped: symbol losing streak pause", signal.symbol)
                 continue
             if self.apply_btc_regime_filter(signal, btc_context):
                 continue

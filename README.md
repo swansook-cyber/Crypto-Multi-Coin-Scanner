@@ -99,6 +99,18 @@ MAX_MAJOR_CORRELATED_SIGNALS=1
 USE_BTC_REGIME_FILTER=1
 BTC_SIDEWAY_PENALTY=10
 BTC_LOW_VOL_SKIP=1
+USE_CANDLE_BODY_FILTER=1
+MIN_BODY_RATIO=0.45
+USE_WICK_FILTER=1
+MAX_OPPOSITE_WICK_RATIO=0.45
+USE_ATR_EXPANSION_FILTER=1
+MIN_ATR_EXPANSION_RATIO=1.05
+USE_LOSING_STREAK_PROTECTION=1
+MAX_SYMBOL_LOSS_STREAK=2
+SYMBOL_PAUSE_AFTER_LOSS_MINUTES=360
+USE_DAILY_RISK_GUARD=1
+MAX_DAILY_LOSSES=5
+MAX_DAILY_SIGNALS=12
 MIN_VOLUME_RATIO=0.80
 MIN_ATR_PCT=0.35
 VOLUME_SPIKE_MULTIPLIER=1.20
@@ -119,6 +131,8 @@ Quality filter behavior:
 - Only the strongest `MAX_SIGNALS_PER_SCAN` candidates are sent each scan
 - Major correlated coins (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `LTCUSDT`) are capped by direction
 - If the same symbol and direction recently hit SL, loss cooldown blocks repeats
+- Candle body, opposite wick, and ATR expansion filters reduce weak breakout setups
+- Daily risk guard stops new signals after too many daily losses or signals
 
 No-trade filter behavior:
 
@@ -133,6 +147,8 @@ Overtrade controls:
 - `MAX_MAJOR_CORRELATED_SIGNALS` keeps highly correlated majors from firing together.
 - `USE_BTC_REGIME_FILTER` reduces altcoin confidence when BTC is sideway and can skip weak altcoin setups when BTC volatility is too low.
 - `MAX_SIGNALS_PER_SCAN` sends only the best ranked setups after all candidates are scored.
+- `USE_LOSING_STREAK_PROTECTION` pauses a symbol after repeated losses.
+- `USE_DAILY_RISK_GUARD` pauses new signals for the day when risk limits are reached.
 
 ## Strategy Components
 
@@ -141,6 +157,8 @@ Overtrade controls:
 - Volume: volume ratio and spike detection improve signal quality.
 - MTF confirmation: 15m EMA/RSI confirms entry timing inside the 1H trend.
 - MFI confirmation: Money Flow Index confirms buying/selling pressure. LONG setups get a bonus when MFI is above `MFI_BULLISH_THRESHOLD`; SHORT setups get a bonus when MFI is below `MFI_BEARISH_THRESHOLD`. If MFI is against direction, confidence is reduced slightly.
+- Candle quality: body strength and opposite wick filters reduce fake breakouts and wick traps.
+- ATR expansion: current ATR is compared with recent ATR to avoid breakouts without volatility expansion.
 - Optional liquidation context: disabled by default. It is a lightweight placeholder for future context sources and only adjusts confidence; it is never the main signal source.
 
 The scanner stays lightweight: no websocket stream, no heavy polling, and no realtime orderflow engine. It is intended to run comfortably on a small VPS.
@@ -249,6 +267,10 @@ Columns:
 - mfi
 - mfi_confirmed
 - ai_summary
+- body_ratio
+- opposite_wick_ratio
+- atr_expansion_ratio
+- quality_flags
 - result
 - hit_target
 - closed_at
