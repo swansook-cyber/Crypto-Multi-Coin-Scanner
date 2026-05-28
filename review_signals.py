@@ -350,6 +350,12 @@ def print_summary(df: pd.DataFrame) -> None:
         symbol_win_rates[symbol] = float((group["result"] == "WIN").mean() * 100)
     best_symbol = max(symbol_win_rates, key=symbol_win_rates.get) if symbol_win_rates else "-"
     worst_symbol = min(symbol_win_rates, key=symbol_win_rates.get) if symbol_win_rates else "-"
+    tier_win_rates: dict[str, float] = {}
+    if "watchlist_tier" in df.columns:
+        closed_by_tier = df[df["result"].isin(["WIN", "LOSS"])].copy()
+        for tier, group in closed_by_tier.groupby(closed_by_tier["watchlist_tier"].fillna("B").astype(str).str.upper()):
+            tier_win_rates[tier] = float((group["result"] == "WIN").mean() * 100)
+    best_tier = max(tier_win_rates, key=tier_win_rates.get) if tier_win_rates else "-"
 
     print("Crypto Multi-Coin Scanner Outcome Review")
     print("----------------------------------------")
@@ -361,6 +367,10 @@ def print_summary(df: pd.DataFrame) -> None:
     print(f"Avg RR: {rr.mean():.2f}")
     print(f"Best symbol: {best_symbol}")
     print(f"Worst symbol: {worst_symbol}")
+    print(f"Best tier: {best_tier}")
+    if tier_win_rates:
+        tier_text = ", ".join(f"{tier}: {rate:.1f}%" for tier, rate in sorted(tier_win_rates.items()))
+        print(f"Tier win rates: {tier_text}")
     print()
     print("Summary table")
     print("-------------")

@@ -4,7 +4,7 @@ Telegram signal assistant for Binance Futures. The scanner is rule-based and qua
 
 ## What It Does
 
-- Scans 10 Binance Futures symbols using `BTCUSDT` format
+- Scans tiered Binance Futures symbols using `BTCUSDT` format
 - Shows TradingView symbols like `BINANCE:BTCUSDT.P`
 - Waits for closed 1H candles, then uses 15m confirmation
 - Sends Telegram alerts only for high-quality signals
@@ -86,7 +86,10 @@ This sends a test-only message and, if present, `charts/test_chart.png`. It does
 ## Important Config
 
 ```env
-WATCHLIST=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,LTCUSDT,ZECUSDT,HYPEUSDT,LABUSDT
+WATCHLIST_TIER_A=BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT
+WATCHLIST_TIER_B=HYPEUSDT,SUIUSDT,DOGEUSDT,LINKUSDT,AVAXUSDT,ADAUSDT,DOTUSDT,NEARUSDT,OPUSDT,ARBUSDT,APTUSDT,INJUSDT,FILUSDT,LTCUSDT,ZECUSDT
+WATCHLIST_TIER_C=PEPEUSDT,WIFUSDT,FLOKIUSDT,BONKUSDT,SEIUSDT,ORDIUSDT,ATOMUSDT,AAVEUSDT,UNIUSDT,RUNEUSDT
+SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,LTCUSDT,ZECUSDT,HYPEUSDT,LABUSDT
 SCORE_THRESHOLD=70
 MIN_CONFIDENCE=75
 MIN_RR=1.8
@@ -133,12 +136,23 @@ Quality filter behavior:
 - If the same symbol and direction recently hit SL, loss cooldown blocks repeats
 - Candle body, opposite wick, and ATR expansion filters reduce weak breakout setups
 - Daily risk guard stops new signals after too many daily losses or signals
+- Tier C setups require stronger confirmation and use a longer cooldown
 
 No-trade filter behavior:
 
 - Sideway market: skip
 - Low volume ratio: skip
 - ATR below `MIN_ATR_PCT`: skip
+
+## Watchlist Tiers
+
+The scanner supports three watchlist tiers, about 30 symbols total:
+
+- Tier A: core/high liquidity coins. These receive a small confidence bonus and higher priority when candidates are tied.
+- Tier B: standard momentum coins. These use the normal rule engine.
+- Tier C: experimental or higher-noise coins. These receive a small confidence penalty, require volume spike or MFI confirmation, require score 80+, and use 1.5x cooldown.
+
+If `WATCHLIST_TIER_A`, `WATCHLIST_TIER_B`, or `WATCHLIST_TIER_C` is set, tier mode is used. If tier variables are not set, legacy `SYMBOLS` is still supported and symbols default to Tier B.
 
 Overtrade controls:
 
@@ -264,6 +278,7 @@ Columns:
 - market_regime
 - volume_spike
 - score
+- watchlist_tier
 - mfi
 - mfi_confirmed
 - ai_summary

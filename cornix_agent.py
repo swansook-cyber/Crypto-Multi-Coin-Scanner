@@ -103,6 +103,7 @@ LOGGER = setup_logging()
 @dataclass
 class ScannerConfig:
     watchlist: list[str]
+    watchlist_tiers: dict[str, str]
     score_threshold: int
     min_confidence: int
     min_rr: float
@@ -160,17 +161,47 @@ class ScannerConfig:
 
     @classmethod
     def from_env(cls) -> "ScannerConfig":
-        default_watchlist = (
-            "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,"
-            "LTCUSDT,ZECUSDT,HYPEUSDT,LABUSDT"
-        )
-        watchlist = [
-            SymbolFormatter.to_binance_symbol(item)
-            for item in os.getenv("WATCHLIST", default_watchlist).split(",")
-            if item.strip()
-        ]
+        default_tier_a = "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT"
+        default_tier_b = "HYPEUSDT,SUIUSDT,DOGEUSDT,LINKUSDT,AVAXUSDT,ADAUSDT,DOTUSDT,NEARUSDT,OPUSDT,ARBUSDT,APTUSDT,INJUSDT,FILUSDT,LTCUSDT,ZECUSDT"
+        default_tier_c = "PEPEUSDT,WIFUSDT,FLOKIUSDT,BONKUSDT,SEIUSDT,ORDIUSDT,ATOMUSDT,AAVEUSDT,UNIUSDT,RUNEUSDT"
+        default_watchlist = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,LTCUSDT,ZECUSDT,HYPEUSDT,LABUSDT"
+
+        def parse_symbols(value: str) -> list[str]:
+            symbols: list[str] = []
+            for item in value.split(","):
+                if not item.strip():
+                    continue
+                symbol = SymbolFormatter.to_binance_symbol(item)
+                if symbol and symbol not in symbols:
+                    symbols.append(symbol)
+            return symbols
+
+        tier_values = {
+            "A": os.getenv("WATCHLIST_TIER_A", "").strip(),
+            "B": os.getenv("WATCHLIST_TIER_B", "").strip(),
+            "C": os.getenv("WATCHLIST_TIER_C", "").strip(),
+        }
+        if any(tier_values.values()):
+            tier_lists = {
+                "A": parse_symbols(tier_values["A"] or default_tier_a),
+                "B": parse_symbols(tier_values["B"] or default_tier_b),
+                "C": parse_symbols(tier_values["C"] or default_tier_c),
+            }
+            watchlist = []
+            watchlist_tiers = {}
+            for tier in ("A", "B", "C"):
+                for symbol in tier_lists[tier]:
+                    if symbol not in watchlist_tiers:
+                        watchlist.append(symbol)
+                        watchlist_tiers[symbol] = tier
+        else:
+            legacy_symbols = os.getenv("SYMBOLS", os.getenv("WATCHLIST", default_watchlist))
+            watchlist = parse_symbols(legacy_symbols)
+            watchlist_tiers = {symbol: "B" for symbol in watchlist}
+
         return cls(
-            watchlist=watchlist[:10],
+            watchlist=watchlist,
+            watchlist_tiers=watchlist_tiers,
             score_threshold=env_int("SCORE_THRESHOLD", 70),
             min_confidence=env_int("MIN_CONFIDENCE", 75),
             min_rr=env_float("MIN_RR", 1.8),
@@ -238,6 +269,7 @@ class MarketRegime:
 class TradeSignal:
     timestamp: datetime
     symbol: str
+    watchlist_tier: str
     tradingview_symbol: str
     direction: str
     entry: float
@@ -478,6 +510,7 @@ class SignalScorer:
         self.liquidation_context = LiquidationContextFilter(config)
 
     def score(self, symbol: str, df_1h: pd.DataFrame, df_15m: pd.DataFrame, fear_greed: int | None = None) -> TradeSignal | None:
+        watchlist_tier = self.config.watchlist_tiers.get(symbol, "B")
         latest_1h = df_1h.iloc[-1]
         latest_15m = df_15m.iloc[-1]
         previous_20 = df_1h.iloc[-21:-1]
@@ -600,6 +633,16 @@ class SignalScorer:
         reward = abs(tp2 - entry)
         rr = reward / risk if risk > 0 else 0
         confidence = min(95, max(1, score + (8 if rr >= self.config.min_rr else 0)))
+        if watchlist_tier == "A":
+            confidence = min(95, confidence + 3)
+        elif watchlist_tier == "C":
+            confidence = max(1, confidence - 3)
+            if not volume_spike and not mfi_confirmed:
+                score = max(0, score - 20)
+                confidence = max(1, confidence - 8)
+                quality_flags.append("tier_c_needs_volume_or_mfi")
+            if score < 80:
+                quality_flags.append("tier_c_score_below_80")
         if self.config.use_mfi_filter and not mfi_confirmed:
             confidence = max(1, confidence - 4)
         if self.config.use_candle_body_filter and "weak_body" in quality_flags:
@@ -626,6 +669,7 @@ class SignalScorer:
         return TradeSignal(
             timestamp=datetime.now(timezone.utc),
             symbol=symbol,
+            watchlist_tier=watchlist_tier,
             tradingview_symbol=SymbolFormatter.to_tradingview_symbol(symbol),
             direction=direction,
             entry=entry,
@@ -810,7 +854,7 @@ Rule reason without exact RR/confidence values: {reason_context}
 class TradeJournalLogger:
     FIELDNAMES = [
         "timestamp", "symbol", "side", "entry", "stop_loss", "tp1", "tp2",
-        "risk_reward", "confidence", "market_regime", "volume_spike", "score", "mfi", "mfi_confirmed", "ai_summary",
+        "risk_reward", "confidence", "market_regime", "volume_spike", "score", "watchlist_tier", "mfi", "mfi_confirmed", "ai_summary",
         "body_ratio", "opposite_wick_ratio", "atr_expansion_ratio", "quality_flags",
         "signal_status", "skip_reason",
         "result", "hit_target", "closed_at", "max_profit_pct", "max_drawdown_pct",
@@ -841,6 +885,7 @@ class TradeJournalLogger:
             "max_drawdown_pct": "",
             "mfi": "",
             "mfi_confirmed": "",
+            "watchlist_tier": "B",
             "body_ratio": "",
             "opposite_wick_ratio": "",
             "atr_expansion_ratio": "",
@@ -877,6 +922,7 @@ class TradeJournalLogger:
                     "market_regime": signal.regime,
                     "volume_spike": "YES" if signal.volume_spike else "NO",
                     "score": signal.score,
+                    "watchlist_tier": signal.watchlist_tier,
                     "mfi": f"{signal.mfi:.2f}",
                     "mfi_confirmed": "YES" if signal.mfi_confirmed else "NO",
                     "ai_summary": signal.ai_commentary,
@@ -988,6 +1034,13 @@ class TradeJournalLogger:
         results = day_df.get("result", pd.Series([], dtype=str)).fillna("").astype(str).str.upper()
         closed_at = pd.to_datetime(day_df.get("closed_at", pd.Series([], dtype=str)), utc=True, errors="coerce")
         daily_losses = int(((results == "LOSS") & (closed_at.dt.strftime("%Y-%m-%d") == day)).sum())
+        tier_series = sent_df.get("watchlist_tier", pd.Series([], dtype=str)).fillna("B").astype(str).str.upper()
+        tier_win_rates = {}
+        if "watchlist_tier" in sent_df and "result" in sent_df:
+            closed_sent = sent_df[sent_df["result"].astype(str).str.upper().isin(["WIN", "LOSS"])]
+            for tier, group in closed_sent.groupby(closed_sent["watchlist_tier"].fillna("B").astype(str).str.upper()):
+                tier_win_rates[tier] = float((group["result"].astype(str).str.upper() == "WIN").mean() * 100)
+        best_tier = max(tier_win_rates, key=tier_win_rates.get) if tier_win_rates else "-"
         return {
             "day": day,
             "total": int(len(day_df)),
@@ -1006,6 +1059,10 @@ class TradeJournalLogger:
             "skipped_daily_risk_guard": int((statuses == "skipped_daily_risk_guard").sum()),
             "skipped_losing_streak": int((statuses == "skipped_losing_streak").sum()),
             "daily_losses": daily_losses,
+            "tier_a_sent": int((tier_series == "A").sum()),
+            "tier_b_sent": int((tier_series == "B").sum()),
+            "tier_c_sent": int((tier_series == "C").sum()),
+            "best_tier_by_win_rate": best_tier,
             "top_symbols": ", ".join(f"{symbol} ({count})" for symbol, count in top_symbols.items()),
         }
 
@@ -1055,6 +1112,7 @@ class TelegramNotifier:
             f"🔥 Confidence: {signal.confidence}%\n"
             f"⭐ Score: {signal.score}\n\n"
             f"📊 Market: {signal.regime}\n"
+            f"🏷 Tier: {signal.watchlist_tier}\n"
             f"📦 Volume Spike: {volume_text}\n"
             f"📈 MFI: {signal.mfi:.1f}\n"
             f"🕯 Body: {signal.body_ratio * 100:.0f}%\n"
@@ -1081,6 +1139,10 @@ class TelegramNotifier:
             f"🔥 Avg confidence: {summary.get('avg_confidence', 0):.1f}%\n"
             f"📈 Avg RR: {summary.get('avg_rr', 0):.2f}\n"
             f"📈 Avg MFI: {summary.get('avg_mfi', 0):.1f}\n"
+            f"🏷 Tier A sent: {summary.get('tier_a_sent', 0)}\n"
+            f"🏷 Tier B sent: {summary.get('tier_b_sent', 0)}\n"
+            f"🏷 Tier C sent: {summary.get('tier_c_sent', 0)}\n"
+            f"🏆 Best tier win rate: {summary.get('best_tier_by_win_rate', '-')}\n"
             f"🔥 MFI-confirmed signals: {summary.get('mfi_confirmed_count', 0)}\n"
             f"🛑 Daily losses: {summary.get('daily_losses', 0)}\n"
             f"🧪 Skipped quality filter: {summary.get('skipped_quality_filter', 0)}\n"
@@ -1172,7 +1234,8 @@ class AgentRunner:
         if not data:
             return False
         elapsed = time.time() - float(data.get("sent_at", 0))
-        if elapsed >= self.config.cooldown_minutes * 60:
+        cooldown_minutes = self.config.cooldown_minutes * (1.5 if signal.watchlist_tier == "C" else 1.0)
+        if elapsed >= cooldown_minutes * 60:
             return False
         last_confidence = int(data.get("confidence", 0))
         if signal.confidence >= last_confidence + self.config.confidence_override_delta:
@@ -1217,7 +1280,7 @@ class AgentRunner:
         self._save_state()
 
     def run_forever(self) -> None:
-        LOGGER.info("Watchlist: %s", ", ".join(self.config.watchlist))
+        LOGGER.info("Watchlist: %s", ", ".join(f"{symbol}({self.config.watchlist_tiers.get(symbol, 'B')})" for symbol in self.config.watchlist))
         LOGGER.info(
             "Threshold=%s min_confidence=%s min_rr=%.2f cooldown=%sm dry_run=%s ai_commentary=%s",
             self.config.score_threshold,
@@ -1255,6 +1318,8 @@ class AgentRunner:
                 signal = self.scan_symbol(symbol)
                 if signal:
                     candidates.append(signal)
+            except requests.HTTPError as exc:
+                LOGGER.warning("Scan skipped for %s: %s", symbol, exc)
             except Exception as exc:
                 LOGGER.exception("Scan failed for %s: %s", symbol, exc)
             time.sleep(self.config.request_delay_seconds)
@@ -1289,6 +1354,14 @@ class AgentRunner:
         btc_context = self.get_btc_context()
         eligible: list[TradeSignal] = []
         for signal in candidates:
+            if signal.watchlist_tier == "C" and signal.score < 80:
+                self.journal.log_signal(signal, "logged_quality_filter", "tier_c_score_below_80")
+                LOGGER.info("%s logged only: Tier C score %s below 80", signal.symbol, signal.score)
+                continue
+            if signal.watchlist_tier == "C" and not signal.volume_spike and not signal.mfi_confirmed:
+                self.journal.log_signal(signal, "logged_quality_filter", "tier_c_needs_volume_or_mfi")
+                LOGGER.info("%s logged only: Tier C requires volume spike or MFI confirmation", signal.symbol)
+                continue
             if signal.score < self.config.score_threshold:
                 self.journal.log_signal(signal, "logged_quality_filter", "score_below_threshold")
                 LOGGER.info("%s logged only: score %s below threshold %s", signal.symbol, signal.score, self.config.score_threshold)
@@ -1364,7 +1437,13 @@ class AgentRunner:
         major_symbols = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "LTCUSDT"}
         ranked = sorted(
             candidates,
-            key=lambda item: (item.score, item.confidence, int(item.volume_spike), item.rr),
+            key=lambda item: (
+                item.score,
+                item.confidence,
+                {"A": 3, "B": 2, "C": 1}.get(item.watchlist_tier, 2),
+                int(item.volume_spike),
+                item.rr,
+            ),
             reverse=True,
         )
         selected: list[TradeSignal] = []
@@ -1394,8 +1473,8 @@ class AgentRunner:
 
 def main() -> None:
     config = ScannerConfig.from_env()
-    if len(config.watchlist) != 10:
-        LOGGER.warning("WATCHLIST has %s symbols; expected 10", len(config.watchlist))
+    if len(config.watchlist) != 30:
+        LOGGER.warning("WATCHLIST has %s symbols; tier mode expects about 30", len(config.watchlist))
     AgentRunner(config).run_forever()
 
 
