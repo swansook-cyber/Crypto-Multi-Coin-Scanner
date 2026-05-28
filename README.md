@@ -204,6 +204,8 @@ It prints a console report and exports:
 - `reports/symbol_performance.csv`
 - `reports/tier_performance.csv`
 
+The dashboard also groups performance by score bucket, setup strength range, HTF alignment/conflict, and market session. Public signal messages use `Setup Strength` instead of `Confidence` so the score is not presented as win probability.
+
 ## Tier Review
 
 Run:
@@ -302,7 +304,7 @@ Alerts are mobile-friendly and include:
 - SL
 - TP1/TP2
 - RR
-- Confidence
+- Setup Strength
 - Market regime
 - Volume spike
 - MFI
@@ -323,7 +325,7 @@ Example:
 🎯 TP2: 71000
 
 📈 RR: 1:2.10
-🔥 Confidence: 82%
+🔥 Setup Strength: 82%
 ```
 
 ## Trade Journal
@@ -345,9 +347,12 @@ Columns:
 - tp2
 - risk_reward
 - confidence
+- setup_strength
 - market_regime
 - volume_spike
 - score
+- raw_score
+- score_bucket
 - watchlist_tier
 - mfi
 - mfi_confirmed
@@ -359,6 +364,8 @@ Columns:
 - market_session
 - htf_regime
 - htf_alignment
+- htf_conflict
+- signal_version
 - result
 - hit_target
 - closed_at

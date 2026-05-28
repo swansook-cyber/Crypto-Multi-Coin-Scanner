@@ -40,6 +40,11 @@ OUTCOME_COLUMNS = {
     "market_session": "",
     "htf_regime": "",
     "htf_alignment": "",
+    "setup_strength": "",
+    "raw_score": "",
+    "score_bucket": "",
+    "htf_conflict": "",
+    "signal_version": "",
     "result": "OPEN",
     "hit_target": "",
     "closed_at": "",
@@ -386,6 +391,7 @@ def print_summary(df: pd.DataFrame) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Review signal outcomes from Binance Futures candles.")
     parser.add_argument("--notify", action="store_true", help="Send Telegram alerts for newly closed outcomes.")
+    parser.add_argument("--dry-run", action="store_true", help="Review outcomes without sending Telegram alerts.")
     return parser.parse_args()
 
 
@@ -502,7 +508,7 @@ def main() -> int:
         return run_loop(notify=True, lookahead_hours=lookahead_hours, interval_seconds=interval_seconds)
 
     session = build_session()
-    run_review_cycle(notify=args.notify, session=session, lookahead_hours=lookahead_hours, print_report=True)
+    run_review_cycle(notify=args.notify and not args.dry_run, session=session, lookahead_hours=lookahead_hours, print_report=True)
     return 0
 
 

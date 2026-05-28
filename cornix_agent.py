@@ -44,6 +44,7 @@ CHART_DIR = BASE_DIR / "charts"
 STATE_FILE = BASE_DIR / "signal_state.json"
 LOG_FILE = LOG_DIR / "cornix_agent.log"
 SIGNAL_JOURNAL = LOG_DIR / "signals.csv"
+SIGNAL_VERSION = "internal-lab-v2"
 
 LOG_DIR.mkdir(exist_ok=True)
 CHART_DIR.mkdir(exist_ok=True)
@@ -79,6 +80,17 @@ def format_price(value: float) -> str:
     if value >= 1:
         return f"{value:.4f}"
     return f"{value:.6f}"
+
+
+def score_bucket(value: float | int) -> str:
+    score = float(value)
+    if score >= 90:
+        return "A+"
+    if score >= 80:
+        return "A"
+    if score >= 70:
+        return "B"
+    return "C"
 
 
 def setup_logging() -> logging.Logger:
@@ -883,6 +895,8 @@ class AICommentaryEngine:
 Write trader-style market commentary for this rule-based Binance Futures signal.
 Use English. Keep it to 1-2 short sentences under 240 characters.
 Mention momentum, trend strength, MFI condition, volatility context, and BTC alignment when useful.
+Use cautious professional wording such as "sell pressure", "momentum supports", or "continuation is possible under system conditions".
+Avoid overconfident wording such as "clearly", "guaranteed", "certain", "แนวโน้มขาลงชัดเจน", or "ชัดเจน".
 Do not repeat exact RR, exact confidence, entry, TP, SL, score, or numeric indicator values.
 Do not override the trade logic and do not promise profit.
 
@@ -905,6 +919,9 @@ Rule reason without exact RR/confidence values: {reason_context}
         sentences = re.split(r"(?<=[.!?])\s+", cleaned.strip())
         kept = [sentence for sentence in sentences if sentence and not banned.match(sentence.strip())]
         cleaned = " ".join(kept[:2]).strip()
+        cleaned = re.sub(r"\bclearly\b", "appears to", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bguaranteed\b|\bcertain\b", "possible", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("แนวโน้มขาลงชัดเจน", "มีแรงกดดันฝั่งขาย").replace("ชัดเจน", "ตามเงื่อนไขของระบบ")
         return cleaned[:240].rstrip(" ,;:")
 
     def summarize(self, signal: TradeSignal) -> str:
@@ -937,9 +954,9 @@ Rule reason without exact RR/confidence values: {reason_context}
 class TradeJournalLogger:
     FIELDNAMES = [
         "timestamp", "symbol", "side", "entry", "stop_loss", "tp1", "tp2",
-        "risk_reward", "confidence", "market_regime", "volume_spike", "score", "watchlist_tier", "mfi", "mfi_confirmed", "ai_summary",
+        "risk_reward", "confidence", "setup_strength", "market_regime", "volume_spike", "score", "raw_score", "score_bucket", "watchlist_tier", "mfi", "mfi_confirmed", "ai_summary",
         "body_ratio", "opposite_wick_ratio", "atr_expansion_ratio", "quality_flags",
-        "market_session", "htf_regime", "htf_alignment",
+        "market_session", "htf_regime", "htf_alignment", "htf_conflict", "signal_version",
         "signal_status", "skip_reason",
         "result", "hit_target", "closed_at", "max_profit_pct", "max_drawdown_pct",
         "outcome_alert_sent", "outcome_alert_at", "outcome_id",
@@ -970,6 +987,9 @@ class TradeJournalLogger:
             "mfi": "",
             "mfi_confirmed": "",
             "watchlist_tier": "B",
+            "setup_strength": "",
+            "raw_score": "",
+            "score_bucket": "",
             "body_ratio": "",
             "opposite_wick_ratio": "",
             "atr_expansion_ratio": "",
@@ -977,6 +997,8 @@ class TradeJournalLogger:
             "market_session": "",
             "htf_regime": "",
             "htf_alignment": "",
+            "htf_conflict": "",
+            "signal_version": SIGNAL_VERSION,
             "signal_status": "",
             "skip_reason": "",
             "outcome_alert_sent": 0,
@@ -1006,9 +1028,12 @@ class TradeJournalLogger:
                     "tp2": format_price(signal.tp2),
                     "risk_reward": f"{signal.rr:.2f}",
                     "confidence": signal.confidence,
+                    "setup_strength": signal.confidence,
                     "market_regime": signal.regime,
                     "volume_spike": "YES" if signal.volume_spike else "NO",
                     "score": signal.score,
+                    "raw_score": signal.score,
+                    "score_bucket": score_bucket(signal.confidence),
                     "watchlist_tier": signal.watchlist_tier,
                     "mfi": f"{signal.mfi:.2f}",
                     "mfi_confirmed": "YES" if signal.mfi_confirmed else "NO",
@@ -1020,6 +1045,8 @@ class TradeJournalLogger:
                     "market_session": signal.market_session,
                     "htf_regime": signal.htf_regime,
                     "htf_alignment": signal.htf_alignment,
+                    "htf_conflict": "YES" if signal.htf_alignment == "Conflict" else "NO",
+                    "signal_version": SIGNAL_VERSION,
                     "signal_status": signal_status,
                     "skip_reason": skip_reason,
                     "result": result,
@@ -1172,7 +1199,7 @@ class ChartExporter:
         ax.axhline(signal.tp1, color="#22c55e", linestyle="-.", linewidth=1, label="TP1")
         ax.axhline(signal.tp2, color="#15803d", linestyle="-.", linewidth=1, label="TP2")
         ax.axhline(signal.sl, color="#ef4444", linestyle="-.", linewidth=1, label="SL")
-        ax.set_title(f"{signal.tradingview_symbol} {signal.direction} | RR {signal.rr:.2f} | Confidence {signal.confidence}%")
+        ax.set_title(f"{signal.tradingview_symbol} {signal.direction} | RR {signal.rr:.2f} | Setup Strength {signal.confidence}%")
         ax.grid(True, alpha=0.25)
         ax.legend(loc="best")
         fig.autofmt_xdate()
@@ -1193,6 +1220,8 @@ class TelegramNotifier:
         signal_emoji = "🚀" if signal.direction == "LONG" else "🔻"
         volume_text = "YES" if signal.volume_spike else "NO"
         commentary = f"\n\n🧠 AI Summary:\n{signal.ai_commentary}" if signal.ai_commentary else ""
+        htf_alignment_yes = "YES" if signal.htf_alignment == "Aligned" else "NO"
+        htf_conflict_yes = "YES" if signal.htf_alignment == "Conflict" else "NO"
         return (
             f"{signal_emoji} {signal.direction} SIGNAL\n"
             f"🪙 {SymbolFormatter.to_display_symbol(signal.symbol)}\n\n"
@@ -1201,12 +1230,16 @@ class TelegramNotifier:
             f"🎯 TP1: {format_price(signal.tp1)}\n"
             f"🎯 TP2: {format_price(signal.tp2)}\n\n"
             f"📈 RR: 1:{signal.rr:.2f}\n"
-            f"🔥 Confidence: {signal.confidence}%\n"
+            f"🔥 Setup Strength: {signal.confidence}%\n"
             f"⭐ Score: {signal.score}\n\n"
             f"📊 Market: {signal.regime}\n"
             f"🏷 Tier: {signal.watchlist_tier}\n"
-            f"🕒 Session: {signal.market_session}\n"
-            f"🧭 4H Regime: {signal.htf_regime}\n"
+            f"🕒 Session: {signal.market_session or 'Other'}\n\n"
+            f"🧭 HTF:\n"
+            f"4H Trend: {signal.htf_regime}\n"
+            f"Alignment: {htf_alignment_yes}\n"
+            f"Conflict: {htf_conflict_yes}\n"
+            f"Regime Score: {score_bucket(signal.confidence)}\n\n"
             f"📦 Volume Spike: {volume_text}\n"
             f"📈 MFI: {signal.mfi:.1f}\n"
             f"🕯 Body: {signal.body_ratio * 100:.0f}%\n"
@@ -1217,6 +1250,8 @@ class TelegramNotifier:
             f"📐 Size: {signal.position_size_coin:.6f} {signal.symbol.replace('USDT', '')}\n\n"
             f"🧠 Reason:\n{signal.reason}"
             f"{commentary}\n\n"
+            f"⚠️ สัญญาณนี้ใช้เพื่อเก็บสถิติ/ทดสอบระบบเท่านั้น ไม่ใช่คำแนะนำการลงทุน\n"
+            f"⚠️ Signal is for research/testing only. No auto-trade. Manage risk manually.\n\n"
             f"Exchange: Binance Futures\n"
             f"Leverage: Cross {self.config.max_leverage}x\n"
             f"TradingView: {signal.tradingview_symbol}"
@@ -1230,7 +1265,7 @@ class TelegramNotifier:
             f"✅ Sent signals: {summary.get('sent_total', 0)}\n"
             f"🚀 Long: {summary.get('long_count', 0)}\n"
             f"🔻 Short: {summary.get('short_count', 0)}\n"
-            f"🔥 Avg confidence: {summary.get('avg_confidence', 0):.1f}%\n"
+            f"🔥 Avg setup strength: {summary.get('avg_confidence', 0):.1f}%\n"
             f"📈 Avg RR: {summary.get('avg_rr', 0):.2f}\n"
             f"📈 Avg MFI: {summary.get('avg_mfi', 0):.1f}\n"
             f"🕒 Sent by session: {summary.get('sent_by_session') or '-'}\n"
