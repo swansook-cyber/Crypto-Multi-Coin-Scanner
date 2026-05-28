@@ -128,6 +128,15 @@ class ScannerConfig:
     use_daily_risk_guard: bool
     max_daily_losses: int
     max_daily_signals: int
+    use_session_filter: bool
+    active_sessions: list[str]
+    allow_asia_session: bool
+    session_penalty_asia: int
+    use_4h_regime_filter: bool
+    htf_timeframe: str
+    trend_timeframe: str
+    entry_timeframe: str
+    htf_conflict_penalty: int
     run_once: bool
     dry_run: bool
     ai_commentary: bool
@@ -226,6 +235,15 @@ class ScannerConfig:
             use_daily_risk_guard=env_bool("USE_DAILY_RISK_GUARD", True),
             max_daily_losses=env_int("MAX_DAILY_LOSSES", 5),
             max_daily_signals=env_int("MAX_DAILY_SIGNALS", 12),
+            use_session_filter=env_bool("USE_SESSION_FILTER", True),
+            active_sessions=[item.strip() for item in os.getenv("ACTIVE_SESSIONS", "London,NewYork").split(",") if item.strip()],
+            allow_asia_session=env_bool("ALLOW_ASIA_SESSION", True),
+            session_penalty_asia=env_int("SESSION_PENALTY_ASIA", 3),
+            use_4h_regime_filter=env_bool("USE_4H_REGIME_FILTER", True),
+            htf_timeframe=os.getenv("HTF_TIMEFRAME", "4h").strip(),
+            trend_timeframe=os.getenv("TREND_TIMEFRAME", "1h").strip(),
+            entry_timeframe=os.getenv("ENTRY_TIMEFRAME", "15m").strip(),
+            htf_conflict_penalty=env_int("HTF_CONFLICT_PENALTY", 8),
             run_once=env_bool("RUN_ONCE", False),
             dry_run=env_bool("DRY_RUN", False),
             ai_commentary=env_bool("AI_COMMENTARY", env_bool("USE_AI_COMMENTARY", True)),
@@ -283,6 +301,9 @@ class TradeSignal:
     resistance: float
     regime: str
     regime_details: str
+    market_session: str
+    htf_regime: str
+    htf_alignment: str
     volume_spike: bool
     volume_ratio: float
     atr_pct: float
@@ -471,6 +492,43 @@ class MarketRegimeDetector:
         return MarketRegime("Sideway", f"EMA gap {ema_gap_pct:.2f}%, ATR {atr_pct:.2f}%")
 
 
+class MarketSessionDetector:
+    @staticmethod
+    def detect(timestamp: datetime | pd.Timestamp | None = None) -> str:
+        ts = pd.Timestamp(timestamp if timestamp is not None else datetime.now(timezone.utc))
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        ts = ts.tz_convert("UTC")
+        hour = ts.hour + ts.minute / 60
+        sessions = []
+        if 0 <= hour < 8:
+            sessions.append("Asia")
+        if 8 <= hour < 16:
+            sessions.append("London")
+        if 13 <= hour < 21:
+            sessions.append("NewYork")
+        return "+".join(sessions) if sessions else "OffHours"
+
+
+def classify_trend(df: pd.DataFrame) -> str:
+    latest = df.iloc[-1]
+    if latest["close"] > latest["ema20"] > latest["ema50"]:
+        return "Bullish"
+    if latest["close"] < latest["ema20"] < latest["ema50"]:
+        return "Bearish"
+    return "Sideway"
+
+
+def alignment_for_direction(direction: str, htf_regime: str) -> str:
+    if direction == "LONG" and htf_regime == "Bullish":
+        return "Aligned"
+    if direction == "SHORT" and htf_regime == "Bearish":
+        return "Aligned"
+    if htf_regime == "Sideway":
+        return "Neutral"
+    return "Conflict"
+
+
 class LiquidationContextFilter:
     """Lightweight placeholder for future liquidation context sources."""
 
@@ -509,13 +567,15 @@ class SignalScorer:
         self.regime_detector = regime_detector
         self.liquidation_context = LiquidationContextFilter(config)
 
-    def score(self, symbol: str, df_1h: pd.DataFrame, df_15m: pd.DataFrame, fear_greed: int | None = None) -> TradeSignal | None:
+    def score(self, symbol: str, df_1h: pd.DataFrame, df_15m: pd.DataFrame, fear_greed: int | None = None, df_htf: pd.DataFrame | None = None) -> TradeSignal | None:
         watchlist_tier = self.config.watchlist_tiers.get(symbol, "B")
         latest_1h = df_1h.iloc[-1]
         latest_15m = df_15m.iloc[-1]
         previous_20 = df_1h.iloc[-21:-1]
         support, resistance = self.support_resistance.calculate(df_1h)
         regime = self.regime_detector.detect(df_1h)
+        market_session = MarketSessionDetector.detect(latest_1h.get("close_time", datetime.now(timezone.utc)))
+        htf_regime = classify_trend(df_htf) if df_htf is not None and not df_htf.empty else "Unknown"
 
         price = float(latest_1h["close"])
         candle_open = float(latest_1h["open"])
@@ -615,6 +675,7 @@ class SignalScorer:
 
         direction = "LONG" if long_score >= short_score else "SHORT"
         score = max(long_score, short_score)
+        htf_alignment = alignment_for_direction(direction, htf_regime) if htf_regime != "Unknown" else "Unknown"
         mfi_confirmed = long_mfi_confirmed if direction == "LONG" else short_mfi_confirmed
         opposite_wick_ratio = upper_wick_ratio if direction == "LONG" else lower_wick_ratio
         quality_flags = long_quality_flags if direction == "LONG" else short_quality_flags
@@ -645,6 +706,24 @@ class SignalScorer:
                 quality_flags.append("tier_c_score_below_80")
         if self.config.use_mfi_filter and not mfi_confirmed:
             confidence = max(1, confidence - 4)
+        if self.config.use_session_filter:
+            active_sessions = {item.strip().lower() for item in self.config.active_sessions}
+            session_parts = {item.strip().lower() for item in market_session.split("+")}
+            session_allowed = bool(session_parts & active_sessions)
+            if market_session == "Asia" and self.config.allow_asia_session:
+                confidence = max(1, confidence - self.config.session_penalty_asia)
+                quality_flags.append("asia_session_penalty")
+            elif not session_allowed:
+                confidence = max(1, confidence - self.config.session_penalty_asia)
+                quality_flags.append("inactive_session_penalty")
+        if self.config.use_4h_regime_filter:
+            if htf_alignment == "Aligned":
+                confidence = min(95, confidence + 3)
+                score += 3
+            elif htf_alignment == "Conflict":
+                confidence = max(1, confidence - self.config.htf_conflict_penalty)
+                score = max(0, score - self.config.htf_conflict_penalty)
+                quality_flags.append("htf_conflict")
         if self.config.use_candle_body_filter and "weak_body" in quality_flags:
             confidence = max(1, confidence - 6)
         if self.config.use_wick_filter and ("upper_wick_risk" in quality_flags or "lower_wick_risk" in quality_flags):
@@ -663,7 +742,8 @@ class SignalScorer:
             f"EMA {'bullish' if direction == 'LONG' else 'bearish'} trend on 1H; "
             f"15m confirmation {'confirmed' if (entry_long if direction == 'LONG' else entry_short) else 'weak'}; "
             f"volume ratio {volume_ratio:.2f}; ATR {atr_pct:.2f}%; "
-            f"body {body_ratio:.2f}; ATR expansion {atr_expansion_ratio:.2f}x; {mfi_reason}; RR {rr:.2f}"
+            f"body {body_ratio:.2f}; ATR expansion {atr_expansion_ratio:.2f}x; "
+            f"session {market_session}; 4H {htf_regime}/{htf_alignment}; {mfi_reason}; RR {rr:.2f}"
         )
 
         return TradeSignal(
@@ -683,6 +763,9 @@ class SignalScorer:
             resistance=resistance,
             regime=regime.name,
             regime_details=regime.details,
+            market_session=market_session,
+            htf_regime=htf_regime,
+            htf_alignment=htf_alignment,
             volume_spike=volume_spike,
             volume_ratio=volume_ratio,
             atr_pct=atr_pct,
@@ -856,6 +939,7 @@ class TradeJournalLogger:
         "timestamp", "symbol", "side", "entry", "stop_loss", "tp1", "tp2",
         "risk_reward", "confidence", "market_regime", "volume_spike", "score", "watchlist_tier", "mfi", "mfi_confirmed", "ai_summary",
         "body_ratio", "opposite_wick_ratio", "atr_expansion_ratio", "quality_flags",
+        "market_session", "htf_regime", "htf_alignment",
         "signal_status", "skip_reason",
         "result", "hit_target", "closed_at", "max_profit_pct", "max_drawdown_pct",
         "outcome_alert_sent", "outcome_alert_at", "outcome_id",
@@ -890,6 +974,9 @@ class TradeJournalLogger:
             "opposite_wick_ratio": "",
             "atr_expansion_ratio": "",
             "quality_flags": "",
+            "market_session": "",
+            "htf_regime": "",
+            "htf_alignment": "",
             "signal_status": "",
             "skip_reason": "",
             "outcome_alert_sent": 0,
@@ -930,6 +1017,9 @@ class TradeJournalLogger:
                     "opposite_wick_ratio": f"{signal.opposite_wick_ratio:.4f}",
                     "atr_expansion_ratio": f"{signal.atr_expansion_ratio:.4f}",
                     "quality_flags": signal.quality_flags,
+                    "market_session": signal.market_session,
+                    "htf_regime": signal.htf_regime,
+                    "htf_alignment": signal.htf_alignment,
                     "signal_status": signal_status,
                     "skip_reason": skip_reason,
                     "result": result,
@@ -1035,6 +1125,7 @@ class TradeJournalLogger:
         closed_at = pd.to_datetime(day_df.get("closed_at", pd.Series([], dtype=str)), utc=True, errors="coerce")
         daily_losses = int(((results == "LOSS") & (closed_at.dt.strftime("%Y-%m-%d") == day)).sum())
         tier_series = sent_df.get("watchlist_tier", pd.Series([], dtype=str)).fillna("B").astype(str).str.upper()
+        session_counts = sent_df.get("market_session", pd.Series([], dtype=str)).fillna("-").astype(str).value_counts().head(5)
         tier_win_rates = {}
         if "watchlist_tier" in sent_df and "result" in sent_df:
             closed_sent = sent_df[sent_df["result"].astype(str).str.upper().isin(["WIN", "LOSS"])]
@@ -1063,6 +1154,7 @@ class TradeJournalLogger:
             "tier_b_sent": int((tier_series == "B").sum()),
             "tier_c_sent": int((tier_series == "C").sum()),
             "best_tier_by_win_rate": best_tier,
+            "sent_by_session": ", ".join(f"{session} ({count})" for session, count in session_counts.items()),
             "top_symbols": ", ".join(f"{symbol} ({count})" for symbol, count in top_symbols.items()),
         }
 
@@ -1113,6 +1205,8 @@ class TelegramNotifier:
             f"⭐ Score: {signal.score}\n\n"
             f"📊 Market: {signal.regime}\n"
             f"🏷 Tier: {signal.watchlist_tier}\n"
+            f"🕒 Session: {signal.market_session}\n"
+            f"🧭 4H Regime: {signal.htf_regime}\n"
             f"📦 Volume Spike: {volume_text}\n"
             f"📈 MFI: {signal.mfi:.1f}\n"
             f"🕯 Body: {signal.body_ratio * 100:.0f}%\n"
@@ -1139,6 +1233,7 @@ class TelegramNotifier:
             f"🔥 Avg confidence: {summary.get('avg_confidence', 0):.1f}%\n"
             f"📈 Avg RR: {summary.get('avg_rr', 0):.2f}\n"
             f"📈 Avg MFI: {summary.get('avg_mfi', 0):.1f}\n"
+            f"🕒 Sent by session: {summary.get('sent_by_session') or '-'}\n"
             f"🏷 Tier A sent: {summary.get('tier_a_sent', 0)}\n"
             f"🏷 Tier B sent: {summary.get('tier_b_sent', 0)}\n"
             f"🏷 Tier C sent: {summary.get('tier_c_sent', 0)}\n"
@@ -1327,9 +1422,12 @@ class AgentRunner:
         self.process_candidates(candidates)
 
     def scan_symbol(self, symbol: str) -> TradeSignal | None:
-        df_1h = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, "1h", 200))
-        df_15m = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, "15m", 200))
-        signal = self.scorer.score(symbol, df_1h, df_15m, self.fear_greed_value)
+        df_1h = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.trend_timeframe, 200))
+        df_15m = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.entry_timeframe, 200))
+        df_htf = None
+        if self.config.use_4h_regime_filter:
+            df_htf = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.htf_timeframe, 200))
+        signal = self.scorer.score(symbol, df_1h, df_15m, self.fear_greed_value, df_htf)
         if not signal:
             LOGGER.info("%s WAIT: no valid setup", symbol)
             return None

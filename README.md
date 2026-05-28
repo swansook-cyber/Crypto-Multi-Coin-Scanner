@@ -25,7 +25,10 @@ This project does not auto trade. It is a Telegram signal assistant only.
 - `.env.example` - environment config template
 - `requirements.txt` - Python dependencies
 - `review_signals.py` - outcome tracker for WIN / LOSS / OPEN
+- `stats_dashboard.py` - CSV analytics dashboard and report exporter
+- `tier_review.py` - tier promotion/demotion recommendation report
 - `logs/signals.csv` - generated signal journal
+- `reports/` - generated analytics CSV reports
 - `charts/` - generated chart screenshots
 - `signal_state.json` - generated cooldown and summary state
 
@@ -114,6 +117,19 @@ SYMBOL_PAUSE_AFTER_LOSS_MINUTES=360
 USE_DAILY_RISK_GUARD=1
 MAX_DAILY_LOSSES=5
 MAX_DAILY_SIGNALS=12
+USE_SESSION_FILTER=1
+ACTIVE_SESSIONS=London,NewYork
+ALLOW_ASIA_SESSION=1
+SESSION_PENALTY_ASIA=3
+USE_4H_REGIME_FILTER=1
+HTF_TIMEFRAME=4h
+TREND_TIMEFRAME=1h
+ENTRY_TIMEFRAME=15m
+HTF_CONFLICT_PENALTY=8
+USE_AUTO_TIER_REVIEW=0
+TIER_REVIEW_MIN_TRADES=20
+TIER_PROMOTE_WINRATE=60
+TIER_DEMOTE_WINRATE=40
 MIN_VOLUME_RATIO=0.80
 MIN_ATR_PCT=0.35
 VOLUME_SPIKE_MULTIPLIER=1.20
@@ -154,6 +170,58 @@ The scanner supports three watchlist tiers, about 30 symbols total:
 
 If `WATCHLIST_TIER_A`, `WATCHLIST_TIER_B`, or `WATCHLIST_TIER_C` is set, tier mode is used. If tier variables are not set, legacy `SYMBOLS` is still supported and symbols default to Tier B.
 
+## Market Session Filter
+
+Sessions are tagged by UTC time:
+
+- Asia: 00:00-08:00 UTC
+- London: 08:00-16:00 UTC
+- NewYork: 13:00-21:00 UTC
+
+The scanner does not hard-block inactive sessions by default. It applies a small confidence adjustment so the rule engine remains the decision maker.
+
+## Multi-Timeframe Regime
+
+The default workflow is:
+
+- `HTF_TIMEFRAME=4h`: higher-timeframe regime and big trend context
+- `TREND_TIMEFRAME=1h`: setup trend
+- `ENTRY_TIMEFRAME=15m`: entry confirmation
+
+Aligned 4H and 1H direction can add a small bonus. Conflicting 4H context reduces score and confidence, and weak setups are filtered by the existing quality thresholds.
+
+## Stats Dashboard
+
+Run:
+
+```bat
+python stats_dashboard.py
+```
+
+It prints a console report and exports:
+
+- `reports/stats_summary.csv`
+- `reports/symbol_performance.csv`
+- `reports/tier_performance.csv`
+
+## Tier Review
+
+Run:
+
+```bat
+python tier_review.py
+```
+
+This only recommends promotions/demotions from historical outcomes. It never edits `.env` automatically.
+
+## Recommended Weekly Workflow
+
+```bat
+python stats_dashboard.py
+python tier_review.py
+python review_signals.py
+```
+
 Overtrade controls:
 
 - `LOSS_COOLDOWN_MINUTES` blocks the same symbol + direction after a recent SL.
@@ -167,9 +235,11 @@ Overtrade controls:
 ## Strategy Components
 
 - EMA trend: 1H EMA20/EMA50 define the main direction.
+- Multi-timeframe regime: 4H defines higher-timeframe context, 1H defines the setup, and 15m confirms entry timing.
 - ATR volatility: ATR controls TP/SL distance and avoids fixed percentage targets.
 - Volume: volume ratio and spike detection improve signal quality.
 - MTF confirmation: 15m EMA/RSI confirms entry timing inside the 1H trend.
+- Market session filter: Asia, London, and New York sessions are tagged in the journal. Inactive sessions apply a small confidence penalty rather than a hard block.
 - MFI confirmation: Money Flow Index confirms buying/selling pressure. LONG setups get a bonus when MFI is above `MFI_BULLISH_THRESHOLD`; SHORT setups get a bonus when MFI is below `MFI_BEARISH_THRESHOLD`. If MFI is against direction, confidence is reduced slightly.
 - Candle quality: body strength and opposite wick filters reduce fake breakouts and wick traps.
 - ATR expansion: current ATR is compared with recent ATR to avoid breakouts without volatility expansion.
@@ -286,6 +356,9 @@ Columns:
 - opposite_wick_ratio
 - atr_expansion_ratio
 - quality_flags
+- market_session
+- htf_regime
+- htf_alignment
 - result
 - hit_target
 - closed_at

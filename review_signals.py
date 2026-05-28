@@ -36,6 +36,10 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 OUTCOME_COLUMNS = {
+    "watchlist_tier": "B",
+    "market_session": "",
+    "htf_regime": "",
+    "htf_alignment": "",
     "result": "OPEN",
     "hit_target": "",
     "closed_at": "",
