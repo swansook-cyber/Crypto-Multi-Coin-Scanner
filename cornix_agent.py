@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -648,25 +649,64 @@ class AICommentaryEngine:
             return False
         return True
 
-    def summarize(self, signal: TradeSignal) -> str:
-        if not self.client or self.disabled_for_run:
-            return ""
-        prompt = f"""
-Summarize this Binance Futures rule-based signal in Thai in one short sentence.
-Do not change direction, entry, TP, SL, RR, or confidence. Do not add financial guarantees.
+    def build_prompt(self, signal: TradeSignal) -> str:
+        reason_context = re.sub(r";?\s*RR\s+\d+(?:\.\d+)?", "", signal.reason, flags=re.IGNORECASE).strip(" ;")
+        mfi_context = (
+            "bullish MFI confirmation"
+            if signal.direction == "LONG" and signal.mfi_confirmed
+            else "bearish MFI confirmation"
+            if signal.direction == "SHORT" and signal.mfi_confirmed
+            else "MFI is neutral or against the setup"
+        )
+        volatility_context = (
+            "high volatility"
+            if signal.regime == "High Volatility"
+            else "quiet volatility"
+            if signal.atr_pct < self.config.min_atr_pct * 1.2
+            else "normal volatility"
+        )
+        btc_context = "BTC alignment is not available"
+        if "BTC sideway penalty" in signal.reason:
+            btc_context = "BTC is sideways, so follow-through needs confirmation"
+        elif signal.symbol == "BTCUSDT":
+            btc_context = "this is the BTC market context"
+
+        return f"""
+Write trader-style market commentary for this rule-based Binance Futures signal.
+Use English. Keep it to 1-2 short sentences under 240 characters.
+Mention momentum, trend strength, MFI condition, volatility context, and BTC alignment when useful.
+Do not repeat exact RR, exact confidence, entry, TP, SL, score, or numeric indicator values.
+Do not override the trade logic and do not promise profit.
 
 Symbol: {signal.symbol}
 Direction: {signal.direction}
-Score: {signal.score}
-Confidence: {signal.confidence}
-Regime: {signal.regime}
-Volume spike: {signal.volume_spike}
-Reason: {signal.reason}
+Trend/regime: {signal.regime}
+Volume spike: {"yes" if signal.volume_spike else "no"}
+MFI context: {mfi_context}
+Volatility context: {volatility_context}
+BTC context: {btc_context}
+Rule reason without exact RR/confidence values: {reason_context}
 """
+
+    @staticmethod
+    def clean_commentary(text: str) -> str:
+        cleaned = " ".join((text or "").strip().split())
+        if not cleaned:
+            return ""
+        banned = re.compile(r"^(confidence|conf|RR|risk[- ]?reward|entry|TP1|TP2|SL|stop loss|score)\b", re.IGNORECASE)
+        sentences = re.split(r"(?<=[.!?])\s+", cleaned.strip())
+        kept = [sentence for sentence in sentences if sentence and not banned.match(sentence.strip())]
+        cleaned = " ".join(kept[:2]).strip()
+        return cleaned[:240].rstrip(" ,;:")
+
+    def summarize(self, signal: TradeSignal) -> str:
+        if not self.client or self.disabled_for_run:
+            return ""
+        prompt = self.build_prompt(signal)
         try:
             self.calls_this_run += 1
             response = self.client.models.generate_content(model=self.config.gemini_model, contents=prompt)
-            return (response.text or "").strip().replace("\n", " ")[:240]
+            return self.clean_commentary(response.text or "")
         except Timeout:
             self.disabled_for_run = True
             LOGGER.info("AI skipped: Gemini unavailable")
