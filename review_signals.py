@@ -53,6 +53,10 @@ OUTCOME_COLUMNS = {
     "outcome_alert_sent": 0,
     "outcome_alert_at": "",
     "outcome_id": "",
+    "tp1_alert_sent": 0,
+    "tp2_alert_sent": 0,
+    "sl_alert_sent": 0,
+    "outcome_alert_sent_at": "",
 }
 
 PROCESSED_OUTCOMES: set[str] = set()
@@ -113,6 +117,10 @@ def display_symbol(symbol: str) -> str:
     return f"{cleaned}.P"
 
 
+def clean_symbol(symbol: str) -> str:
+    return str(symbol).strip().upper().replace("BINANCE:", "").replace(".P", "")
+
+
 def format_price(value: Any) -> str:
     price = float(value)
     if price >= 1000:
@@ -137,6 +145,35 @@ def format_period(start_iso: Any, end_iso: Any) -> str:
     if hours:
         return f"{hours} hr"
     return f"{minutes} min"
+
+
+def format_hold_time(start_iso: Any, end_iso: Any) -> str:
+    start = pd.to_datetime(start_iso, utc=True, errors="coerce")
+    end = pd.to_datetime(end_iso, utc=True, errors="coerce")
+    if pd.isna(start) or pd.isna(end):
+        return "-"
+    total_minutes = max(0, int((end - start).total_seconds() // 60))
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if hours and minutes:
+        return f"{hours}h {minutes:02d}m"
+    if hours:
+        return f"{hours}h 00m"
+    return f"{minutes}m"
+
+
+def format_setup_strength(value: Any) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return "-"
+    return f"{numeric:.0f}%"
+
+
+def format_score(value: Any) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return "-"
+    return f"{numeric:.0f}"
 
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -198,7 +235,22 @@ def build_outcome_id(row: pd.Series) -> str:
     return f"{symbol}|{side}|{entry}|{result}|{closed_at}"
 
 
-def build_outcome_alert(row: pd.Series) -> str:
+def outcome_alert_column(hit_target: Any) -> str:
+    target = str(hit_target).strip().upper()
+    if target == "TP2":
+        return "tp2_alert_sent"
+    if target == "TP1":
+        return "tp1_alert_sent"
+    return "sl_alert_sent"
+
+
+def target_alert_already_sent(row: pd.Series) -> bool:
+    if alert_already_sent(row.get("outcome_alert_sent", 0)):
+        return True
+    return alert_already_sent(row.get(outcome_alert_column(row.get("hit_target", "SL")), 0))
+
+
+def build_legacy_outcome_alert(row: pd.Series) -> str:
     side = str(row["side"]).upper()
     result = str(row["result"]).upper()
     hit_target = str(row.get("hit_target", "")).upper()
@@ -233,6 +285,44 @@ def build_outcome_alert(row: pd.Series) -> str:
         f"🛑 SL: {format_price(stop_loss)}\n"
         f"📉 Loss: -{abs(loss_pct):.2f}%\n"
         f"⏱ Period: {period}"
+    )
+
+
+def build_outcome_alert(row: pd.Series) -> str:
+    result = str(row["result"]).upper()
+    hit_target = str(row.get("hit_target", "")).upper()
+    hold_time = format_hold_time(row.get("timestamp"), row.get("closed_at"))
+    setup_strength = row.get("setup_strength", row.get("confidence", ""))
+    score = row.get("raw_score", row.get("score", ""))
+    market = str(row.get("market_regime", "-") or "-")
+    session_name = str(row.get("market_session", "-") or "-")
+    disclaimer = "⚠️ Research tracking only. Past performance does not guarantee future results."
+
+    if result == "WIN":
+        r_value = "+2R" if hit_target == "TP2" else "+1R"
+        return (
+            f"✅ {hit_target or 'TP'} HIT\n"
+            f"🪙 {clean_symbol(row['symbol'])}\n"
+            f"📈 Result: {r_value}\n"
+            f"⏱ Hold Time: {hold_time}\n"
+            f"🔥 Setup Strength: {format_setup_strength(setup_strength)}\n"
+            f"⭐ Score: {format_score(score)}\n"
+            f"📊 Market: {market}\n"
+            f"🧭 Session: {session_name}\n\n"
+            f"{disclaimer}"
+        )
+
+    return (
+        "❌ SL HIT\n"
+        f"🪙 {clean_symbol(row['symbol'])}\n"
+        "📉 Result: -1R\n"
+        "⚠️ Risk managed correctly\n"
+        f"⏱ Hold Time: {hold_time}\n"
+        f"🔥 Setup Strength: {format_setup_strength(setup_strength)}\n"
+        f"⭐ Score: {format_score(score)}\n"
+        f"📊 Market: {market}\n"
+        f"🧭 Session: {session_name}\n\n"
+        f"{disclaimer}"
     )
 
 
@@ -407,7 +497,7 @@ def run_review_cycle(notify: bool, session: requests.Session, lookahead_hours: i
     for index, row in df.iterrows():
         previous_result = str(row.get("result", "OPEN")).upper()
         if previous_result == "OPEN":
-            if alert_already_sent(row.get("outcome_alert_sent", 0)) or has_outcome_id(row.get("outcome_id", "")):
+            if target_alert_already_sent(row) or has_outcome_id(row.get("outcome_id", "")):
                 stats.skipped_alerts += 1
                 LOGGER.info("Outcome duplicate skipped before review: %s", row.get("outcome_id", ""))
                 continue
@@ -437,7 +527,7 @@ def run_review_cycle(notify: bool, session: requests.Session, lookahead_hours: i
             continue
 
         outcome_id = build_outcome_id(updated_row)
-        if alert_already_sent(updated_row.get("outcome_alert_sent", 0)) or has_outcome_id(updated_row.get("outcome_id", "")):
+        if target_alert_already_sent(updated_row) or has_outcome_id(updated_row.get("outcome_id", "")):
             stats.skipped_alerts += 1
             LOGGER.info("Outcome duplicate skipped: %s", updated_row.get("outcome_id", outcome_id))
             time.sleep(0.2)
@@ -459,6 +549,8 @@ def run_review_cycle(notify: bool, session: requests.Session, lookahead_hours: i
             PROCESSED_OUTCOMES.add(outcome_id)
             df.at[index, "outcome_alert_sent"] = 1
             df.at[index, "outcome_alert_at"] = datetime.now(timezone.utc).isoformat()
+            df.at[index, outcome_alert_column(updated_row.get("hit_target", "SL"))] = 1
+            df.at[index, "outcome_alert_sent_at"] = df.at[index, "outcome_alert_at"]
             df.at[index, "outcome_id"] = outcome_id
             persist_journal(df)
         else:

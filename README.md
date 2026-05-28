@@ -374,6 +374,10 @@ Columns:
 - outcome_alert_sent
 - outcome_alert_at
 - outcome_id
+- tp1_alert_sent
+- tp2_alert_sent
+- sl_alert_sent
+- outcome_alert_sent_at
 
 ## Review Signals
 
@@ -445,11 +449,126 @@ OUTCOME_CHECK_INTERVAL_MINUTES=15
 OUTCOME_LOOP_MODE=1
 OUTCOME_LOOP_INTERVAL_SECONDS=900
 SEND_OUTCOME_ALERTS=1
+SEND_DAILY_SUMMARY=1
+DAILY_SUMMARY_HOUR=23
+DAILY_SUMMARY_MINUTE=55
+PROMO_ENABLED=false
 ```
 
 If `SEND_TELEGRAM=0` or `SEND_OUTCOME_ALERTS=0`, review still updates `logs/signals.csv` but does not send outcome alerts.
 
-Outcome alerts are sent once only. After an alert is sent, `outcome_alert_sent=1` and `outcome_alert_at` is recorded.
+Outcome alerts are sent once only. After an alert is sent, `outcome_alert_sent=1`, the matching `tp1_alert_sent` / `tp2_alert_sent` / `sl_alert_sent` flag, and `outcome_alert_at` are recorded.
+
+## Daily Summary
+
+Run a daily journal summary:
+
+```bat
+python daily_summary.py --dry-run
+```
+
+To send it to Telegram, set:
+
+```env
+SEND_DAILY_SUMMARY=1
+```
+
+Then run:
+
+```bat
+python daily_summary.py
+```
+
+The report includes total signals, TP1/TP2/SL counts, pending signals, best/worst symbol, best session, best score bucket, and average holding time. It is research tracking only and does not place trades.
+
+## VPS systemd Examples
+
+Create `/etc/systemd/system/crypto-scanner.service`:
+
+```ini
+[Unit]
+Description=Crypto Multi-Coin Scanner
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+EnvironmentFile=/opt/Crypto-Multi-Coin-Scanner/.env
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python cornix_agent.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create `/etc/systemd/system/crypto-outcome-checker.service`:
+
+```ini
+[Unit]
+Description=Crypto Outcome Checker
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+EnvironmentFile=/opt/Crypto-Multi-Coin-Scanner/.env
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python review_signals.py --notify
+```
+
+Create `/etc/systemd/system/crypto-outcome-checker.timer`:
+
+```ini
+[Unit]
+Description=Run Crypto Outcome Checker every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=crypto-outcome-checker.service
+
+[Install]
+WantedBy=timers.target
+```
+
+Create `/etc/systemd/system/crypto-daily-summary.service`:
+
+```ini
+[Unit]
+Description=Crypto Daily Summary
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+EnvironmentFile=/opt/Crypto-Multi-Coin-Scanner/.env
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python daily_summary.py
+```
+
+Create `/etc/systemd/system/crypto-daily-summary.timer`:
+
+```ini
+[Unit]
+Description=Run Crypto Daily Summary once per day
+
+[Timer]
+OnCalendar=*-*-* 23:55:00
+Persistent=true
+Unit=crypto-daily-summary.service
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now crypto-scanner.service
+sudo systemctl enable --now crypto-outcome-checker.timer
+sudo systemctl enable --now crypto-daily-summary.timer
+```
+
+The daily timer example runs at 23:55 server time. Keep `PROMO_ENABLED=false`; this project is internal lab signal tracking only.
 
 ## Troubleshooting
 
