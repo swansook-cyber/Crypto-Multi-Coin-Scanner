@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
+HISTORY = BASE_DIR / "logs" / "signals_history.csv"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,8 +38,12 @@ REQUIRED_COLUMNS = {
     "hit_target": "",
     "closed_at": "",
     "market_session": "",
+    "session": "",
+    "watchlist_tier": "",
+    "tier": "",
     "score_bucket": "",
     "risk_reward": "",
+    "holding_minutes": "",
     "setup_strength": "",
     "confidence": "",
 }
@@ -60,12 +65,19 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["result"] = df["result"].fillna("OPEN").astype(str).str.upper()
     df["hit_target"] = df["hit_target"].fillna("").astype(str).str.upper()
     df["symbol"] = df["symbol"].fillna("").astype(str).str.upper()
+    if df["market_session"].fillna("").astype(str).str.strip().eq("").all() and "session" in df.columns:
+        df["market_session"] = df["session"]
+    if df["watchlist_tier"].fillna("").astype(str).str.strip().eq("").all() and "tier" in df.columns:
+        df["watchlist_tier"] = df["tier"]
     df["market_session"] = df["market_session"].fillna("Other").replace("", "Other")
+    df["watchlist_tier"] = df["watchlist_tier"].fillna("-").replace("", "-").astype(str).str.upper()
     df["score_bucket"] = df["score_bucket"].fillna("-").replace("", "-")
     return df
 
 
 def load_journal(path: Path = JOURNAL) -> pd.DataFrame:
+    if path == JOURNAL and HISTORY.exists():
+        path = HISTORY
     if not path.exists():
         LOGGER.warning("Journal not found: %s", path)
         return ensure_columns(pd.DataFrame())
@@ -120,6 +132,21 @@ def worst_group(df: pd.DataFrame, column: str) -> str:
     return min(scores, key=scores.get) if scores else "-"
 
 
+def current_streak(df: pd.DataFrame) -> str:
+    closed = df[df["result"].isin(["WIN", "LOSS"])].copy()
+    if closed.empty:
+        return "-"
+    sort_column = "closed_at" if closed["closed_at"].notna().any() else "timestamp"
+    closed = closed.sort_values(sort_column)
+    last_result = str(closed.iloc[-1]["result"]).upper()
+    count = 0
+    for result in reversed(closed["result"].astype(str).str.upper().tolist()):
+        if result != last_result:
+            break
+        count += 1
+    return f"{count} {last_result}"
+
+
 def build_daily_summary(df: pd.DataFrame, date: str | None = None) -> dict[str, Any]:
     if date is None:
         date = latest_journal_day(df)
@@ -133,7 +160,10 @@ def build_daily_summary(df: pd.DataFrame, date: str | None = None) -> dict[str, 
     tp2 = int(((day_df["result"] == "WIN") & (day_df["hit_target"] == "TP2")).sum()) if total else 0
     sl = int((day_df["result"] == "LOSS").sum()) if total else 0
     pending = int((day_df["result"] == "OPEN").sum()) if total else 0
-    holding_minutes = (day_df["closed_at"] - day_df["timestamp"]).dt.total_seconds().div(60)
+    closed_count = tp1 + tp2 + sl
+    holding_minutes = pd.to_numeric(day_df["holding_minutes"], errors="coerce")
+    if holding_minutes.dropna().empty:
+        holding_minutes = (day_df["closed_at"] - day_df["timestamp"]).dt.total_seconds().div(60)
     avg_holding = format_hold_time(float(holding_minutes.dropna().mean())) if not holding_minutes.dropna().empty else "-"
 
     return {
@@ -143,6 +173,7 @@ def build_daily_summary(df: pd.DataFrame, date: str | None = None) -> dict[str, 
         "tp2_hits": tp2,
         "sl_hits": sl,
         "pending": pending,
+        "win_rate": (tp1 + tp2) / closed_count * 100 if closed_count else 0.0,
         "tp1_rate": tp1 / total * 100 if total else 0.0,
         "tp2_rate": tp2 / total * 100 if total else 0.0,
         "sl_rate": sl / total * 100 if total else 0.0,
@@ -150,6 +181,8 @@ def build_daily_summary(df: pd.DataFrame, date: str | None = None) -> dict[str, 
         "worst_symbol": worst_group(day_df, "symbol"),
         "best_session": best_group(day_df, "market_session"),
         "best_score_bucket": best_group(day_df, "score_bucket"),
+        "current_streak": current_streak(df),
+        "top_performing_tier": best_group(df, "watchlist_tier"),
         "avg_holding_time": avg_holding,
     }
 
@@ -159,12 +192,15 @@ def build_telegram_message(summary: dict[str, Any]) -> str:
         "📊 Daily Signal Summary\n"
         f"Date: {summary['date']}\n\n"
         f"Signals: {summary['total_signals']}\n"
+        f"Today's Winrate: {summary['win_rate']:.1f}%\n"
         f"✅ TP1: {summary['tp1_hits']}\n"
         f"🏆 TP2: {summary['tp2_hits']}\n"
         f"❌ SL: {summary['sl_hits']}\n"
         f"⏳ Pending: {summary['pending']}\n\n"
         f"Best Symbol: {summary['best_symbol']}\n"
         f"Worst Symbol: {summary['worst_symbol']}\n"
+        f"Current Streak: {summary['current_streak']}\n"
+        f"Top Tier: {summary['top_performing_tier']}\n"
         f"Best Session: {summary['best_session']}\n"
         f"Best Bucket: {summary['best_score_bucket']}\n"
         f"Avg Hold: {summary['avg_holding_time']}\n\n"

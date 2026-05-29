@@ -11,27 +11,30 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
+HISTORY = BASE_DIR / "logs" / "signals_history.csv"
+PERFORMANCE_REPORT = BASE_DIR / "logs" / "performance_report.txt"
 REPORT_DIR = BASE_DIR / "reports"
 
 
 def load_journal() -> pd.DataFrame:
-    if not JOURNAL.exists():
+    source = HISTORY if HISTORY.exists() else JOURNAL
+    if not source.exists():
         return pd.DataFrame()
     try:
-        return pd.read_csv(JOURNAL)
+        return pd.read_csv(source)
     except pd.errors.EmptyDataError:
         return pd.DataFrame()
 
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
     for column, default in {
         "signal_status": "sent",
         "result": "",
         "hit_target": "",
         "watchlist_tier": "B",
+        "tier": "",
         "side": "",
+        "session": "",
         "market_regime": "",
         "mfi_confirmed": "",
         "market_session": "",
@@ -39,9 +42,21 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
         "setup_strength": "",
         "htf_alignment": "",
         "htf_conflict": "",
+        "risk_reward": "",
+        "timestamp": "",
+        "closed_at": "",
+        "holding_minutes": "",
     }.items():
         if column not in df.columns:
             df[column] = default
+    if df["watchlist_tier"].fillna("").astype(str).str.strip().eq("").all() and "tier" in df.columns:
+        df["watchlist_tier"] = df["tier"]
+    if df["market_session"].fillna("").astype(str).str.strip().eq("").all() and "session" in df.columns:
+        df["market_session"] = df["session"]
+    if "rr" in df.columns and "risk_reward" not in df.columns:
+        df["risk_reward"] = df["rr"]
+    if "sl" in df.columns and "stop_loss" not in df.columns:
+        df["stop_loss"] = df["sl"]
     df["timestamp"] = pd.to_datetime(df.get("timestamp"), utc=True, errors="coerce")
     df["closed_at"] = pd.to_datetime(df.get("closed_at"), utc=True, errors="coerce")
     df["risk_reward"] = pd.to_numeric(df.get("risk_reward"), errors="coerce")
@@ -77,6 +92,10 @@ def closed_trades(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def holding_hours(df: pd.DataFrame) -> pd.Series:
+    if "holding_minutes" in df.columns:
+        minutes = pd.to_numeric(df["holding_minutes"], errors="coerce")
+        if minutes.notna().any():
+            return minutes / 60
     return (df["closed_at"] - df["timestamp"]).dt.total_seconds() / 3600
 
 
@@ -135,6 +154,7 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
         ("sl_rate", losses / closed_count * 100 if closed_count else 0.0),
         ("avg_holding_hours", holding_hours(closed).mean() if not closed.empty else 0.0),
         ("avg_rr", pd.to_numeric(sent["risk_reward"], errors="coerce").mean() if not sent.empty else 0.0),
+        ("avg_holding_time_minutes", holding_hours(closed).mean() * 60 if not closed.empty else 0.0),
         ("profit_factor", profit_factor(df)),
         ("best_symbol", symbol_perf.iloc[0]["symbol"] if not symbol_perf.empty else "-"),
         ("worst_symbol", symbol_perf.iloc[-1]["symbol"] if not symbol_perf.empty else "-"),
@@ -142,6 +162,44 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
         ("worst_tier", tier_perf.iloc[-1]["watchlist_tier"] if not tier_perf.empty else "-"),
     ]
     return pd.DataFrame(rows, columns=["metric", "value"])
+
+
+def adaptive_suggestions(df: pd.DataFrame) -> list[str]:
+    suggestions: list[str] = []
+    symbol_perf = performance_by(df, "symbol")
+    if not symbol_perf.empty:
+        weak_symbols = symbol_perf[(symbol_perf["trades"] >= 3) & (symbol_perf["win_rate"] < 35)]
+        for _, row in weak_symbols.iterrows():
+            suggestions.append(
+                f"Consider temporarily disabling {row['symbol']}: winrate {row['win_rate']:.1f}% over {int(row['trades'])} closed trades."
+            )
+    htf_perf = performance_by(df, "htf_alignment")
+    if not htf_perf.empty:
+        htf_no = htf_perf[htf_perf["htf_alignment"].astype(str).str.upper().isin(["NO", "CONFLICT", "MISALIGNED"])]
+        poor_htf_no = htf_no[(htf_no["trades"] >= 3) & (htf_no["win_rate"] < 35)]
+        if not poor_htf_no.empty:
+            suggestions.append(
+                "HTF alignment NO/Conflict is underperforming; consider reducing score for misaligned setups."
+            )
+    if not suggestions:
+        suggestions.append("No adaptive filtering changes suggested yet; collect more closed outcomes.")
+    return suggestions
+
+
+def write_performance_report(summary: pd.DataFrame, tables: dict[str, pd.DataFrame], suggestions: list[str]) -> None:
+    PERFORMANCE_REPORT.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "Crypto Multi-Coin Scanner Performance Report",
+        "============================================",
+        "",
+        summary.to_string(index=False),
+    ]
+    for name, table in tables.items():
+        lines.extend(["", name, "-" * len(name)])
+        lines.append("No data" if table.empty else table.head(20).to_string(index=False))
+    lines.extend(["", "Adaptive Filtering Suggestions", "-------------------------------"])
+    lines.extend(f"- {item}" for item in suggestions)
+    PERFORMANCE_REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def print_report(summary: pd.DataFrame, tables: dict[str, pd.DataFrame]) -> None:
@@ -175,10 +233,17 @@ def main() -> int:
         "Winrate by HTF Conflict": performance_by(df, "htf_conflict"),
         "Winrate by Session": performance_by(df, "market_session"),
     }
+    suggestions = adaptive_suggestions(df)
     summary.to_csv(REPORT_DIR / "stats_summary.csv", index=False)
     tables["Winrate by Symbol"].to_csv(REPORT_DIR / "symbol_performance.csv", index=False)
     tables["Winrate by Tier"].to_csv(REPORT_DIR / "tier_performance.csv", index=False)
+    write_performance_report(summary, tables, suggestions)
     print_report(summary, tables)
+    print()
+    print("Adaptive Filtering Suggestions")
+    print("-------------------------------")
+    for suggestion in suggestions:
+        print(f"- {suggestion}")
     return 0
 
 

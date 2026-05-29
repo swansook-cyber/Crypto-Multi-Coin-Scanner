@@ -22,6 +22,7 @@ from urllib3.util.retry import Retry
 
 BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
+HISTORY = BASE_DIR / "logs" / "signals_history.csv"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 ERROR_RETRY_SECONDS = 60
 
@@ -60,6 +61,29 @@ OUTCOME_COLUMNS = {
 }
 
 PROCESSED_OUTCOMES: set[str] = set()
+
+HISTORY_COLUMNS = [
+    "timestamp",
+    "symbol",
+    "side",
+    "tier",
+    "session",
+    "entry",
+    "sl",
+    "tp1",
+    "tp2",
+    "rr",
+    "setup_strength",
+    "score",
+    "market_regime",
+    "htf_alignment",
+    "volume_spike",
+    "mfi",
+    "atr",
+    "result",
+    "pnl_percent",
+    "holding_minutes",
+]
 
 
 @dataclass
@@ -214,6 +238,105 @@ def persist_journal(df: pd.DataFrame) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     LOGGER.info("CSV persisted: %s", JOURNAL)
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return default
+    return float(numeric)
+
+
+def signal_history_key(df: pd.DataFrame) -> pd.Series:
+    parts = []
+    for column in ["timestamp", "symbol", "side", "entry"]:
+        if column not in df.columns:
+            parts.append(pd.Series([""] * len(df), index=df.index))
+        else:
+            parts.append(df[column].fillna("").astype(str).str.strip())
+    return parts[0] + "|" + parts[1].str.upper() + "|" + parts[2].str.upper() + "|" + parts[3]
+
+
+def realized_pnl_percent(row: pd.Series) -> float:
+    result = str(row.get("result", "OPEN")).upper()
+    hit_target = str(row.get("hit_target", "")).upper()
+    side = str(row.get("side", "")).upper()
+    entry = safe_float(row.get("entry"))
+    if entry <= 0:
+        return 0.0
+    if result == "LOSS":
+        stop_loss = safe_float(row.get("stop_loss", row.get("sl")))
+        pnl = (stop_loss - entry) / entry * 100 if side == "LONG" else (entry - stop_loss) / entry * 100
+        return -abs(float(pnl))
+    if result == "WIN":
+        target_column = "tp2" if hit_target == "TP2" else "tp1"
+        target = safe_float(row.get(target_column))
+        pnl = (target - entry) / entry * 100 if side == "LONG" else (entry - target) / entry * 100
+        return abs(float(pnl))
+    return 0.0
+
+
+def holding_minutes(row: pd.Series) -> float:
+    start = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+    end = pd.to_datetime(row.get("closed_at"), utc=True, errors="coerce")
+    if pd.isna(start) or pd.isna(end):
+        return 0.0
+    return max(0.0, float((end - start).total_seconds() / 60))
+
+
+def journal_to_history(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+    rows = []
+    for _, row in df.iterrows():
+        rows.append({
+            "timestamp": row.get("timestamp", ""),
+            "symbol": clean_symbol(row.get("symbol", "")),
+            "side": str(row.get("side", "")).upper(),
+            "tier": str(row.get("watchlist_tier", row.get("tier", "B")) or "B").upper(),
+            "session": row.get("market_session", row.get("session", "")),
+            "entry": row.get("entry", ""),
+            "sl": row.get("stop_loss", row.get("sl", "")),
+            "tp1": row.get("tp1", ""),
+            "tp2": row.get("tp2", ""),
+            "rr": row.get("risk_reward", row.get("rr", "")),
+            "setup_strength": row.get("setup_strength", row.get("confidence", "")),
+            "score": row.get("raw_score", row.get("score", "")),
+            "market_regime": row.get("market_regime", ""),
+            "htf_alignment": row.get("htf_alignment", ""),
+            "volume_spike": row.get("volume_spike", ""),
+            "mfi": row.get("mfi", ""),
+            "atr": row.get("atr", row.get("atr_pct", "")),
+            "result": str(row.get("result", "OPEN") or "OPEN").upper(),
+            "pnl_percent": f"{realized_pnl_percent(row):.4f}",
+            "holding_minutes": f"{holding_minutes(row):.1f}",
+        })
+    history = pd.DataFrame(rows, columns=HISTORY_COLUMNS)
+    return history
+
+
+def sync_signal_history(df: pd.DataFrame) -> None:
+    HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    current = journal_to_history(df)
+    if HISTORY.exists():
+        try:
+            existing = pd.read_csv(HISTORY)
+        except pd.errors.EmptyDataError:
+            existing = pd.DataFrame(columns=HISTORY_COLUMNS)
+    else:
+        existing = pd.DataFrame(columns=HISTORY_COLUMNS)
+    for column in HISTORY_COLUMNS:
+        if column not in existing.columns:
+            existing[column] = ""
+    combined = pd.concat([existing[HISTORY_COLUMNS], current], ignore_index=True)
+    if not combined.empty:
+        combined["_key"] = signal_history_key(combined.rename(columns={"sl": "stop_loss", "rr": "risk_reward"}))
+        combined = combined.drop_duplicates("_key", keep="last").drop(columns=["_key"])
+    with HISTORY.open("w", newline="", encoding="utf-8") as handle:
+        combined.to_csv(handle, index=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    LOGGER.info("Signal history synced: %s rows -> %s", len(combined), HISTORY)
 
 
 def alert_already_sent(value: Any) -> bool:
@@ -558,6 +681,7 @@ def run_review_cycle(notify: bool, session: requests.Session, lookahead_hours: i
         time.sleep(0.2)
 
     persist_journal(df)
+    sync_signal_history(df)
     if print_report:
         print_summary(df)
     return stats

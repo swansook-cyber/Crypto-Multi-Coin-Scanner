@@ -95,6 +95,22 @@ def test_review_old_journal_columns() -> None:
             "outcome_alert_sent_at",
         ]:
             assert column in df.columns
+
+        history_path = Path(tempfile.gettempdir()) / "signals_history_smoke.csv"
+        old_history = review_signals.HISTORY
+        try:
+            review_signals.HISTORY = history_path
+            review_signals.sync_signal_history(df)
+            history = pd.read_csv(history_path)
+            for column in review_signals.HISTORY_COLUMNS:
+                assert column in history.columns
+            assert len(history) == 1
+        finally:
+            review_signals.HISTORY = old_history
+            try:
+                history_path.unlink()
+            except OSError:
+                pass
     finally:
         review_signals.JOURNAL = old
         review_signals.PROCESSED_OUTCOMES.clear()
@@ -121,6 +137,8 @@ def test_stats_old_and_new_fields() -> None:
     assert normalized.loc[0, "score_bucket"] == "A"
     summary = stats_dashboard.build_summary(normalized)
     assert not summary.empty
+    suggestions = stats_dashboard.adaptive_suggestions(normalized)
+    assert suggestions
 
 
 def test_outcome_message_and_dedupe() -> None:
@@ -196,10 +214,14 @@ def test_daily_summary_and_missing_telegram_env() -> None:
     assert summary["tp1_hits"] == 1
     assert summary["sl_hits"] == 1
     assert summary["pending"] == 1
+    assert summary["win_rate"] == 50.0
+    assert summary["current_streak"] == "1 LOSS"
     message = daily_summary.build_telegram_message(summary)
     assert "📊 Daily Signal Summary" in message
+    assert "Today's Winrate: 50.0%" in message
     assert "Best Session: London" in message
     assert "Best Bucket: A+" in message
+    assert "Current Streak: 1 LOSS" in message
 
     old_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
     old_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)

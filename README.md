@@ -203,8 +203,21 @@ It prints a console report and exports:
 - `reports/stats_summary.csv`
 - `reports/symbol_performance.csv`
 - `reports/tier_performance.csv`
+- `logs/performance_report.txt`
 
 The dashboard also groups performance by score bucket, setup strength range, HTF alignment/conflict, and market session. Public signal messages use `Setup Strength` instead of `Confidence` so the score is not presented as win probability.
+
+## Data-Driven Validation
+
+The outcome checker keeps a persistent derived history at:
+
+```text
+logs/signals_history.csv
+```
+
+It is synced from `logs/signals.csv` after outcome review finishes and includes timestamp, symbol, side, tier, session, entry, SL, TP1/TP2, RR, setup strength, score, market regime, HTF alignment, volume spike, MFI, ATR, result, realized PnL percent, and holding minutes.
+
+`stats_dashboard.py` reads `logs/signals_history.csv` first and falls back to `logs/signals.csv` if the history file does not exist. It prints and writes adaptive filtering suggestions to `logs/performance_report.txt`, such as symbols with weak historical winrate or underperforming HTF-misaligned setups. These are recommendations only; the scanner does not auto-trade and does not rewrite strategy settings automatically.
 
 ## Tier Review
 
