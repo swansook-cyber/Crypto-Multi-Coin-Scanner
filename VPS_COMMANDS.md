@@ -55,6 +55,36 @@ tools\health_check.bat
 
 Every tool connects to the VPS, runs one command, then pauses before exit.
 
+## VelaFlow Scanner Control Center
+
+Main launcher:
+
+```bat
+tools\VelaFlow Scanner Control Center.bat
+```
+
+How to use:
+
+- Double click the BAT file.
+- Choose a menu number.
+- Wait for SSH output.
+- Press any key to return to the menu.
+
+The Control Center automatically loads:
+
+```bat
+tools\vps_env.bat
+```
+
+Default connection:
+
+```bat
+set VPS_HOST=143.14.11.12
+set VPS_USER=root
+```
+
+It uses built-in Windows OpenSSH and does not require PowerShell.
+
 ## Service Management
 
 Scanner:
