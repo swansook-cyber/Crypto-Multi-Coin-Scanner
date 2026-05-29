@@ -32,6 +32,8 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from core.btc_regime_filter import detect_btc_regime
+from core.loss_cooldown import LossCooldownTracker
 from core.wave_structure_analyzer import calculate_wave_score
 
 try:
@@ -124,6 +126,8 @@ class ScannerConfig:
     cooldown_minutes: int
     confidence_override_delta: int
     loss_cooldown_minutes: int
+    loss_streak_cooldown_losses: int
+    loss_streak_cooldown_hours: int
     max_signals_per_scan: int
     max_signals_per_direction_per_candle: int
     max_major_correlated_signals: int
@@ -231,6 +235,8 @@ class ScannerConfig:
             cooldown_minutes=env_int("COOLDOWN_MINUTES", 240),
             confidence_override_delta=env_int("CONFIDENCE_OVERRIDE_DELTA", 12),
             loss_cooldown_minutes=env_int("LOSS_COOLDOWN_MINUTES", 180),
+            loss_streak_cooldown_losses=env_int("LOSS_STREAK_COOLDOWN_LOSSES", 3),
+            loss_streak_cooldown_hours=env_int("LOSS_STREAK_COOLDOWN_HOURS", 12),
             max_signals_per_scan=env_int("MAX_SIGNALS_PER_SCAN", 3),
             max_signals_per_direction_per_candle=env_int("MAX_SIGNALS_PER_DIRECTION_PER_CANDLE", 2),
             max_major_correlated_signals=env_int("MAX_MAJOR_CORRELATED_SIGNALS", 1),
@@ -338,12 +344,18 @@ class TradeSignal:
     wave_structure: str = "unclear"
     wave_phase: str = "unknown"
     wave_notes: list[str] = field(default_factory=list)
+    btc_regime: str = "unclear"
+    risk_mode: str = "normal"
+    btc_regime_notes: str = ""
 
 
 @dataclass
 class BtcMarketContext:
     regime: str
-    atr_pct: float
+    allow_long: bool = True
+    allow_short: bool = True
+    risk_multiplier: float = 1.0
+    notes: list[str] = field(default_factory=list)
 
 
 class SymbolFormatter:
@@ -1010,6 +1022,7 @@ class TradeJournalLogger:
         "risk_reward", "confidence", "setup_strength", "market_regime", "volume_spike", "score", "raw_score", "score_bucket", "watchlist_tier", "mfi", "mfi_confirmed", "ai_summary",
         "body_ratio", "opposite_wick_ratio", "atr_expansion_ratio", "quality_flags",
         "wave_score", "wave_structure", "wave_phase", "wave_notes",
+        "btc_regime", "risk_mode", "btc_regime_notes",
         "market_session", "htf_regime", "htf_alignment", "htf_conflict", "signal_version",
         "signal_status", "skip_reason",
         "result", "hit_target", "closed_at", "max_profit_pct", "max_drawdown_pct",
@@ -1052,6 +1065,9 @@ class TradeJournalLogger:
             "wave_structure": "",
             "wave_phase": "",
             "wave_notes": "",
+            "btc_regime": "",
+            "risk_mode": "",
+            "btc_regime_notes": "",
             "market_session": "",
             "htf_regime": "",
             "htf_alignment": "",
@@ -1104,6 +1120,9 @@ class TradeJournalLogger:
                     "wave_structure": signal.wave_structure,
                     "wave_phase": signal.wave_phase,
                     "wave_notes": "; ".join(signal.wave_notes),
+                    "btc_regime": signal.btc_regime,
+                    "risk_mode": signal.risk_mode,
+                    "btc_regime_notes": signal.btc_regime_notes,
                     "market_session": signal.market_session,
                     "htf_regime": signal.htf_regime,
                     "htf_alignment": signal.htf_alignment,
@@ -1221,6 +1240,7 @@ class TradeJournalLogger:
             for tier, group in closed_sent.groupby(closed_sent["watchlist_tier"].fillna("B").astype(str).str.upper()):
                 tier_win_rates[tier] = float((group["result"].astype(str).str.upper() == "WIN").mean() * 100)
         best_tier = max(tier_win_rates, key=tier_win_rates.get) if tier_win_rates else "-"
+        cooldown_status = LossCooldownTracker(self.path).status()
         return {
             "day": day,
             "total": int(len(day_df)),
@@ -1245,6 +1265,9 @@ class TradeJournalLogger:
             "best_tier_by_win_rate": best_tier,
             "sent_by_session": ", ".join(f"{session} ({count})" for session, count in session_counts.items()),
             "top_symbols": ", ".join(f"{symbol} ({count})" for symbol, count in top_symbols.items()),
+            "loss_cooldown_status": "ACTIVE" if cooldown_status.active else "OFF",
+            "loss_cooldown_streak": cooldown_status.loss_streak,
+            "loss_cooldown_until": cooldown_status.pause_until.isoformat() if cooldown_status.pause_until is not None else "-",
         }
 
 
@@ -1298,6 +1321,9 @@ class TelegramNotifier:
             f"📊 Market: {signal.regime}\n"
             f"🏷 Tier: {signal.watchlist_tier}\n"
             f"🕒 Session: {signal.market_session or 'Other'}\n\n"
+            f"Market Regime:\n"
+            f"BTC: {signal.btc_regime}\n"
+            f"Risk Mode: {signal.risk_mode}\n\n"
             f"🧭 HTF:\n"
             f"4H Trend: {signal.htf_regime}\n"
             f"Alignment: {htf_alignment_yes}\n"
@@ -1346,6 +1372,8 @@ class TelegramNotifier:
             f"🧯 Skipped daily risk guard: {summary.get('skipped_daily_risk_guard', 0)}\n"
             f"🥶 Skipped losing streak: {summary.get('skipped_losing_streak', 0)}\n"
             f"🧊 Skipped loss cooldown: {summary.get('skipped_loss_cooldown', 0)}\n"
+            f"🧊 Loss cooldown: {summary.get('loss_cooldown_status', 'OFF')} "
+            f"(streak {summary.get('loss_cooldown_streak', 0)}, until {summary.get('loss_cooldown_until', '-')})\n"
             f"🔗 Skipped correlation: {summary.get('skipped_correlation', 0)}\n"
             f"₿ Skipped BTC regime: {summary.get('skipped_btc_regime', 0)}\n"
             f"🏅 Skipped not top: {summary.get('skipped_not_top_candidate', 0)}\n"
@@ -1409,6 +1437,11 @@ class AgentRunner:
         self.risk_manager = RiskManager(config)
         self.ai_commentary = AICommentaryEngine(config)
         self.journal = TradeJournalLogger()
+        self.loss_cooldown = LossCooldownTracker(
+            self.journal.path,
+            config.loss_streak_cooldown_losses,
+            config.loss_streak_cooldown_hours,
+        )
         self.chart_exporter = ChartExporter()
         self.notifier = TelegramNotifier(config)
         self.state = self._load_state()
@@ -1551,6 +1584,15 @@ class AgentRunner:
                     self.journal.log_signal(signal, "skipped_daily_risk_guard", risk_guard_reason)
                 LOGGER.info("Daily risk guard active: %s", risk_guard_reason)
                 return
+        cooldown_status = self.loss_cooldown.status()
+        if cooldown_status.active:
+            pause_until = cooldown_status.pause_until.isoformat() if cooldown_status.pause_until is not None else ""
+            reason = f"global_loss_cooldown_until_{pause_until}"
+            for signal in candidates:
+                signal.risk_mode = "cooldown"
+                self.journal.log_signal(signal, "skipped_loss_cooldown", reason)
+            LOGGER.info("Loss cooldown active: %s", "; ".join(cooldown_status.notes or []))
+            return
         btc_context = self.get_btc_context()
         eligible: list[TradeSignal] = []
         for signal in candidates:
@@ -1611,26 +1653,63 @@ class AgentRunner:
             return None
         try:
             df_btc = self.indicators.add_indicators(self.data_client.fetch_closed_klines("BTCUSDT", "1h", 120))
-            regime = MarketRegimeDetector().detect(df_btc)
-            return BtcMarketContext(regime=regime.name, atr_pct=float(df_btc.iloc[-1]["atr_pct"]))
+            context = detect_btc_regime(df_btc)
+            return BtcMarketContext(
+                regime=str(context.get("regime", "unclear")),
+                allow_long=bool(context.get("allow_long", True)),
+                allow_short=bool(context.get("allow_short", True)),
+                risk_multiplier=float(context.get("risk_multiplier", 1.0)),
+                notes=[str(item) for item in context.get("notes", [])],
+            )
         except Exception as exc:
             LOGGER.warning("BTC regime filter unavailable: %s", exc)
-            return None
+            return BtcMarketContext(regime="unclear", notes=["BTC regime unavailable"])
 
     def apply_btc_regime_filter(self, signal: TradeSignal, btc_context: BtcMarketContext | None) -> bool:
-        if not btc_context or signal.symbol == "BTCUSDT":
+        if not btc_context:
             return False
-        if btc_context.regime == "Sideway":
-            signal.confidence = max(1, signal.confidence - self.config.btc_sideway_penalty)
-            signal.reason += f"; BTC sideway penalty -{self.config.btc_sideway_penalty}"
-            if signal.confidence < self.config.min_confidence:
-                self.journal.log_signal(signal, "skipped_btc_regime", "btc_sideway_confidence_below_minimum")
-                LOGGER.info("%s skipped: BTC sideway regime filter", signal.symbol)
+        signal.btc_regime = btc_context.regime
+        signal.btc_regime_notes = "; ".join(btc_context.notes)
+        signal.risk_mode = "normal" if btc_context.risk_multiplier >= 1.0 else "reduced"
+        if btc_context.risk_multiplier < 1.0:
+            signal.risk_amount_usdt *= btc_context.risk_multiplier
+            signal.position_size_coin *= btc_context.risk_multiplier
+            signal.position_value_usdt *= btc_context.risk_multiplier
+        if signal.symbol == "BTCUSDT" or btc_context.regime == "unclear":
+            return False
+
+        opposite_direction = (
+            (btc_context.regime == "bullish" and signal.direction == "SHORT")
+            or (btc_context.regime == "bearish" and signal.direction == "LONG")
+        )
+        if opposite_direction:
+            penalty = max(4, self.config.btc_sideway_penalty // 2)
+            signal.confidence = max(1, signal.confidence - penalty)
+            signal.score = max(0, signal.score - penalty)
+            signal.risk_mode = "reduced"
+            signal.reason += f"; BTC {btc_context.regime} opposite-direction penalty -{penalty}"
+            if signal.confidence < self.config.min_confidence or signal.score < self.config.score_threshold:
+                self.journal.log_signal(signal, "skipped_btc_regime", f"btc_{btc_context.regime}_opposite_direction")
+                LOGGER.info("%s skipped: BTC %s opposite-direction filter", signal.symbol, btc_context.regime)
                 return True
-        if self.config.btc_low_vol_skip and btc_context.atr_pct < self.config.min_atr_pct:
-            self.journal.log_signal(signal, "skipped_btc_regime", "btc_low_volatility")
-            LOGGER.info("%s skipped: BTC low volatility filter", signal.symbol)
-            return True
+
+        if btc_context.regime == "sideways":
+            signal.confidence = max(1, signal.confidence - self.config.btc_sideway_penalty)
+            signal.reason += f"; BTC sideways penalty -{self.config.btc_sideway_penalty}"
+            if signal.confidence < self.config.min_confidence:
+                self.journal.log_signal(signal, "skipped_btc_regime", "btc_sideways_confidence_below_minimum")
+                LOGGER.info("%s skipped: BTC sideways regime filter", signal.symbol)
+                return True
+
+        if btc_context.regime == "high_volatility":
+            signal.confidence = max(1, signal.confidence - self.config.btc_sideway_penalty)
+            signal.score = max(0, signal.score - self.config.btc_sideway_penalty)
+            signal.reason += f"; BTC high-volatility risk reduction -{self.config.btc_sideway_penalty}"
+            weak_signal = signal.confidence < self.config.min_confidence or signal.score < self.config.score_threshold
+            if weak_signal:
+                self.journal.log_signal(signal, "skipped_btc_regime", "btc_high_volatility_weak_signal")
+                LOGGER.info("%s skipped: BTC high-volatility weak signal", signal.symbol)
+                return True
         return False
 
     def select_top_candidates(self, candidates: list[TradeSignal]) -> list[TradeSignal]:

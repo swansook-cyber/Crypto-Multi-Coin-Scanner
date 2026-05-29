@@ -17,6 +17,8 @@ import cornix_agent as scanner
 import daily_summary
 import review_signals
 import stats_dashboard
+from core.btc_regime_filter import detect_btc_regime
+from core.loss_cooldown import LossCooldownTracker
 from core import wave_structure_analyzer as wave
 
 
@@ -54,6 +56,8 @@ def sample_signal() -> scanner.TradeSignal:
         wave_structure="bearish",
         wave_phase="possible_wave_3",
         wave_notes=["bearish swing structure", "volume confirms move"],
+        btc_regime="bearish",
+        risk_mode="normal",
         reason="test reason",
     )
 
@@ -72,6 +76,9 @@ def test_telegram_message() -> None:
     assert "Wave Score: 76/100" in message
     assert "Possible Phase: possible_wave_3" in message
     assert "bearish swing structure" in message
+    assert "Market Regime:" in message
+    assert "BTC: bearish" in message
+    assert "Risk Mode: normal" in message
     assert message.count("For educational analysis only. Not financial advice.") == 1
     assert "No auto-trade" not in message
 
@@ -145,6 +152,56 @@ def test_wave_range_or_unclear_and_score_bounds() -> None:
         result = wave.calculate_wave_score(_wave_test_candles(kind))
         assert 0 <= result["wave_score"] <= 100
         assert result["structure"] in {"bullish", "bearish", "range", "unclear"}
+
+
+def test_btc_regime_filter_profiles() -> None:
+    bullish = detect_btc_regime(_wave_test_candles("bullish"))
+    assert bullish["regime"] == "bullish"
+    assert bullish["allow_long"] is True
+
+    bearish = detect_btc_regime(_wave_test_candles("bearish"))
+    assert bearish["regime"] == "bearish"
+    assert bearish["allow_short"] is True
+
+    sideways = detect_btc_regime(_wave_test_candles("range"))
+    assert sideways["regime"] == "sideways"
+    assert sideways["risk_multiplier"] < 1.0
+
+    high_volatility_df = _wave_test_candles("bullish")
+    high_volatility_df["atr_pct"] = 3.2
+    high_volatility = detect_btc_regime(high_volatility_df)
+    assert high_volatility["regime"] == "high_volatility"
+    assert high_volatility["risk_multiplier"] < 1.0
+
+    unavailable = detect_btc_regime(None)
+    assert unavailable["regime"] == "unclear"
+    assert unavailable["allow_long"] is True
+    assert unavailable["allow_short"] is True
+
+
+def test_loss_cooldown_three_losses_and_missing_journal() -> None:
+    missing = LossCooldownTracker(Path(tempfile.gettempdir()) / "missing_loss_cooldown_smoke.csv")
+    assert missing.status().active is False
+
+    path = Path(tempfile.gettempdir()) / "loss_cooldown_smoke.csv"
+    now = pd.Timestamp.now(tz="UTC")
+    try:
+        pd.DataFrame(
+            [
+                {"result": "LOSS", "closed_at": (now - pd.Timedelta(hours=1)).isoformat()},
+                {"result": "LOSS", "closed_at": (now - pd.Timedelta(hours=2)).isoformat()},
+                {"result": "LOSS", "closed_at": (now - pd.Timedelta(hours=3)).isoformat()},
+                {"result": "WIN", "closed_at": (now - pd.Timedelta(hours=20)).isoformat()},
+            ]
+        ).to_csv(path, index=False)
+        status = LossCooldownTracker(path, max_losses=3, pause_hours=12).status(now=now)
+        assert status.active is True
+        assert status.loss_streak == 3
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def test_scanner_survives_wave_analyzer_failure() -> None:
@@ -361,6 +418,8 @@ def main() -> int:
     test_wave_bullish_higher_high_higher_low()
     test_wave_bearish_lower_high_lower_low()
     test_wave_range_or_unclear_and_score_bounds()
+    test_btc_regime_filter_profiles()
+    test_loss_cooldown_three_losses_and_missing_journal()
     test_scanner_survives_wave_analyzer_failure()
     test_review_old_journal_columns()
     test_stats_old_and_new_fields()
