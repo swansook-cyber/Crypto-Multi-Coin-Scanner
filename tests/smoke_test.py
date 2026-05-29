@@ -17,6 +17,7 @@ import cornix_agent as scanner
 import daily_summary
 import review_signals
 import stats_dashboard
+from core import wave_structure_analyzer as wave
 
 
 def sample_signal() -> scanner.TradeSignal:
@@ -49,6 +50,10 @@ def sample_signal() -> scanner.TradeSignal:
         opposite_wick_ratio=0.2,
         atr_expansion_ratio=1.18,
         quality_flags="strong_body",
+        wave_score=76,
+        wave_structure="bearish",
+        wave_phase="possible_wave_3",
+        wave_notes=["bearish swing structure", "volume confirms move"],
         reason="test reason",
     )
 
@@ -63,8 +68,114 @@ def test_telegram_message() -> None:
     assert "Alignment: YES" in message
     assert "Conflict: NO" in message
     assert "Session: London" in message
-    assert "สัญญาณนี้ใช้เพื่อเก็บสถิติ/ทดสอบระบบเท่านั้น" in message
-    assert "No auto-trade" in message
+    assert "Wave Structure:" in message
+    assert "Wave Score: 76/100" in message
+    assert "Possible Phase: possible_wave_3" in message
+    assert "bearish swing structure" in message
+    assert message.count("For educational analysis only. Not financial advice.") == 1
+    assert "No auto-trade" not in message
+
+
+def _wave_test_candles(kind: str = "bullish") -> pd.DataFrame:
+    rows = []
+    base_time = pd.Timestamp("2026-05-28T00:00:00Z")
+    if kind == "range":
+        closes = [100 + ((index % 6) - 3) * 0.25 for index in range(60)]
+    elif kind == "bearish":
+        closes = [120 - index * 0.35 + (1 if index % 8 == 0 else 0) for index in range(60)]
+    else:
+        closes = [100 + index * 0.35 - (1 if index % 8 == 0 else 0) for index in range(60)]
+    for index, close in enumerate(closes):
+        open_price = close - 0.25 if kind != "bearish" else close + 0.25
+        rows.append(
+            {
+                "open_time": base_time + pd.Timedelta(hours=index),
+                "close_time": base_time + pd.Timedelta(hours=index + 1),
+                "open": open_price,
+                "high": close + 0.8,
+                "low": close - 0.8,
+                "close": close,
+                "volume": 1000 + index * 5,
+            }
+        )
+    df = pd.DataFrame(rows)
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["volume_sma20"] = df["volume"].rolling(20).mean()
+    return df
+
+
+def test_wave_bullish_higher_high_higher_low() -> None:
+    swings = [
+        {"type": "low", "price": 100, "index": 1},
+        {"type": "high", "price": 110, "index": 2},
+        {"type": "low", "price": 104, "index": 3},
+        {"type": "high", "price": 118, "index": 4},
+    ]
+    structure = wave.detect_market_structure(swings)
+    assert structure["higher_high"] is True
+    assert structure["higher_low"] is True
+    assert structure["bullish_structure"] is True
+    assert structure["structure"] == "bullish"
+
+
+def test_wave_bearish_lower_high_lower_low() -> None:
+    swings = [
+        {"type": "high", "price": 120, "index": 1},
+        {"type": "low", "price": 110, "index": 2},
+        {"type": "high", "price": 116, "index": 3},
+        {"type": "low", "price": 104, "index": 4},
+    ]
+    structure = wave.detect_market_structure(swings)
+    assert structure["lower_high"] is True
+    assert structure["lower_low"] is True
+    assert structure["bearish_structure"] is True
+    assert structure["structure"] == "bearish"
+
+
+def test_wave_range_or_unclear_and_score_bounds() -> None:
+    swings = [
+        {"type": "high", "price": 105, "index": 1},
+        {"type": "low", "price": 100, "index": 2},
+        {"type": "high", "price": 105, "index": 3},
+        {"type": "low", "price": 100, "index": 4},
+    ]
+    structure = wave.detect_market_structure(swings)
+    assert structure["structure"] == "range"
+    for kind in ["bullish", "bearish", "range"]:
+        result = wave.calculate_wave_score(_wave_test_candles(kind))
+        assert 0 <= result["wave_score"] <= 100
+        assert result["structure"] in {"bullish", "bearish", "range", "unclear"}
+
+
+def test_scanner_survives_wave_analyzer_failure() -> None:
+    indicator_engine = scanner.IndicatorEngine()
+    df_1h = indicator_engine.add_indicators(_wave_test_candles("bullish"))
+    df_15m = indicator_engine.add_indicators(_wave_test_candles("bullish"))
+    cfg = scanner.ScannerConfig.from_env()
+    cfg.use_mfi_filter = False
+    cfg.use_session_filter = False
+    cfg.use_4h_regime_filter = False
+    cfg.use_candle_body_filter = False
+    cfg.use_wick_filter = False
+    cfg.use_atr_expansion_filter = False
+    cfg.min_volume_ratio = 0
+    cfg.min_atr_pct = 0
+    scorer = scanner.SignalScorer(
+        cfg,
+        scanner.SupportResistanceEngine(),
+        scanner.MarketRegimeDetector(),
+    )
+    original = scanner.calculate_wave_score
+
+    def broken_wave_score(*_args, **_kwargs):
+        raise RuntimeError("wave unavailable")
+
+    scanner.calculate_wave_score = broken_wave_score
+    try:
+        signal = scorer.score("BTCUSDT", df_1h, df_15m, None)
+    finally:
+        scanner.calculate_wave_score = original
+    assert signal is None or signal.wave_structure == "unclear"
 
 
 def test_review_old_journal_columns() -> None:
@@ -247,6 +358,10 @@ def test_daily_summary_and_missing_telegram_env() -> None:
 
 def main() -> int:
     test_telegram_message()
+    test_wave_bullish_higher_high_higher_low()
+    test_wave_bearish_lower_high_lower_low()
+    test_wave_range_or_unclear_and_score_bounds()
+    test_scanner_survives_wave_analyzer_failure()
     test_review_old_journal_columns()
     test_stats_old_and_new_fields()
     test_outcome_message_and_dedupe()

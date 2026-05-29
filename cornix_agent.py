@@ -16,7 +16,7 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from requests import Timeout
@@ -31,6 +31,8 @@ import requests
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from core.wave_structure_analyzer import calculate_wave_score
 
 try:
     from google import genai
@@ -332,6 +334,10 @@ class TradeSignal:
     position_size_coin: float = 0.0
     position_value_usdt: float = 0.0
     chart_path: Path | None = None
+    wave_score: int = 0
+    wave_structure: str = "unclear"
+    wave_phase: str = "unknown"
+    wave_notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -682,6 +688,25 @@ class SignalScorer:
         elif self.config.use_mfi_filter and mfi >= self.config.mfi_bullish_threshold:
             short_score = max(0, short_score - self.config.mfi_score_bonus)
 
+        try:
+            wave_context = calculate_wave_score(
+                df_1h,
+                {
+                    "ema20": float(df_1h["ema20"].iloc[-1]),
+                    "ema50": float(df_1h["ema50"].iloc[-1]),
+                    "atr14": atr,
+                    "mfi14": mfi,
+                },
+            )
+        except Exception as exc:
+            LOGGER.warning("Wave analyzer failed for %s: %s", symbol, exc)
+            wave_context = {
+                "wave_score": 0,
+                "structure": "unclear",
+                "possible_phase": "unknown",
+                "notes": ["wave analysis unavailable"],
+            }
+
         if long_score < 1 and short_score < 1:
             return None
 
@@ -706,6 +731,30 @@ class SignalScorer:
         reward = abs(tp2 - entry)
         rr = reward / risk if risk > 0 else 0
         confidence = min(95, max(1, score + (8 if rr >= self.config.min_rr else 0)))
+        wave_score = int(wave_context.get("wave_score", 0))
+        wave_structure = str(wave_context.get("structure", "unclear"))
+        wave_phase = str(wave_context.get("possible_phase", "unknown"))
+        wave_notes = [str(item) for item in wave_context.get("notes", [])][:3]
+        wave_aligned = (
+            (direction == "LONG" and wave_structure == "bullish")
+            or (direction == "SHORT" and wave_structure == "bearish")
+        )
+        wave_conflict = (
+            (direction == "LONG" and wave_structure == "bearish")
+            or (direction == "SHORT" and wave_structure == "bullish")
+        )
+        if wave_aligned:
+            wave_bonus = min(8, max(1, wave_score // 12))
+            score += wave_bonus
+            confidence = min(95, confidence + wave_bonus)
+            quality_flags.append("wave_aligned")
+        elif wave_conflict:
+            score = max(0, score - 5)
+            confidence = max(1, confidence - 5)
+            quality_flags.append("wave_conflict")
+        elif wave_structure == "range":
+            confidence = max(1, confidence - 2)
+            quality_flags.append("wave_range")
         if watchlist_tier == "A":
             confidence = min(95, confidence + 3)
         elif watchlist_tier == "C":
@@ -788,6 +837,10 @@ class SignalScorer:
             atr_expansion_ratio=atr_expansion_ratio,
             quality_flags=", ".join(quality_flags),
             liquidation_context=liquidation_context,
+            wave_score=wave_score,
+            wave_structure=wave_structure,
+            wave_phase=wave_phase,
+            wave_notes=wave_notes,
             reason=reason,
         )
 
@@ -956,6 +1009,7 @@ class TradeJournalLogger:
         "timestamp", "symbol", "side", "entry", "stop_loss", "tp1", "tp2",
         "risk_reward", "confidence", "setup_strength", "market_regime", "volume_spike", "score", "raw_score", "score_bucket", "watchlist_tier", "mfi", "mfi_confirmed", "ai_summary",
         "body_ratio", "opposite_wick_ratio", "atr_expansion_ratio", "quality_flags",
+        "wave_score", "wave_structure", "wave_phase", "wave_notes",
         "market_session", "htf_regime", "htf_alignment", "htf_conflict", "signal_version",
         "signal_status", "skip_reason",
         "result", "hit_target", "closed_at", "max_profit_pct", "max_drawdown_pct",
@@ -994,6 +1048,10 @@ class TradeJournalLogger:
             "opposite_wick_ratio": "",
             "atr_expansion_ratio": "",
             "quality_flags": "",
+            "wave_score": "",
+            "wave_structure": "",
+            "wave_phase": "",
+            "wave_notes": "",
             "market_session": "",
             "htf_regime": "",
             "htf_alignment": "",
@@ -1042,6 +1100,10 @@ class TradeJournalLogger:
                     "opposite_wick_ratio": f"{signal.opposite_wick_ratio:.4f}",
                     "atr_expansion_ratio": f"{signal.atr_expansion_ratio:.4f}",
                     "quality_flags": signal.quality_flags,
+                    "wave_score": signal.wave_score,
+                    "wave_structure": signal.wave_structure,
+                    "wave_phase": signal.wave_phase,
+                    "wave_notes": "; ".join(signal.wave_notes),
                     "market_session": signal.market_session,
                     "htf_regime": signal.htf_regime,
                     "htf_alignment": signal.htf_alignment,
@@ -1222,6 +1284,7 @@ class TelegramNotifier:
         commentary = f"\n\n🧠 AI Summary:\n{signal.ai_commentary}" if signal.ai_commentary else ""
         htf_alignment_yes = "YES" if signal.htf_alignment == "Aligned" else "NO"
         htf_conflict_yes = "YES" if signal.htf_alignment == "Conflict" else "NO"
+        wave_notes = "\n".join(f"- {note}" for note in signal.wave_notes[:3]) or "- none"
         return (
             f"{signal_emoji} {signal.direction} SIGNAL\n"
             f"🪙 {SymbolFormatter.to_display_symbol(signal.symbol)}\n\n"
@@ -1240,6 +1303,11 @@ class TelegramNotifier:
             f"Alignment: {htf_alignment_yes}\n"
             f"Conflict: {htf_conflict_yes}\n"
             f"Regime Score: {score_bucket(signal.confidence)}\n\n"
+            f"Wave Structure:\n"
+            f"- Structure: {signal.wave_structure}\n"
+            f"- Wave Score: {signal.wave_score}/100\n"
+            f"- Possible Phase: {signal.wave_phase}\n"
+            f"- Notes:\n{wave_notes}\n\n"
             f"📦 Volume Spike: {volume_text}\n"
             f"📈 MFI: {signal.mfi:.1f}\n"
             f"🕯 Body: {signal.body_ratio * 100:.0f}%\n"
@@ -1250,8 +1318,7 @@ class TelegramNotifier:
             f"📐 Size: {signal.position_size_coin:.6f} {signal.symbol.replace('USDT', '')}\n\n"
             f"🧠 Reason:\n{signal.reason}"
             f"{commentary}\n\n"
-            f"⚠️ สัญญาณนี้ใช้เพื่อเก็บสถิติ/ทดสอบระบบเท่านั้น ไม่ใช่คำแนะนำการลงทุน\n"
-            f"⚠️ Signal is for research/testing only. No auto-trade. Manage risk manually.\n\n"
+            f"For educational analysis only. Not financial advice.\n\n"
             f"Exchange: Binance Futures\n"
             f"Leverage: Cross {self.config.max_leverage}x\n"
             f"TradingView: {signal.tradingview_symbol}"
