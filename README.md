@@ -219,6 +219,15 @@ It is synced from `logs/signals.csv` after outcome review finishes and includes 
 
 `stats_dashboard.py` reads `logs/signals_history.csv` first and falls back to `logs/signals.csv` if the history file does not exist. It prints and writes adaptive filtering suggestions to `logs/performance_report.txt`, such as symbols with weak historical winrate or underperforming HTF-misaligned setups. These are recommendations only; the scanner does not auto-trade and does not rewrite strategy settings automatically.
 
+The quant validation layer also maintains:
+
+- `logs/daily_summary.csv`
+- `logs/equity_curve.csv`
+- `logs/rejected_signals.csv`
+- `logs/adaptive_filters.json`
+
+Adaptive analytics can recommend a 7-day symbol blacklist, HTF score reductions, session threshold increases, daily consecutive-loss pauses, max daily drawdown guards, and ATR spike protection. These are research controls by default; keep `USE_ADAPTIVE_FILTERS=0` unless you intentionally wire the generated state into scanner filtering.
+
 ## Tier Review
 
 Run:

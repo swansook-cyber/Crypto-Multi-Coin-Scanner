@@ -97,6 +97,7 @@ def test_review_old_journal_columns() -> None:
             assert column in df.columns
 
         history_path = Path(tempfile.gettempdir()) / "signals_history_smoke.csv"
+        rejected_path = history_path.with_name("rejected_signals_smoke.csv")
         old_history = review_signals.HISTORY
         try:
             review_signals.HISTORY = history_path
@@ -109,6 +110,10 @@ def test_review_old_journal_columns() -> None:
             review_signals.HISTORY = old_history
             try:
                 history_path.unlink()
+            except OSError:
+                pass
+            try:
+                rejected_path.unlink()
             except OSError:
                 pass
     finally:

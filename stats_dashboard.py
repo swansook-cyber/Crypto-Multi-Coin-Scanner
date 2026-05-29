@@ -8,10 +8,18 @@ from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 
+from core.analytics_engine import update_validation_artifacts
+from core.performance_stats import load_csv as load_performance_csv
+from core.performance_stats import normalize as normalize_performance
+from core.performance_stats import performance_by as core_performance_by
+from core.performance_stats import rejection_counts, summary as core_summary
+
 
 BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
 HISTORY = BASE_DIR / "logs" / "signals_history.csv"
+REJECTED = BASE_DIR / "logs" / "rejected_signals.csv"
+EQUITY = BASE_DIR / "logs" / "equity_curve.csv"
 PERFORMANCE_REPORT = BASE_DIR / "logs" / "performance_report.txt"
 REPORT_DIR = BASE_DIR / "reports"
 
@@ -24,6 +32,10 @@ def load_journal() -> pd.DataFrame:
         return pd.read_csv(source)
     except pd.errors.EmptyDataError:
         return pd.DataFrame()
+
+
+def load_rejected() -> pd.DataFrame:
+    return load_performance_csv(REJECTED)
 
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -53,13 +65,17 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
         df["watchlist_tier"] = df["tier"]
     if df["market_session"].fillna("").astype(str).str.strip().eq("").all() and "session" in df.columns:
         df["market_session"] = df["session"]
-    if "rr" in df.columns and "risk_reward" not in df.columns:
+    if "rr" in df.columns and df["risk_reward"].fillna("").astype(str).str.strip().eq("").all():
         df["risk_reward"] = df["rr"]
     if "sl" in df.columns and "stop_loss" not in df.columns:
         df["stop_loss"] = df["sl"]
     df["timestamp"] = pd.to_datetime(df.get("timestamp"), utc=True, errors="coerce")
     df["closed_at"] = pd.to_datetime(df.get("closed_at"), utc=True, errors="coerce")
     df["risk_reward"] = pd.to_numeric(df.get("risk_reward"), errors="coerce")
+    if "real_rr" in df.columns:
+        df["real_rr"] = pd.to_numeric(df.get("real_rr"), errors="coerce")
+    else:
+        df["real_rr"] = df["risk_reward"].where(df["result"].astype(str).str.upper() == "WIN", -1)
     df["setup_strength"] = pd.to_numeric(df.get("setup_strength"), errors="coerce").fillna(pd.to_numeric(df.get("confidence"), errors="coerce"))
     if df["score_bucket"].fillna("").astype(str).str.strip().eq("").all():
         df["score_bucket"] = df["setup_strength"].apply(bucket_strength)
@@ -108,6 +124,16 @@ def profit_factor(df: pd.DataFrame) -> float:
     gross_win = pd.to_numeric(wins.get("risk_reward"), errors="coerce").fillna(0).sum()
     gross_loss = float(len(losses))
     return float(gross_win / gross_loss) if gross_loss else float(gross_win)
+
+
+def distribution(df: pd.DataFrame, column: str, bins: list[float], labels: list[str]) -> pd.DataFrame:
+    if column not in df.columns:
+        return pd.DataFrame(columns=["bucket", "count"])
+    values = pd.to_numeric(df[column], errors="coerce").dropna()
+    if values.empty:
+        return pd.DataFrame(columns=["bucket", "count"])
+    buckets = pd.cut(values, bins=bins, labels=labels, include_lowest=True)
+    return buckets.value_counts().sort_index().rename_axis("bucket").reset_index(name="count")
 
 
 def performance_by(df: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -168,10 +194,10 @@ def adaptive_suggestions(df: pd.DataFrame) -> list[str]:
     suggestions: list[str] = []
     symbol_perf = performance_by(df, "symbol")
     if not symbol_perf.empty:
-        weak_symbols = symbol_perf[(symbol_perf["trades"] >= 3) & (symbol_perf["win_rate"] < 35)]
+        weak_symbols = symbol_perf[(symbol_perf["trades"] >= 10) & (symbol_perf["win_rate"] < 35)]
         for _, row in weak_symbols.iterrows():
             suggestions.append(
-                f"Consider temporarily disabling {row['symbol']}: winrate {row['win_rate']:.1f}% over {int(row['trades'])} closed trades."
+                f"Temporarily blacklist {row['symbol']} for 7 days: winrate {row['win_rate']:.1f}% over {int(row['trades'])} closed trades."
             )
     htf_perf = performance_by(df, "htf_alignment")
     if not htf_perf.empty:
@@ -219,7 +245,13 @@ def print_report(summary: pd.DataFrame, tables: dict[str, pd.DataFrame]) -> None
 def main() -> int:
     load_dotenv(BASE_DIR / ".env")
     REPORT_DIR.mkdir(exist_ok=True)
+    journal = load_performance_csv(JOURNAL)
+    if not journal.empty:
+        update_validation_artifacts(journal, BASE_DIR / "logs")
     df = normalize(load_journal())
+    rejected = load_rejected()
+    core_df = normalize_performance(load_journal())
+    core_stats = core_summary(core_df)
     summary = build_summary(df)
     tables = {
         "Winrate by Symbol": performance_by(df, "symbol"),
@@ -227,13 +259,19 @@ def main() -> int:
         "Winrate by Side": performance_by(df, "side"),
         "Winrate by Market Regime": performance_by(df, "market_regime"),
         "Winrate by MFI Confirmed": performance_by(df, "mfi_confirmed"),
+        "AI Commentary ON vs OFF": core_performance_by(core_df, "ai_commentary_used"),
         "Winrate by Score Bucket": performance_by(df, "score_bucket"),
         "Winrate by Setup Strength Range": performance_by(df.assign(setup_strength_range=df["setup_strength"].apply(strength_range)), "setup_strength_range"),
         "Winrate by HTF Alignment": performance_by(df, "htf_alignment"),
         "Winrate by HTF Conflict": performance_by(df, "htf_conflict"),
         "Winrate by Session": performance_by(df, "market_session"),
+        "RR Distribution": distribution(core_df, "real_rr", [-10, -1, 0, 1, 2, 5, 10], ["<=-1R", "-1-0R", "0-1R", "1-2R", "2-5R", "5R+"]),
+        "Holding Time Distribution": distribution(core_df, "holding_minutes", [0, 60, 240, 720, 1440, 100000], ["<1h", "1-4h", "4-12h", "12-24h", "24h+"]),
+        "Top Rejection Reasons": rejection_counts(rejected).head(7),
     }
     suggestions = adaptive_suggestions(df)
+    if core_stats.get("equity_status") == "Drawdown":
+        suggestions.append("Equity curve is in drawdown; consider reducing signal frequency until recovery.")
     summary.to_csv(REPORT_DIR / "stats_summary.csv", index=False)
     tables["Winrate by Symbol"].to_csv(REPORT_DIR / "symbol_performance.csv", index=False)
     tables["Winrate by Tier"].to_csv(REPORT_DIR / "tier_performance.csv", index=False)

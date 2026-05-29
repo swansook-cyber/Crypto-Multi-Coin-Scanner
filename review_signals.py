@@ -19,10 +19,14 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from core.analytics_engine import update_validation_artifacts
+from core.outcome_tracker import HISTORY_COLUMNS, sync_history_files
+
 
 BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
 HISTORY = BASE_DIR / "logs" / "signals_history.csv"
+REJECTED = BASE_DIR / "logs" / "rejected_signals.csv"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 ERROR_RETRY_SECONDS = 60
 
@@ -61,30 +65,6 @@ OUTCOME_COLUMNS = {
 }
 
 PROCESSED_OUTCOMES: set[str] = set()
-
-HISTORY_COLUMNS = [
-    "timestamp",
-    "symbol",
-    "side",
-    "tier",
-    "session",
-    "entry",
-    "sl",
-    "tp1",
-    "tp2",
-    "rr",
-    "setup_strength",
-    "score",
-    "market_regime",
-    "htf_alignment",
-    "volume_spike",
-    "mfi",
-    "atr",
-    "result",
-    "pnl_percent",
-    "holding_minutes",
-]
-
 
 @dataclass
 class Outcome:
@@ -316,27 +296,17 @@ def journal_to_history(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def sync_signal_history(df: pd.DataFrame) -> None:
-    HISTORY.parent.mkdir(parents=True, exist_ok=True)
-    current = journal_to_history(df)
-    if HISTORY.exists():
-        try:
-            existing = pd.read_csv(HISTORY)
-        except pd.errors.EmptyDataError:
-            existing = pd.DataFrame(columns=HISTORY_COLUMNS)
-    else:
-        existing = pd.DataFrame(columns=HISTORY_COLUMNS)
-    for column in HISTORY_COLUMNS:
-        if column not in existing.columns:
-            existing[column] = ""
-    combined = pd.concat([existing[HISTORY_COLUMNS], current], ignore_index=True)
-    if not combined.empty:
-        combined["_key"] = signal_history_key(combined.rename(columns={"sl": "stop_loss", "rr": "risk_reward"}))
-        combined = combined.drop_duplicates("_key", keep="last").drop(columns=["_key"])
-    with HISTORY.open("w", newline="", encoding="utf-8") as handle:
-        combined.to_csv(handle, index=False)
-        handle.flush()
-        os.fsync(handle.fileno())
-    LOGGER.info("Signal history synced: %s rows -> %s", len(combined), HISTORY)
+    if HISTORY.parent != BASE_DIR / "logs":
+        history, rejected = sync_history_files(df, HISTORY, HISTORY.with_name("rejected_signals_smoke.csv"))
+        LOGGER.info("Validation artifacts synced: history=%s rejected=%s equity=0", len(history), len(rejected))
+        return
+    artifacts = update_validation_artifacts(df, BASE_DIR / "logs")
+    LOGGER.info(
+        "Validation artifacts synced: history=%s rejected=%s equity=%s",
+        len(artifacts["history"]),
+        len(artifacts["rejected"]),
+        len(artifacts["equity"]),
+    )
 
 
 def alert_already_sent(value: Any) -> bool:
