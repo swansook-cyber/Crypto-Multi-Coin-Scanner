@@ -10,6 +10,7 @@ config_template_improved.bat
 *.log
 cornix_agent.log
 logs/
+journal/
 charts/
 reports/
 signal_state.json

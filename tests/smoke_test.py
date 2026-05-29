@@ -17,6 +17,7 @@ import cornix_agent as scanner
 import daily_summary
 import review_signals
 import stats_dashboard
+from core.analytics_reporting import build_daily_performance_report, export_journal_csvs, journal_signal_export
 from core.btc_regime_filter import detect_btc_regime
 from core.loss_cooldown import LossCooldownTracker
 from core import wave_structure_analyzer as wave
@@ -358,6 +359,13 @@ def test_daily_summary_and_missing_telegram_env() -> None:
             "timestamp": "2026-05-28T00:00:00+00:00",
             "closed_at": "2026-05-28T02:15:00+00:00",
             "symbol": "BTCUSDT",
+            "side": "LONG",
+            "entry": 100,
+            "tp2": 104,
+            "stop_loss": 98,
+            "wave_score": 82,
+            "btc_regime": "bullish",
+            "pnl_percent": 2.0,
             "result": "WIN",
             "hit_target": "TP1",
             "market_session": "London",
@@ -367,6 +375,13 @@ def test_daily_summary_and_missing_telegram_env() -> None:
             "timestamp": "2026-05-28T03:00:00+00:00",
             "closed_at": "2026-05-28T04:00:00+00:00",
             "symbol": "ETHUSDT",
+            "side": "SHORT",
+            "entry": 100,
+            "tp2": 96,
+            "stop_loss": 102,
+            "wave_score": 55,
+            "btc_regime": "bearish",
+            "pnl_percent": -1.0,
             "result": "LOSS",
             "hit_target": "SL",
             "market_session": "London",
@@ -375,6 +390,13 @@ def test_daily_summary_and_missing_telegram_env() -> None:
         {
             "timestamp": "2026-05-28T05:00:00+00:00",
             "symbol": "SOLUSDT",
+            "side": "LONG",
+            "entry": 100,
+            "tp2": 104,
+            "stop_loss": 98,
+            "wave_score": 30,
+            "btc_regime": "sideways",
+            "pnl_percent": 0.0,
             "result": "OPEN",
             "hit_target": "",
             "market_session": "Asia",
@@ -388,12 +410,18 @@ def test_daily_summary_and_missing_telegram_env() -> None:
     assert summary["sl_hits"] == 1
     assert summary["pending"] == 1
     assert summary["win_rate"] == 50.0
+    assert summary["btc_regime_breakdown"] == "bullish: 1, bearish: 1, sideways: 1"
+    assert summary["wave_score_breakdown"] == "80-100: 1, 40-59: 1, 0-39: 1"
     assert summary["current_streak"] == "1 LOSS"
     message = daily_summary.build_telegram_message(summary)
     assert "📊 Daily Signal Summary" in message
     assert "Today's Winrate: 50.0%" in message
+    assert "Best Coin: BTCUSDT" in message
+    assert "Worst Coin: ETHUSDT" in message
     assert "Best Session: London" in message
     assert "Best Bucket: A+" in message
+    assert "BTC Regime: bullish: 1, bearish: 1, sideways: 1" in message
+    assert "Wave Score: 80-100: 1, 40-59: 1, 0-39: 1" in message
     assert "Current Streak: 1 LOSS" in message
 
     old_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
@@ -413,6 +441,91 @@ def test_daily_summary_and_missing_telegram_env() -> None:
             os.environ["SEND_DAILY_SUMMARY"] = old_send
 
 
+def test_analytics_report_and_journal_exports() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-05-28T00:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "entry": 100,
+                "tp2": 104,
+                "stop_loss": 98,
+                "wave_score": 88,
+                "btc_regime": "bullish",
+                "result": "WIN",
+                "pnl_percent": 2.0,
+            },
+            {
+                "timestamp": "2026-05-28T01:00:00+00:00",
+                "symbol": "ETHUSDT",
+                "side": "SHORT",
+                "entry": 100,
+                "tp2": 96,
+                "stop_loss": 102,
+                "wave_score": 45,
+                "btc_regime": "bearish",
+                "result": "LOSS",
+                "pnl_percent": -1.0,
+            },
+            {
+                "timestamp": "2026-05-28T02:00:00+00:00",
+                "symbol": "SOLUSDT",
+                "side": "LONG",
+                "entry": 100,
+                "tp2": 103,
+                "stop_loss": 98,
+                "wave_score": 70,
+                "btc_regime": "sideways",
+                "result": "OPEN",
+                "pnl_percent": 0.0,
+            },
+        ]
+    )
+    report = build_daily_performance_report(df, "2026-05-28")
+    assert report["signals"] == 3
+    assert report["wins"] == 1
+    assert report["losses"] == 1
+    assert report["pending"] == 1
+    assert report["win_rate"] == 50.0
+    assert report["best_coin"] == "BTCUSDT"
+    assert report["worst_coin"] == "ETHUSDT"
+
+    export = journal_signal_export(df)
+    assert list(export.columns) == [
+        "timestamp",
+        "symbol",
+        "direction",
+        "wave_score",
+        "btc_regime",
+        "entry",
+        "tp",
+        "sl",
+        "result",
+        "pnl_percent",
+    ]
+
+    export_dir = Path(tempfile.gettempdir()) / "crypto_scanner_journal_export_smoke"
+    signals_path, daily_path = export_journal_csvs(df, export_dir, report)
+    try:
+        signals = pd.read_csv(signals_path)
+        daily = pd.read_csv(daily_path)
+        assert len(signals) == 3
+        assert len(daily) == 1
+        assert daily.loc[0, "btc_regime_breakdown"] == report["btc_regime_breakdown"]
+    finally:
+        try:
+            signals_path.unlink()
+            daily_path.unlink()
+            export_dir.rmdir()
+        except OSError:
+            pass
+
+    missing_report = build_daily_performance_report(pd.DataFrame(), "2026-05-28")
+    assert missing_report["signals"] == 0
+    assert missing_report["btc_regime_breakdown"] == "-"
+
+
 def main() -> int:
     test_telegram_message()
     test_wave_bullish_higher_high_higher_low()
@@ -425,6 +538,7 @@ def main() -> int:
     test_stats_old_and_new_fields()
     test_outcome_message_and_dedupe()
     test_daily_summary_and_missing_telegram_env()
+    test_analytics_report_and_journal_exports()
     print("smoke tests passed")
     return 0
 

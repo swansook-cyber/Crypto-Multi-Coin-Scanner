@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+from core.analytics_reporting import build_daily_performance_report, export_journal_csvs
 from core.equity_tracker import equity_curve_status
 from core.performance_stats import load_csv as load_performance_csv
 from core.performance_stats import normalize as normalize_performance
@@ -27,6 +28,7 @@ HISTORY = BASE_DIR / "logs" / "signals_history.csv"
 REJECTED = BASE_DIR / "logs" / "rejected_signals.csv"
 EQUITY = BASE_DIR / "logs" / "equity_curve.csv"
 DAILY_SUMMARY = BASE_DIR / "logs" / "daily_summary.csv"
+JOURNAL_EXPORT_DIR = BASE_DIR / "journal"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +59,8 @@ REQUIRED_COLUMNS = {
     "holding_minutes": "",
     "setup_strength": "",
     "confidence": "",
+    "btc_regime": "",
+    "wave_score": "",
 }
 
 
@@ -92,6 +96,8 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["score_bucket"] = df["score_bucket"].fillna("-").replace("", "-")
     df["real_rr"] = pd.to_numeric(df["real_rr"], errors="coerce")
     df["pnl_percent"] = pd.to_numeric(df["pnl_percent"], errors="coerce")
+    df["wave_score"] = pd.to_numeric(df["wave_score"], errors="coerce")
+    df["btc_regime"] = df["btc_regime"].fillna("unclear").replace("", "unclear").astype(str).str.lower()
     return df
 
 
@@ -191,6 +197,7 @@ def build_daily_summary(df: pd.DataFrame, date: str | None = None) -> dict[str, 
     equity = load_performance_csv(EQUITY)
     perf = performance_summary(normalize_performance(df.copy()))
 
+    analytics = build_daily_performance_report(day_df, date)
     return {
         "date": date,
         "total_signals": total,
@@ -210,6 +217,10 @@ def build_daily_summary(df: pd.DataFrame, date: str | None = None) -> dict[str, 
         "sl_rate": sl / total * 100 if total else 0.0,
         "best_symbol": best_group(day_df, "symbol"),
         "worst_symbol": worst_group(day_df, "symbol"),
+        "best_coin": analytics["best_coin"],
+        "worst_coin": analytics["worst_coin"],
+        "btc_regime_breakdown": analytics["btc_regime_breakdown"],
+        "wave_score_breakdown": analytics["wave_score_breakdown"],
         "best_session": best_group(day_df, "market_session"),
         "best_score_bucket": best_group(day_df, "score_bucket"),
         "current_streak": current_streak(df),
@@ -233,8 +244,10 @@ def build_telegram_message(summary: dict[str, Any]) -> str:
         f"🏆 TP2: {summary['tp2_hits']}\n"
         f"❌ SL: {summary['sl_hits']}\n"
         f"⏳ Pending: {summary['pending']}\n\n"
-        f"Best Symbol: {summary['best_symbol']}\n"
-        f"Worst Symbol: {summary['worst_symbol']}\n"
+        f"Best Coin: {summary.get('best_coin', summary['best_symbol'])}\n"
+        f"Worst Coin: {summary.get('worst_coin', summary['worst_symbol'])}\n"
+        f"BTC Regime: {summary.get('btc_regime_breakdown', '-')}\n"
+        f"Wave Score: {summary.get('wave_score_breakdown', '-')}\n"
         f"Current Streak: {summary['current_streak']}\n"
         f"Top Tier: {summary['top_performing_tier']}\n"
         f"Best Session: {summary['best_session']}\n"
@@ -275,6 +288,8 @@ def persist_daily_summary(summary: dict[str, Any], path: Path = DAILY_SUMMARY) -
         "current_streak": summary["current_streak"],
         "best_session": summary["best_session"],
         "worst_symbol": summary["worst_symbol"],
+        "btc_regime_breakdown": summary.get("btc_regime_breakdown", "-"),
+        "wave_score_breakdown": summary.get("wave_score_breakdown", "-"),
         "avg_holding_time": summary["avg_holding_time"],
         "equity_change_pct": f"{summary['equity_change_pct']:.4f}",
         "equity_status": summary["equity_status"],
@@ -326,6 +341,7 @@ def main() -> int:
     summary = build_daily_summary(df, args.date)
     message = build_telegram_message(summary)
     persist_daily_summary(summary)
+    export_journal_csvs(df, JOURNAL_EXPORT_DIR, summary)
     print_summary(summary)
     if not args.dry_run:
         send_telegram(message)
