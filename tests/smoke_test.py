@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cornix_agent as scanner
 import dashboard
 import daily_summary
+import external_signal_analyzer
 import performance_report
 import position_manager
 import review_signals
@@ -141,6 +142,9 @@ def test_missing_telegram_channel_ids_do_not_crash() -> None:
 def test_external_inbox_logging_and_debug_format() -> None:
     path = Path(tempfile.gettempdir()) / "external_signals_smoke.csv"
     try:
+        pd.DataFrame(
+            [{"timestamp_utc": "2026-05-31T00:00:00+00:00", "chat_id": "old", "message_id": 1, "source": "old", "raw_text": "old", "status": "RECEIVED"}]
+        ).to_csv(path, index=False)
         telegram_external_inbox.log_external_message(
             chat_id="123",
             message_id=456,
@@ -149,8 +153,8 @@ def test_external_inbox_logging_and_debug_format() -> None:
         )
         df = pd.read_csv(path)
         assert list(df.columns) == telegram_external_inbox.FIELDNAMES
-        assert df.loc[0, "status"] == "RECEIVED"
-        assert df.loc[0, "source"] == "External Signal Inbox"
+        assert df.iloc[-1]["recommendation"] in {"APPROVED", "WAIT", "SKIP", "RISKY", "FAILED"}
+        assert df.iloc[-1]["source"] == "External Signal Inbox"
         report = telegram_external_inbox.build_debug_report("x" * 600)
         assert "📥 External Signal Received" in report
         assert "Received Successfully" in report
@@ -164,6 +168,141 @@ def test_external_inbox_logging_and_debug_format() -> None:
         }
         assert telegram_external_inbox.extract_message(update) == ("123", 9, "test")
     finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _vip_long_text() -> str:
+    return """#BTC/USDT
+LONG
+Entry: 105000 - 105500
+SL: 103800
+Targets:
+107000
+109000
+112000
+Leverage: 10x
+"""
+
+
+def _vip_short_text() -> str:
+    return """ETHUSDT
+SELL
+Entry: 3200-3180
+Stop Loss: 3260
+TP1: 3140
+TP2: 3080
+TP3: 3000
+20x
+"""
+
+
+def test_external_signal_parse_long_short_and_symbols() -> None:
+    parsed = external_signal_analyzer.parse_external_signal(_vip_long_text(), message_id=1)
+    assert parsed.parse_status == "SUCCESS"
+    assert parsed.symbol == "BTCUSDT"
+    assert parsed.side == "LONG"
+    assert parsed.entry_low == 105000
+    assert parsed.entry_high == 105500
+    assert parsed.stop_loss == 103800
+    assert parsed.targets[:3] == [107000, 109000, 112000]
+
+    parsed_short = external_signal_analyzer.parse_external_signal(_vip_short_text(), message_id=2)
+    assert parsed_short.parse_status == "SUCCESS"
+    assert parsed_short.symbol == "ETHUSDT"
+    assert parsed_short.side == "SHORT"
+    assert parsed_short.targets[:3] == [3140, 3080, 3000]
+
+
+def test_external_signal_missing_fields_not_approved() -> None:
+    missing_sl = external_signal_analyzer.analyze_external_signal("BTCUSDT LONG Entry 100 TP 105", message_id=3)
+    assert missing_sl.parsed.parse_status == "FAILED"
+    assert missing_sl.recommendation == "FAILED"
+
+    missing_entry = external_signal_analyzer.analyze_external_signal("BTCUSDT LONG SL 95 TP 105", message_id=4)
+    assert missing_entry.parsed.parse_status == "FAILED"
+    assert missing_entry.recommendation == "FAILED"
+
+
+def test_external_signal_score_threshold_and_routing() -> None:
+    old_threshold = os.environ.get("EXTERNAL_SIGNAL_SCORE_THRESHOLD")
+    os.environ["EXTERNAL_SIGNAL_SCORE_THRESHOLD"] = "99"
+    calls: list[tuple[str, str]] = []
+    original_send = external_signal_analyzer.send_telegram_message
+
+    def fake_send(_token: str, chat_id: str, _message: str, channel_name: str) -> bool:
+        calls.append((chat_id, channel_name))
+        return True
+
+    external_signal_analyzer.send_telegram_message = fake_send
+    try:
+        analysis = external_signal_analyzer.process_external_signal(
+            _vip_long_text(),
+            message_id=5,
+            token="token",
+            signals_chat_id="signals",
+            cornix_chat_id="cornix",
+            reports_chat_id="reports",
+            log_path=Path(tempfile.gettempdir()) / "external_threshold_smoke.csv",
+            send=True,
+        )
+        assert analysis.recommendation == "WAIT"
+        assert ("signals", "external signals") not in calls
+        assert ("cornix", "external cornix") not in calls
+        assert ("reports", "external reports") in calls
+    finally:
+        external_signal_analyzer.send_telegram_message = original_send
+        if old_threshold is None:
+            os.environ.pop("EXTERNAL_SIGNAL_SCORE_THRESHOLD", None)
+        else:
+            os.environ["EXTERNAL_SIGNAL_SCORE_THRESHOLD"] = old_threshold
+        try:
+            (Path(tempfile.gettempdir()) / "external_threshold_smoke.csv").unlink()
+        except OSError:
+            pass
+
+
+def test_external_signal_approved_routes_to_signals_and_cornix_and_logs() -> None:
+    old_threshold = os.environ.get("EXTERNAL_SIGNAL_SCORE_THRESHOLD")
+    os.environ["EXTERNAL_SIGNAL_SCORE_THRESHOLD"] = "70"
+    calls: list[tuple[str, str, str]] = []
+    original_send = external_signal_analyzer.send_telegram_message
+    path = Path(tempfile.gettempdir()) / "external_approved_smoke.csv"
+
+    def fake_send(_token: str, chat_id: str, message: str, channel_name: str) -> bool:
+        calls.append((chat_id, channel_name, message))
+        return True
+
+    external_signal_analyzer.send_telegram_message = fake_send
+    try:
+        analysis = external_signal_analyzer.process_external_signal(
+            _vip_long_text(),
+            message_id=6,
+            token="token",
+            signals_chat_id="signals",
+            cornix_chat_id="cornix",
+            reports_chat_id="reports",
+            log_path=path,
+            send=True,
+        )
+        assert analysis.recommendation == "APPROVED"
+        assert analysis.sent_to_signals is True
+        assert analysis.sent_to_cornix is True
+        assert any(call[0] == "signals" and call[1] == "external signals" for call in calls)
+        assert any(call[0] == "cornix" and call[1] == "external cornix" for call in calls)
+        assert "DRY RUN - EXTERNAL SIGNAL CORNIX FORMAT" in [call[2] for call in calls if call[0] == "cornix"][0]
+        logged = pd.read_csv(path)
+        assert logged.loc[0, "recommendation"] == "APPROVED"
+        assert logged.loc[0, "sent_to_signals"] == "YES"
+        assert logged.loc[0, "sent_to_cornix"] == "YES"
+    finally:
+        external_signal_analyzer.send_telegram_message = original_send
+        if old_threshold is None:
+            os.environ.pop("EXTERNAL_SIGNAL_SCORE_THRESHOLD", None)
+        else:
+            os.environ["EXTERNAL_SIGNAL_SCORE_THRESHOLD"] = old_threshold
         try:
             path.unlink()
         except OSError:
@@ -795,6 +934,10 @@ def main() -> int:
     test_cornix_dry_run_format_and_signal_immutability()
     test_missing_telegram_channel_ids_do_not_crash()
     test_external_inbox_logging_and_debug_format()
+    test_external_signal_parse_long_short_and_symbols()
+    test_external_signal_missing_fields_not_approved()
+    test_external_signal_score_threshold_and_routing()
+    test_external_signal_approved_routes_to_signals_and_cornix_and_logs()
     test_wave_bullish_higher_high_higher_low()
     test_wave_bearish_lower_high_lower_low()
     test_wave_range_or_unclear_and_score_bounds()

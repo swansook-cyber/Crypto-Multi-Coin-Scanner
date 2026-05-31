@@ -25,7 +25,8 @@
 - `performance_report.py` creates true closed-outcome performance reporting
 - `dashboard.py` creates local HTML Dashboard V1
 - `position_manager.py` prevents duplicate/opposite/stale position confusion
-- `telegram_external_inbox.py` logs external messages for debug only
+- `external_signal_analyzer.py` parses and reviews forwarded external/VIP signals
+- `telegram_external_inbox.py` polls the External Inbox
 
 ## Telegram Routing
 
@@ -34,7 +35,9 @@
 - Reports: `TELEGRAM_REPORTS_CHAT_ID`
 - External Inbox: `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`
 
-Do not forward External Inbox messages into scanner signals or Cornix.
+Do not forward External Inbox messages into scanner-generated signals.
+
+Only APPROVED external analyzer results may be sent to Signals or Cornix. WAIT, SKIP, RISKY, and FAILED results are reports/logs only.
 
 Cornix output is dry-run format unless the user explicitly changes production mode.
 

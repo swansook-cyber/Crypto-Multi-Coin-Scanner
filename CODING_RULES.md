@@ -25,7 +25,8 @@
 
 - Rule engine remains the decision maker
 - AI commentary is optional explanation only
-- External Signal Inbox is logging/debug only
+- External Signal Analyzer must be approved-only
+- External Signal Inbox must not affect scanner-generated logic
 - Cornix channel is dry-run format unless explicitly changed
 - New filters should reduce bad signals, not increase signal volume
 - Do not add indicators without statistical evidence from collected outcomes
@@ -43,8 +44,9 @@
 - Signals channel receives full signal and chart
 - Cornix channel receives Cornix-format dry-run text
 - Reports channel receives daily summaries, reports, and position advisories
-- External Inbox messages must not affect scanner decisions
-- External Inbox messages must not be forwarded to Cornix
+- External Inbox messages must not affect scanner-generated decisions
+- Only APPROVED external signals may be sent to Signals or Cornix
+- WAIT / SKIP / RISKY / FAILED external signals are logs/reports only
 
 ## Validation
 

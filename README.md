@@ -79,9 +79,9 @@ Optional multi-channel routing:
 - `TELEGRAM_SIGNALS_CHAT_ID`: full scanner signal and chart
 - `TELEGRAM_CORNIX_CHAT_ID`: Cornix-format dry-run signal text
 - `TELEGRAM_REPORTS_CHAT_ID`: daily summaries, reports, and position advisor messages
-- `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`: external message intake for logging/debug only
+- `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`: external message intake for approved-only analysis
 
-If a new channel ID is empty, the scanner falls back to `TELEGRAM_CHAT_ID` where appropriate. External inbox messages are never forwarded to Cornix and never affect scanner signals.
+If a new channel ID is empty, the scanner falls back to `TELEGRAM_CHAT_ID` where appropriate. External inbox messages never affect scanner-generated signals. Only APPROVED external analyzer results may be routed to Signals and Cornix.
 
 To poll the external inbox once:
 
@@ -89,7 +89,7 @@ To poll the external inbox once:
 python telegram_external_inbox.py
 ```
 
-Received external messages are stored in `logs/external_signals.csv` and a debug notification is sent to the reports channel.
+Received external messages are parsed, scored, stored in `logs/external_signals.csv`, and reported to the reports channel. WAIT, SKIP, RISKY, and FAILED messages are never sent to Signals or Cornix.
 
 For testing without sending alerts:
 

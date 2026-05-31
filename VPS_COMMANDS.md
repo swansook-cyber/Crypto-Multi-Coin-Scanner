@@ -207,6 +207,12 @@ cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python telegram_external_inbox.py
 ```
 
+External Signal Analyzer V1 is approved-only:
+
+- APPROVED external signals may route to Signals and Cornix
+- WAIT / SKIP / RISKY / FAILED signals are stored in logs and reports only
+- Cornix output remains dry-run text only
+
 ## Telegram Multi-Channel Config
 
 Required:
@@ -230,7 +236,8 @@ Routing:
 - Signals: full scanner signal and chart
 - Cornix: Cornix-format dry-run text
 - Reports: daily summaries, performance reports, and position advisories
-- External Inbox: incoming external messages are logged and debug-reported only
+- External Inbox: incoming external messages are parsed by External Analyzer V1
+- External Analyzer V1: only APPROVED forwarded VIP signals can route to Signals/Cornix
 
 If a channel-specific ID is empty, the app falls back to `TELEGRAM_CHAT_ID` where appropriate.
 

@@ -40,7 +40,8 @@ Main runtime components:
 - `performance_report.py`: closed-outcome performance report
 - `dashboard.py`: local HTML Dashboard V1
 - `position_manager.py`: duplicate/opposite/stale position advisor
-- `telegram_external_inbox.py`: external inbox logging/debug tool
+- `external_signal_analyzer.py`: approved-only parser/analyzer/router for forwarded VIP signals
+- `telegram_external_inbox.py`: external inbox polling tool
 
 ## Current Strategy
 
@@ -77,7 +78,7 @@ Legacy `SYMBOLS` remains supported as a fallback.
 - Signals channel: full scanner signal and chart
 - Cornix channel: Cornix-format dry-run text
 - Reports channel: daily summaries, performance reports, and position advisories
-- External Inbox: receives outside messages for logging/debug only
+- External Inbox: receives outside messages for approved-only analysis
 
 Environment variables:
 
@@ -88,7 +89,9 @@ Environment variables:
 - `TELEGRAM_REPORTS_CHAT_ID`
 - `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`
 
-External inbox messages must not affect scanner decisions and must not be forwarded to Cornix.
+External inbox messages must not affect scanner-generated decisions.
+
+Only APPROVED external signals may be routed to Signals and Cornix. WAIT, SKIP, RISKY, and FAILED external signals are log/report only.
 
 ## Product Principles
 

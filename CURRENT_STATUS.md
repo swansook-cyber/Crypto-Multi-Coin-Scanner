@@ -28,7 +28,8 @@
 - Daily Performance Report via `performance_report.py`
 - Dashboard V1 as local HTML via `dashboard.py`
 - Position Management Advisor via `position_manager.py`
-- External Signal Inbox logger via `telegram_external_inbox.py`
+- External Signal Analyzer V1 via `external_signal_analyzer.py`
+- External Signal Inbox polling via `telegram_external_inbox.py`
 
 ## Telegram Channels
 
@@ -39,7 +40,13 @@
 - Reports: `TELEGRAM_REPORTS_CHAT_ID`
   - Daily summary, reports, and position management advisories
 - External Inbox: `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`
-  - Incoming external signal messages are logged/debugged only
+  - Incoming external signal messages are parsed, scored, logged, and reviewed
+
+External analyzer routing:
+
+- APPROVED external signals may go to Signals and Cornix
+- WAIT / SKIP / RISKY / FAILED external signals must not go to Signals or Cornix
+- Rejected or failed external signals are logged and may be reported to Reports only
 
 If a channel-specific chat ID is empty, the scanner falls back to `TELEGRAM_CHAT_ID` where appropriate.
 
@@ -68,5 +75,6 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 
 - Runtime CSV/log/chart/dashboard output should stay out of Git
 - `.env` and real API/chat IDs must not be committed
-- External inbox messages must not affect scanner signals
+- External inbox messages must not affect scanner-generated signals
+- External analyzer approval must be explicit before routing to Signals/Cornix
 - Cornix channel is dry-run format only until explicitly connected

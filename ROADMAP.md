@@ -13,6 +13,7 @@
 - Daily Performance Report is implemented through `performance_report.py`
 - Dashboard V1 is implemented as local HTML through `dashboard.py`
 - Position Management Advisor is implemented through `position_manager.py` and scanner Telegram advisory routing
+- External Signal Analyzer V1 is implemented as approved-only routing for forwarded VIP signals
 - Production monitoring now focuses on whether these tools produce useful operational decisions
 
 ## Next
