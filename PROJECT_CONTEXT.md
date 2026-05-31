@@ -20,30 +20,75 @@ New features last.
 
 Do not add indicators without evidence from collected data.
 
-## Current Strategy
+## Current Production Workflow
 
 - Binance Futures market data
-- Multi-coin scanner with tiered watchlists
-- 1H primary timeframe
+- Multi-coin scanner
+- Tier A / B / C watchlists
+- 1H primary setup timeframe
 - 15m entry confirmation
 - Optional 4H regime context
-- Telegram delivery only
+- Telegram delivery
 - Manual execution only
 - No auto trading
 
-## Current Filters
+Main runtime components:
 
+- `cornix_agent.py`: scanner loop and Telegram signal delivery
+- `review_signals.py`: outcome checker and TP/SL alerts
+- `daily_summary.py`: daily summary
+- `performance_report.py`: closed-outcome performance report
+- `dashboard.py`: local HTML Dashboard V1
+- `position_manager.py`: duplicate/opposite/stale position advisor
+- `telegram_external_inbox.py`: external inbox logging/debug tool
+
+## Current Strategy
+
+- Rule-based decision engine
 - EMA trend filter
 - ATR risk management and ATR-based TP/SL
 - Support / Resistance
-- Volume analysis and volume spike filter
+- Volume and volume spike analysis
 - Market regime detection
 - BTC regime filter
 - MFI confirmation layer
 - Candle body / wick / ATR expansion quality filters
 - Wave Structure scoring layer
 - Cooldown, loss cooldown, and daily risk guard
-- Confidence / setup strength scoring
+- Setup Strength scoring
+- Optional Gemini commentary only after rule-based filtering
+
+## Watchlist Architecture
+
+- Tier A: core/high-liquidity symbols
+- Tier B: momentum/standard symbols
+- Tier C: experimental symbols with stricter filtering
+
+Configured through:
+
+- `WATCHLIST_TIER_A`
+- `WATCHLIST_TIER_B`
+- `WATCHLIST_TIER_C`
+
+Legacy `SYMBOLS` remains supported as a fallback.
+
+## Telegram Architecture
+
+- Signals channel: full scanner signal and chart
+- Cornix channel: Cornix-format dry-run text
+- Reports channel: daily summaries, performance reports, and position advisories
+- External Inbox: receives outside messages for logging/debug only
+
+Environment variables:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `TELEGRAM_SIGNALS_CHAT_ID`
+- `TELEGRAM_CORNIX_CHAT_ID`
+- `TELEGRAM_REPORTS_CHAT_ID`
+- `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`
+
+External inbox messages must not affect scanner decisions and must not be forwarded to Cornix.
 
 ## Product Principles
 
@@ -57,13 +102,13 @@ One open position per symbol.
 
 Position management awareness is required.
 
-## Current Priority
+## Current Roadmap Priority
 
-1. Collect statistics
-2. Daily Performance Report
-3. Dashboard V1
-4. Position Management Advisor
-5. Strategy optimization
+1. Daily Performance Report
+2. Dashboard V1
+3. Position Management Advisor
+4. Position Exit Advisor
+5. Advanced TP Engine
 
 ## Future Direction
 

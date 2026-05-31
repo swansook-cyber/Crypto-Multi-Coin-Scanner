@@ -1,45 +1,69 @@
 # VPS Commands
 
-This project is still an internal lab signal assistant. It does not auto-trade.
+Crypto-Multi-Coin-Scanner is an internal lab Telegram signal assistant. It does not auto-trade.
 
-## Windows Setup
+## Production Layout
 
-The files in `tools/` use Windows OpenSSH. On Windows, confirm SSH works:
+Production app path:
 
-```bat
-ssh -V
+```bash
+/opt/Crypto-Multi-Coin-Scanner
 ```
 
-Set your VPS connection once:
+Python runtime:
 
-```bat
-setx VPS_HOST your.vps.ip.address
-setx VPS_USER root
-setx VPS_PORT 22
-setx VPS_APP_DIR /opt/Crypto-Multi-Coin-Scanner
+```bash
+/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python
 ```
 
-Close and reopen Command Prompt after `setx`.
+Current systemd units:
 
-You can also run any BAT directly and enter the VPS host when prompted.
+- `crypto-scanner.service`
+- `crypto-outcome-checker.service`
+- `crypto-outcome-checker.timer`
+- `crypto-daily-summary.service`
+- `crypto-daily-summary.timer`
 
 ## VPS Login
+
+Default Windows helper config is stored in:
+
+```bat
+tools\vps_env.bat
+```
+
+Current default:
+
+```bat
+set VPS_HOST=143.14.11.12
+set VPS_USER=root
+set VPS_PORT=22
+set VPS_APP_DIR=/opt/Crypto-Multi-Coin-Scanner
+```
 
 Manual login:
 
 ```bat
-ssh root@your.vps.ip.address
+ssh root@143.14.11.12
 ```
 
-If using a non-standard SSH port:
+With explicit port:
 
 ```bat
-ssh -p 2222 root@your.vps.ip.address
+ssh -p 22 root@143.14.11.12
 ```
 
-## Easy Windows Tools
+## Windows Control Center
 
-Run from the project folder:
+Main launcher:
+
+```bat
+tools\VelaFlow Scanner Control Center.bat
+```
+
+Use it to check scanner status, logs, restart scanner, pull latest code, view performance report, run daily summary, and run health checks.
+
+Other Windows helpers:
 
 ```bat
 tools\scanner_status.bat
@@ -53,76 +77,73 @@ tools\git_pull_update.bat
 tools\health_check.bat
 ```
 
-Every tool connects to the VPS, runs one command, then pauses before exit.
-
-## VelaFlow Scanner Control Center
-
-Main launcher:
-
-```bat
-tools\VelaFlow Scanner Control Center.bat
-```
-
-How to use:
-
-- Double click the BAT file.
-- Choose a menu number.
-- Wait for SSH output.
-- Press any key to return to the menu.
-
-The Control Center automatically loads:
-
-```bat
-tools\vps_env.bat
-```
-
-Default connection:
-
-```bat
-set VPS_HOST=143.14.11.12
-set VPS_USER=root
-```
-
-It uses built-in Windows OpenSSH and does not require PowerShell.
-
-## Service Management
+## Service Status
 
 Scanner:
 
 ```bash
-sudo systemctl status crypto-scanner.service --no-pager
-sudo systemctl restart crypto-scanner.service
+systemctl status crypto-scanner.service --no-pager
+systemctl is-active crypto-scanner.service
 journalctl -u crypto-scanner.service -n 140 --no-pager
 ```
 
 Outcome checker:
 
 ```bash
-sudo systemctl status crypto-outcome-checker.timer --no-pager
-sudo systemctl status crypto-outcome-checker.service --no-pager
-sudo systemctl restart crypto-outcome-checker.timer
+systemctl status crypto-outcome-checker.timer --no-pager
+systemctl status crypto-outcome-checker.service --no-pager
 systemctl list-timers crypto-outcome-checker.timer --no-pager
+journalctl -u crypto-outcome-checker.service -n 140 --no-pager
 ```
 
 Daily summary:
 
 ```bash
-sudo systemctl status crypto-daily-summary.timer --no-pager
-sudo systemctl status crypto-daily-summary.service --no-pager
+systemctl status crypto-daily-summary.timer --no-pager
+systemctl status crypto-daily-summary.service --no-pager
+systemctl list-timers crypto-daily-summary.timer --no-pager
+journalctl -u crypto-daily-summary.service -n 100 --no-pager
+```
+
+## Restart Services
+
+Scanner:
+
+```bash
+sudo systemctl restart crypto-scanner.service
+```
+
+Outcome checker timer:
+
+```bash
+sudo systemctl restart crypto-outcome-checker.timer
+```
+
+Daily summary timer:
+
+```bash
 sudo systemctl restart crypto-daily-summary.timer
 ```
 
-## Git Update
+Restart all production units after a code update:
 
-Manual update on the VPS:
+```bash
+sudo systemctl restart crypto-scanner.service
+sudo systemctl restart crypto-outcome-checker.timer
+sudo systemctl restart crypto-daily-summary.timer
+```
+
+## Git Update On VPS
 
 ```bash
 cd /opt/Crypto-Multi-Coin-Scanner
 git pull origin main
 .venv/bin/python -m compileall -q .
+.venv/bin/python tests/smoke_test.py
 sudo systemctl restart crypto-scanner.service
 sudo systemctl restart crypto-outcome-checker.timer
 sudo systemctl restart crypto-daily-summary.timer
+systemctl status crypto-scanner.service --no-pager
 ```
 
 Windows shortcut:
@@ -131,38 +152,139 @@ Windows shortcut:
 tools\git_pull_update.bat
 ```
 
-## Log Viewing
+## Runtime Commands
 
-Scanner logs:
-
-```bash
-journalctl -u crypto-scanner.service -n 140 --no-pager
-```
-
-Outcome checker logs:
-
-```bash
-journalctl -u crypto-outcome-checker.service -n 140 --no-pager
-```
-
-Project files:
+Run scanner once with current `.env` settings:
 
 ```bash
 cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python cornix_agent.py
+```
+
+Review outcomes:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python review_signals.py
+.venv/bin/python review_signals.py --notify
+```
+
+Daily summary:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python daily_summary.py
+.venv/bin/python daily_summary.py --dry-run
+```
+
+Daily Performance Report:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python performance_report.py
+.venv/bin/python performance_report.py --send
+```
+
+Dashboard V1:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python dashboard.py
+ls -lh reports/dashboard.html
+```
+
+Position Management Advisor:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python position_manager.py
+```
+
+External Signal Inbox poll once:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python telegram_external_inbox.py
+```
+
+## Telegram Multi-Channel Config
+
+Required:
+
+```env
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+```
+
+Optional channel-specific IDs:
+
+```env
+TELEGRAM_SIGNALS_CHAT_ID=
+TELEGRAM_CORNIX_CHAT_ID=
+TELEGRAM_REPORTS_CHAT_ID=
+TELEGRAM_EXTERNAL_INBOX_CHAT_ID=
+```
+
+Routing:
+
+- Signals: full scanner signal and chart
+- Cornix: Cornix-format dry-run text
+- Reports: daily summaries, performance reports, and position advisories
+- External Inbox: incoming external messages are logged and debug-reported only
+
+If a channel-specific ID is empty, the app falls back to `TELEGRAM_CHAT_ID` where appropriate.
+
+## Log And Data Files
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+tail -n 80 logs/cornix_agent.log
+tail -n 25 logs/signals.csv
 tail -n 25 logs/signals_history.csv
-tail -n 30 logs/equity_curve.csv
+tail -n 25 logs/external_signals.csv
 tail -n 220 logs/performance_report.txt
+tail -n 30 logs/equity_curve.csv
+```
+
+Generated local dashboard:
+
+```bash
+ls -lh reports/dashboard.html
+```
+
+## Health Check
+
+Manual:
+
+```bash
+hostname
+date
+uptime
+df -h /
+cd /opt/Crypto-Multi-Coin-Scanner
+test -f .env && echo ".env OK" || echo ".env MISSING"
+.venv/bin/python -m compileall -q . && echo "compile OK"
+.venv/bin/python tests/smoke_test.py
+systemctl is-active crypto-scanner.service
+systemctl is-active crypto-outcome-checker.timer
+systemctl is-active crypto-daily-summary.timer
+```
+
+Windows shortcut:
+
+```bat
+tools\health_check.bat
 ```
 
 ## Troubleshooting
 
 SSH fails:
 
-- Check `VPS_HOST`, `VPS_USER`, and `VPS_PORT`.
-- Confirm the VPS firewall allows SSH.
-- Try manual login with `ssh -p %VPS_PORT% %VPS_USER%@%VPS_HOST%`.
+- Check `VPS_HOST`, `VPS_USER`, and `VPS_PORT`
+- Confirm VPS firewall allows SSH
+- Try `ssh -p 22 root@143.14.11.12`
 
-Service is inactive:
+Scanner inactive:
 
 ```bash
 sudo systemctl restart crypto-scanner.service
@@ -171,21 +293,34 @@ journalctl -u crypto-scanner.service -n 200 --no-pager
 
 No Telegram messages:
 
-- Check `.env` on the VPS.
-- Confirm `SEND_TELEGRAM=1`.
-- Confirm `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
-- Run `python test_telegram.py` on the VPS.
+- Check `.env` on the VPS
+- Confirm `SEND_TELEGRAM=1`
+- Confirm `TELEGRAM_BOT_TOKEN`
+- Confirm `TELEGRAM_CHAT_ID`
+- Confirm channel IDs if using multi-channel routing
+- Run `.venv/bin/python test_telegram.py`
 
-No performance report:
+No outcome alerts:
+
+```bash
+systemctl status crypto-outcome-checker.timer --no-pager
+journalctl -u crypto-outcome-checker.service -n 200 --no-pager
+```
+
+No daily summary:
+
+```bash
+systemctl status crypto-daily-summary.timer --no-pager
+journalctl -u crypto-daily-summary.service -n 200 --no-pager
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python daily_summary.py --dry-run
+```
+
+No performance report/dashboard:
 
 ```bash
 cd /opt/Crypto-Multi-Coin-Scanner
-.venv/bin/python review_signals.py --dry-run
-.venv/bin/python stats_dashboard.py
-```
-
-Run a full health check from Windows:
-
-```bat
-tools\health_check.bat
+.venv/bin/python performance_report.py
+.venv/bin/python dashboard.py
+ls -lh reports/
 ```
