@@ -35,6 +35,7 @@ from urllib3.util.retry import Retry
 from core.btc_regime_filter import detect_btc_regime
 from core.loss_cooldown import LossCooldownTracker
 from core.wave_structure_analyzer import calculate_wave_score
+from position_manager import evaluate_new_signal
 
 try:
     from google import genai
@@ -1407,6 +1408,18 @@ class TelegramNotifier:
             return True
         return self._send_message(message)
 
+    def send_position_message(self, message: str) -> bool:
+        if self.config.dry_run:
+            LOGGER.info("DRY_RUN position management message:\n%s", message)
+            return True
+        if not self.config.send_telegram:
+            LOGGER.info("SEND_TELEGRAM=0, skipped position management message")
+            return True
+        if not self.config.telegram_bot_token or not self.config.telegram_chat_id:
+            LOGGER.warning("Telegram credentials are missing; skipped position management message")
+            return False
+        return self._send_message(message)
+
     def _send_message(self, message: str) -> bool:
         url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
         payload = {"chat_id": self.config.telegram_chat_id, "text": message}
@@ -1637,6 +1650,13 @@ class AgentRunner:
             if self.is_in_cooldown(signal):
                 self.journal.log_signal(signal, "skipped_not_top_candidate", "send_cooldown_active")
                 LOGGER.info("%s skipped: cooldown active", signal.symbol)
+                continue
+            position_advice = evaluate_new_signal(signal, self.journal.path)
+            if not position_advice.should_send_signal:
+                self.journal.log_signal(signal, "skipped_position_management", position_advice.reason)
+                if position_advice.message:
+                    self.notifier.send_position_message(position_advice.message)
+                LOGGER.info("%s skipped: position manager %s", signal.symbol, position_advice.action)
                 continue
             if self.ai_commentary.can_summarize(signal, self.config):
                 signal.ai_commentary = self.ai_commentary.summarize(signal)

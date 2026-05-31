@@ -207,6 +207,37 @@ It prints a console report and exports:
 
 The dashboard also groups performance by score bucket, setup strength range, HTF alignment/conflict, and market session. Public signal messages use `Setup Strength` instead of `Confidence` so the score is not presented as win probability.
 
+## Daily Performance Report
+
+Run:
+
+```bat
+python performance_report.py
+python performance_report.py --send
+```
+
+This reads `logs/signals.csv` and focuses on closed outcomes, not just signal activity. It reports sent signals, closed/open counts, wins/losses, win rate, TP/SL hits, net R estimate, average win/loss percent, and best/worst symbol, tier, session, and direction performance.
+
+## Dashboard V1
+
+Run:
+
+```bat
+python dashboard.py
+```
+
+This writes a lightweight local HTML dashboard to `reports/dashboard.html` with overview cards, latest signals, symbol/tier/session/direction performance, open positions, and recent TP/SL events.
+
+## Position Management Advisor
+
+Run:
+
+```bat
+python position_manager.py
+```
+
+The advisor reads open signals from `logs/signals.csv` and flags duplicate, opposite, or stale positions. It is Telegram advisory only and never places orders.
+
 ## Data-Driven Validation
 
 The outcome checker keeps a persistent derived history at:

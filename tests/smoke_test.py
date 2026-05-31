@@ -14,7 +14,10 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import cornix_agent as scanner
+import dashboard
 import daily_summary
+import performance_report
+import position_manager
 import review_signals
 import stats_dashboard
 from core.analytics_reporting import build_daily_performance_report, export_journal_csvs, journal_signal_export
@@ -526,6 +529,184 @@ def test_analytics_report_and_journal_exports() -> None:
     assert missing_report["btc_regime_breakdown"] == "-"
 
 
+def test_daily_performance_report_metrics() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-05-30T00:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "watchlist_tier": "A",
+                "market_session": "London",
+                "entry": 100,
+                "tp1": 101.2,
+                "tp2": 102,
+                "stop_loss": 99,
+                "risk_reward": 2.0,
+                "result": "WIN",
+                "hit_target": "TP1",
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "2026-05-30T01:00:00+00:00",
+                "symbol": "ETHUSDT",
+                "side": "SHORT",
+                "watchlist_tier": "B",
+                "market_session": "NewYork",
+                "entry": 100,
+                "tp1": 98.8,
+                "tp2": 98,
+                "stop_loss": 101,
+                "risk_reward": 2.0,
+                "result": "WIN",
+                "hit_target": "TP2",
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "2026-05-30T02:00:00+00:00",
+                "symbol": "SOLUSDT",
+                "side": "LONG",
+                "watchlist_tier": "C",
+                "market_session": "London",
+                "entry": 100,
+                "tp1": 101,
+                "tp2": 102,
+                "stop_loss": 99,
+                "risk_reward": 2.0,
+                "result": "LOSS",
+                "hit_target": "SL",
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "2026-05-30T03:00:00+00:00",
+                "symbol": "BNBUSDT",
+                "side": "SHORT",
+                "watchlist_tier": "A",
+                "market_session": "Asia",
+                "entry": 100,
+                "tp1": 99,
+                "tp2": 98,
+                "stop_loss": 101,
+                "risk_reward": 2.0,
+                "result": "OPEN",
+                "hit_target": "",
+                "signal_status": "sent",
+            },
+        ]
+    )
+    report = performance_report.build_report(df, "2026-05-30")
+    assert report["total_sent_signals"] == 4
+    assert report["closed_signals"] == 3
+    assert report["open_signals"] == 1
+    assert report["wins"] == 2
+    assert report["losses"] == 1
+    assert round(report["win_rate"], 1) == 66.7
+    assert report["tp1_hits"] == 1
+    assert report["tp2_hits"] == 1
+    assert report["sl_hits"] == 1
+    assert report["net_r_estimate"] == 2.2
+    assert report["small_sample_warning"] is True
+    message = performance_report.format_report(report)
+    assert "Daily Performance Report" in message
+    assert "Sample size is still small. Use for monitoring only." in message
+    assert "Long win rate:" in message
+    assert "Short win rate:" in message
+
+
+def test_dashboard_renders_html() -> None:
+    df = performance_report.normalize(
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-05-30T00:00:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "watchlist_tier": "A",
+                    "market_session": "London",
+                    "entry": 100,
+                    "tp1": 101,
+                    "tp2": 102,
+                    "stop_loss": 99,
+                    "risk_reward": 2,
+                    "result": "OPEN",
+                    "signal_status": "sent",
+                }
+            ]
+        )
+    )
+    output = Path(tempfile.gettempdir()) / "crypto_dashboard_smoke.html"
+    try:
+        dashboard.render_dashboard(df, output)
+        html = output.read_text(encoding="utf-8")
+        assert "Crypto Scanner Dashboard" in html
+        assert "Overview" not in html or "Total Signals" in html
+        assert "Open Positions" in html
+    finally:
+        try:
+            output.unlink()
+        except OSError:
+            pass
+
+
+def test_position_manager_advice() -> None:
+    now = pd.Timestamp("2026-05-30T12:00:00Z")
+    path = Path(tempfile.gettempdir()) / "position_manager_smoke.csv"
+    try:
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-05-30T08:00:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "stop_loss": 98,
+                    "tp1": 102,
+                    "tp2": 104,
+                    "result": "OPEN",
+                    "signal_status": "sent",
+                },
+                {
+                    "timestamp": "2026-05-30T02:00:00+00:00",
+                    "symbol": "ETHUSDT",
+                    "side": "SHORT",
+                    "entry": 100,
+                    "stop_loss": 102,
+                    "tp1": 98,
+                    "tp2": 96,
+                    "result": "OPEN",
+                    "signal_status": "sent",
+                },
+            ]
+        ).to_csv(path, index=False)
+
+        same = {"symbol": "BTCUSDT", "direction": "LONG", "entry": 101}
+        advice = position_manager.evaluate_new_signal(same, path, now=now)
+        assert advice.should_send_signal is False
+        assert advice.action == "position_hold"
+        assert "POSITION UPDATE / HOLD" in advice.message
+
+        opposite = {"symbol": "BTCUSDT", "direction": "SHORT", "entry": 101}
+        advice = position_manager.evaluate_new_signal(opposite, path, now=now)
+        assert advice.should_send_signal is False
+        assert advice.action == "opposite_signal"
+        assert "OPPOSITE SIGNAL DETECTED" in advice.message
+
+        review = {"symbol": "ETHUSDT", "direction": "SHORT", "entry": 99}
+        advice = position_manager.evaluate_new_signal(review, path, now=now)
+        assert advice.should_send_signal is False
+        assert advice.action == "position_review"
+        assert "POSITION REVIEW" in advice.message
+
+        fresh = {"symbol": "SOLUSDT", "direction": "LONG", "entry": 100}
+        advice = position_manager.evaluate_new_signal(fresh, path, now=now)
+        assert advice.should_send_signal is True
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def main() -> int:
     test_telegram_message()
     test_wave_bullish_higher_high_higher_low()
@@ -539,6 +720,9 @@ def main() -> int:
     test_outcome_message_and_dedupe()
     test_daily_summary_and_missing_telegram_env()
     test_analytics_report_and_journal_exports()
+    test_daily_performance_report_metrics()
+    test_dashboard_renders_html()
+    test_position_manager_advice()
     print("smoke tests passed")
     return 0
 
