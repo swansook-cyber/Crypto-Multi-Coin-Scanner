@@ -30,7 +30,7 @@
 - Complete Performance Analytics V1 via `core/performance_analytics_v1.py`
 - Dashboard V2 as read-only Streamlit analytics app via `dashboard.py`
 - Position Management Advisor via `position_manager.py`
-- External Signal Analyzer V1 via `external_signal_analyzer.py`
+- External Signal Refine V2 via `external_signal_analyzer.py`
 - External Signal Inbox polling via `telegram_external_inbox.py`
 - External inbox VPS listener loop via `telegram_external_inbox.py --loop`
 
@@ -50,6 +50,7 @@ External analyzer routing:
 - APPROVED external signals may go to Signals and Cornix
 - WAIT / SKIP / RISKY / FAILED external signals must not go to Signals or Cornix
 - WAIT / SKIP / RISKY / FAILED external signals are CSV-only and appear in summaries; no immediate Telegram message is sent
+- External Refine V2 fetches fresh Binance Futures candles, recalculates scanner-style market context, and requires scanner agreement before approval
 
 Channel-specific chat IDs are required for production channel routing. This prevents Signals, Cornix, and Reports messages from mixing in one destination.
 

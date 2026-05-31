@@ -263,15 +263,27 @@ def test_external_signal_missing_fields_not_approved() -> None:
 
 def test_external_signal_score_threshold_and_routing() -> None:
     old_threshold = os.environ.get("EXTERNAL_SIGNAL_SCORE_THRESHOLD")
-    os.environ["EXTERNAL_SIGNAL_SCORE_THRESHOLD"] = "99"
+    os.environ["EXTERNAL_SIGNAL_SCORE_THRESHOLD"] = "101"
     calls: list[tuple[str, str]] = []
     original_send = external_signal_analyzer.send_telegram_message
+    original_refine = external_signal_analyzer.perform_refine_analysis
 
     def fake_send(_token: str, chat_id: str, _message: str, channel_name: str) -> bool:
         calls.append((chat_id, channel_name))
         return True
 
+    def fake_refine(_parsed):
+        return external_signal_analyzer.RefineResult(
+            status="SUCCESS",
+            score=80,
+            scanner_agreement="YES",
+            scanner_direction="LONG",
+            reason=["scanner agreement mocked"],
+            details={"trend_1h": "bullish", "entry_15m": "bullish", "btc_regime": "bullish"},
+        )
+
     external_signal_analyzer.send_telegram_message = fake_send
+    external_signal_analyzer.perform_refine_analysis = fake_refine
     try:
         analysis = external_signal_analyzer.process_external_signal(
             _vip_long_text(),
@@ -297,6 +309,7 @@ def test_external_signal_score_threshold_and_routing() -> None:
             (Path(tempfile.gettempdir()) / "external_threshold_smoke.csv").unlink()
         except OSError:
             pass
+        external_signal_analyzer.perform_refine_analysis = original_refine
 
 
 def test_external_signal_approved_routes_to_signals_and_cornix_and_logs() -> None:
@@ -304,13 +317,38 @@ def test_external_signal_approved_routes_to_signals_and_cornix_and_logs() -> Non
     os.environ["EXTERNAL_SIGNAL_SCORE_THRESHOLD"] = "70"
     calls: list[tuple[str, str, str]] = []
     original_send = external_signal_analyzer.send_telegram_message
+    original_refine = external_signal_analyzer.perform_refine_analysis
     path = Path(tempfile.gettempdir()) / "external_approved_smoke.csv"
 
     def fake_send(_token: str, chat_id: str, message: str, channel_name: str) -> bool:
         calls.append((chat_id, channel_name, message))
         return True
 
+    def fake_refine(_parsed):
+        return external_signal_analyzer.RefineResult(
+            status="SUCCESS",
+            score=90,
+            scanner_agreement="YES",
+            scanner_direction="LONG",
+            reason=["scanner agreement mocked"],
+            details={
+                "trend_1h": "bullish",
+                "entry_15m": "bullish",
+                "htf_regime": "Bullish",
+                "htf_alignment": "Aligned",
+                "mfi": "61.0",
+                "atr_pct": "0.80",
+                "support": "104000",
+                "resistance": "108000",
+                "btc_regime": "bullish",
+                "volume_ratio": "1.50",
+                "volume_spike": "YES",
+                "market_regime": "Trending",
+            },
+        )
+
     external_signal_analyzer.send_telegram_message = fake_send
+    external_signal_analyzer.perform_refine_analysis = fake_refine
     try:
         analysis = external_signal_analyzer.process_external_signal(
             _vip_long_text(),
@@ -333,12 +371,67 @@ def test_external_signal_approved_routes_to_signals_and_cornix_and_logs() -> Non
         assert logged.loc[0, "recommendation"] == "APPROVED"
         assert logged.loc[0, "sent_to_signals"] == "YES"
         assert logged.loc[0, "sent_to_cornix"] == "YES"
+        assert logged.loc[0, "scanner_agreement"] == "YES"
+        assert int(logged.loc[0, "refine_score"]) == 90
+        assert logged.loc[0, "trend_1h"] == "bullish"
     finally:
         external_signal_analyzer.send_telegram_message = original_send
+        external_signal_analyzer.perform_refine_analysis = original_refine
         if old_threshold is None:
             os.environ.pop("EXTERNAL_SIGNAL_SCORE_THRESHOLD", None)
         else:
             os.environ["EXTERNAL_SIGNAL_SCORE_THRESHOLD"] = old_threshold
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def test_external_signal_refine_conflict_not_approved_or_routed() -> None:
+    calls: list[tuple[str, str]] = []
+    original_send = external_signal_analyzer.send_telegram_message
+    original_refine = external_signal_analyzer.perform_refine_analysis
+    path = Path(tempfile.gettempdir()) / "external_conflict_smoke.csv"
+
+    def fake_send(_token: str, chat_id: str, _message: str, channel_name: str) -> bool:
+        calls.append((chat_id, channel_name))
+        return True
+
+    def conflict_refine(_parsed):
+        return external_signal_analyzer.RefineResult(
+            status="SUCCESS",
+            score=20,
+            scanner_agreement="NO",
+            scanner_direction="SHORT",
+            conflict_reason="scanner_direction=SHORT",
+            reason=["VIP direction conflicts with scanner"],
+            details={"trend_1h": "bearish", "entry_15m": "bearish", "btc_regime": "bearish"},
+        )
+
+    external_signal_analyzer.send_telegram_message = fake_send
+    external_signal_analyzer.perform_refine_analysis = conflict_refine
+    try:
+        analysis = external_signal_analyzer.process_external_signal(
+            _vip_long_text(),
+            message_id=7,
+            token="token",
+            signals_chat_id="signals",
+            cornix_chat_id="cornix",
+            reports_chat_id="reports",
+            log_path=path,
+            send=True,
+        )
+        assert analysis.recommendation == "WAIT"
+        assert analysis.scanner_agreement == "NO"
+        assert not calls
+        logged = pd.read_csv(path)
+        assert logged.loc[0, "sent_to_signals"] == "NO"
+        assert logged.loc[0, "sent_to_cornix"] == "NO"
+        assert logged.loc[0, "scanner_agreement"] == "NO"
+        assert "scanner_direction" in str(logged.loc[0, "conflict_reason"])
+    finally:
+        external_signal_analyzer.send_telegram_message = original_send
+        external_signal_analyzer.perform_refine_analysis = original_refine
         try:
             path.unlink()
         except OSError:
@@ -1423,6 +1516,7 @@ def main() -> int:
     test_external_signal_missing_fields_not_approved()
     test_external_signal_score_threshold_and_routing()
     test_external_signal_approved_routes_to_signals_and_cornix_and_logs()
+    test_external_signal_refine_conflict_not_approved_or_routed()
     test_outcome_alert_reports_only()
     test_outcome_alert_success_marks_sent_and_failure_does_not()
     test_wave_bullish_higher_high_higher_low()

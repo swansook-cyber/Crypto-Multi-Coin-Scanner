@@ -81,7 +81,7 @@ Optional multi-channel routing:
 - `TELEGRAM_REPORTS_CHAT_ID`: daily summaries, reports, and position advisor messages
 - `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`: external message intake for approved-only analysis
 
-For production channel routing, set the channel-specific IDs. External inbox messages never affect scanner-generated signals. Only APPROVED external analyzer results may be routed to Signals and Cornix. WAIT, SKIP, RISKY, and FAILED external signals are CSV-only and appear in summary reporting.
+For production channel routing, set the channel-specific IDs. External inbox messages never affect scanner-generated signals. Only APPROVED external analyzer results may be routed to Signals and Cornix. WAIT, SKIP, RISKY, and FAILED external signals are CSV-only and appear in summary reporting. External Signal Refine V2 fetches fresh Binance Futures candles and requires scanner-style agreement before approval.
 
 To poll the external inbox once:
 

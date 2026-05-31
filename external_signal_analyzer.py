@@ -12,7 +12,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import requests
+
+from core.btc_regime_filter import detect_btc_regime
+from cornix_agent import (
+    IndicatorEngine,
+    MarketDataClient,
+    MarketRegimeDetector,
+    SupportResistanceEngine,
+    alignment_for_direction,
+    classify_trend,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -39,6 +50,24 @@ FIELDNAMES = [
     "analysis_score",
     "recommendation",
     "reason",
+    "rr",
+    "refine_status",
+    "refine_score",
+    "scanner_agreement",
+    "scanner_direction",
+    "conflict_reason",
+    "trend_1h",
+    "entry_15m",
+    "htf_regime",
+    "htf_alignment",
+    "mfi",
+    "atr_pct",
+    "support",
+    "resistance",
+    "btc_regime",
+    "volume_ratio",
+    "volume_spike",
+    "market_regime",
     "sent_to_signals",
     "sent_to_cornix",
 ]
@@ -67,8 +96,25 @@ class ExternalSignalAnalysis:
     recommendation: str = "FAILED"
     reason: list[str] = field(default_factory=list)
     rr: float = 0.0
+    refine_status: str = "NOT_RUN"
+    refine_score: int = 0
+    scanner_agreement: str = "UNKNOWN"
+    scanner_direction: str = "UNKNOWN"
+    conflict_reason: str = ""
+    refine_details: dict[str, Any] = field(default_factory=dict)
     sent_to_signals: bool = False
     sent_to_cornix: bool = False
+
+
+@dataclass
+class RefineResult:
+    status: str = "FAILED"
+    score: int = 0
+    scanner_agreement: str = "NO"
+    scanner_direction: str = "UNKNOWN"
+    conflict_reason: str = ""
+    reason: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 def env_float(name: str, default: float) -> float:
@@ -83,6 +129,13 @@ def env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def format_price(value: float | None) -> str:
@@ -220,6 +273,179 @@ def calculate_rr(parsed: ParsedExternalSignal) -> float:
     return reward / risk
 
 
+def _latest_float(df: pd.DataFrame, column: str, default: float = 0.0) -> float:
+    if df.empty or column not in df.columns:
+        return default
+    value = pd.to_numeric(pd.Series([df.iloc[-1].get(column)]), errors="coerce").iloc[0]
+    if pd.isna(value):
+        return default
+    return float(value)
+
+
+def _direction_from_context(trend_long: bool, trend_short: bool, entry_long: bool, entry_short: bool) -> str:
+    if trend_long and entry_long:
+        return "LONG"
+    if trend_short and entry_short:
+        return "SHORT"
+    if trend_long and not trend_short:
+        return "LONG_BIAS"
+    if trend_short and not trend_long:
+        return "SHORT_BIAS"
+    return "UNKNOWN"
+
+
+def perform_refine_analysis(parsed: ParsedExternalSignal) -> RefineResult:
+    """Run fresh scanner-style market analysis for an external VIP signal."""
+    try:
+        data_client = MarketDataClient(env_float("REQUEST_DELAY_SECONDS", 0.0))
+        indicators = IndicatorEngine(env_int("MFI_PERIOD", 14))
+        sr_engine = SupportResistanceEngine()
+        regime_detector = MarketRegimeDetector()
+
+        trend_tf = os.getenv("TREND_TIMEFRAME", "1h")
+        entry_tf = os.getenv("ENTRY_TIMEFRAME", "15m")
+        htf_tf = os.getenv("HTF_TIMEFRAME", "4h")
+
+        df_1h = indicators.add_indicators(data_client.fetch_closed_klines(parsed.symbol, trend_tf, 200))
+        df_15m = indicators.add_indicators(data_client.fetch_closed_klines(parsed.symbol, entry_tf, 200))
+        df_htf = indicators.add_indicators(data_client.fetch_closed_klines(parsed.symbol, htf_tf, 200))
+        df_btc = indicators.add_indicators(data_client.fetch_closed_klines("BTCUSDT", trend_tf, 120))
+    except Exception as exc:
+        LOGGER.warning("External refine unavailable for %s: %s", parsed.symbol, exc)
+        return RefineResult(
+            status="FAILED",
+            scanner_agreement="NO",
+            scanner_direction="UNKNOWN",
+            conflict_reason="market_data_unavailable",
+            reason=["❌ Fresh market data unavailable"],
+        )
+
+    if df_1h.empty or df_15m.empty:
+        return RefineResult(
+            status="FAILED",
+            scanner_agreement="NO",
+            scanner_direction="UNKNOWN",
+            conflict_reason="insufficient_candles",
+            reason=["❌ Insufficient candles for refine analysis"],
+        )
+
+    latest_1h = df_1h.iloc[-1]
+    latest_15m = df_15m.iloc[-1]
+    close_1h = float(latest_1h["close"])
+    close_15m = float(latest_15m["close"])
+    ema_fast_1h = float(latest_1h["ema_fast"])
+    ema_slow_1h = float(latest_1h["ema_slow"])
+    ema_fast_15m = float(latest_15m["ema_fast"])
+    atr_pct = _latest_float(df_1h, "atr_pct")
+    mfi = _latest_float(df_1h, "mfi")
+    volume_sma = _latest_float(df_1h, "volume_sma20")
+    latest_volume = _latest_float(df_1h, "volume")
+    volume_ratio = latest_volume / volume_sma if volume_sma > 0 else 0.0
+    volume_spike = volume_ratio >= env_float("VOLUME_SPIKE_MULTIPLIER", 1.2)
+    support, resistance = sr_engine.calculate(df_1h)
+    regime = regime_detector.detect(df_1h)
+    htf_regime = classify_trend(df_htf) if not df_htf.empty else "Unknown"
+    htf_alignment = alignment_for_direction(parsed.side, htf_regime) if htf_regime != "Unknown" else "Unknown"
+    btc_context = detect_btc_regime(df_btc)
+    btc_regime = str(btc_context.get("regime", "unclear"))
+
+    trend_long = close_1h > ema_fast_1h > ema_slow_1h
+    trend_short = close_1h < ema_fast_1h < ema_slow_1h
+    entry_long = close_15m > ema_fast_15m
+    entry_short = close_15m < ema_fast_15m
+    scanner_direction = _direction_from_context(trend_long, trend_short, entry_long, entry_short)
+
+    agreement = (
+        scanner_direction == parsed.side
+        or (parsed.side == "LONG" and scanner_direction == "LONG_BIAS")
+        or (parsed.side == "SHORT" and scanner_direction == "SHORT_BIAS")
+    )
+    score = 0
+    reasons: list[str] = []
+    if agreement:
+        score += 30
+        reasons.append("✅ VIP direction agrees with scanner trend/entry context")
+    else:
+        reasons.append("❌ VIP direction conflicts with scanner trend/entry context")
+    if regime.name == "Trending":
+        score += 15
+        reasons.append("✅ 1H market regime supports trend continuation")
+    elif regime.name == "Sideway":
+        score -= 10
+        reasons.append("❌ 1H market regime is sideway")
+    if htf_alignment == "Aligned":
+        score += 15
+        reasons.append("✅ 4H HTF aligned")
+    elif htf_alignment == "Conflict":
+        score -= 15
+        reasons.append("❌ 4H HTF conflict")
+    if (parsed.side == "LONG" and mfi >= env_float("MFI_BULLISH_THRESHOLD", 55)) or (
+        parsed.side == "SHORT" and mfi <= env_float("MFI_BEARISH_THRESHOLD", 45)
+    ):
+        score += 10
+        reasons.append("✅ MFI confirms direction")
+    else:
+        reasons.append("⚠️ MFI does not strongly confirm direction")
+    if volume_spike:
+        score += 10
+        reasons.append("✅ Volume spike confirms activity")
+    else:
+        reasons.append("⚠️ No volume spike")
+    if atr_pct >= env_float("MIN_ATR_PCT", 0.35):
+        score += 10
+        reasons.append("✅ ATR is tradeable")
+    else:
+        score -= 10
+        reasons.append("❌ ATR is too low")
+    if btc_regime == "sideways":
+        score -= 10
+        reasons.append("⚠️ BTC regime is sideways")
+    elif (btc_regime == "bullish" and parsed.side == "LONG") or (btc_regime == "bearish" and parsed.side == "SHORT"):
+        score += 10
+        reasons.append("✅ BTC regime supports direction")
+    elif btc_regime in {"bullish", "bearish"}:
+        score -= 10
+        reasons.append("❌ BTC regime conflicts with direction")
+
+    conflict_parts = []
+    if not agreement:
+        conflict_parts.append(f"scanner_direction={scanner_direction}")
+    if regime.name == "Sideway":
+        conflict_parts.append("sideway_regime")
+    if htf_alignment == "Conflict":
+        conflict_parts.append("htf_conflict")
+    if atr_pct < env_float("MIN_ATR_PCT", 0.35):
+        conflict_parts.append("low_atr")
+    if btc_regime in {"bullish", "bearish"} and not (
+        (btc_regime == "bullish" and parsed.side == "LONG") or (btc_regime == "bearish" and parsed.side == "SHORT")
+    ):
+        conflict_parts.append(f"btc_{btc_regime}_conflict")
+
+    details = {
+        "trend_1h": "bullish" if trend_long else "bearish" if trend_short else "mixed",
+        "entry_15m": "bullish" if entry_long else "bearish" if entry_short else "mixed",
+        "htf_regime": htf_regime,
+        "htf_alignment": htf_alignment,
+        "mfi": f"{mfi:.2f}",
+        "atr_pct": f"{atr_pct:.2f}",
+        "support": f"{support:.8f}",
+        "resistance": f"{resistance:.8f}",
+        "btc_regime": btc_regime,
+        "volume_ratio": f"{volume_ratio:.2f}",
+        "volume_spike": "YES" if volume_spike else "NO",
+        "market_regime": regime.name,
+    }
+    return RefineResult(
+        status="SUCCESS",
+        score=max(0, min(100, int(score))),
+        scanner_agreement="YES" if agreement else "NO",
+        scanner_direction=scanner_direction,
+        conflict_reason=";".join(conflict_parts),
+        reason=reasons,
+        details=details,
+    )
+
+
 def analyze_external_signal(raw_text: str, message_id: int | str = "", source: str = "VIP Forwarded Signal") -> ExternalSignalAnalysis:
     min_rr = env_float("EXTERNAL_SIGNAL_MIN_RR", 1.2)
     score_threshold = env_int("EXTERNAL_SIGNAL_SCORE_THRESHOLD", 70)
@@ -273,13 +499,34 @@ def analyze_external_signal(raw_text: str, message_id: int | str = "", source: s
     else:
         reasons.append("⚠️ Leverage not specified")
 
-    # Market/regime checks are intentionally conservative for V1. They do not
-    # approve weak parses and they do not trade; they only add context.
-    reasons.append("⚠️ Market/regime checks use external V1 lightweight validation")
+    refine = perform_refine_analysis(parsed) if env_bool("EXTERNAL_SIGNAL_REFINE_ENABLED", True) else RefineResult(
+        status="DISABLED",
+        score=50,
+        scanner_agreement="YES",
+        scanner_direction=parsed.side,
+        reason=["⚠️ External refine disabled by config"],
+    )
+    analysis.refine_status = refine.status
+    analysis.refine_score = refine.score
+    analysis.scanner_agreement = refine.scanner_agreement
+    analysis.scanner_direction = refine.scanner_direction
+    analysis.conflict_reason = refine.conflict_reason
+    analysis.refine_details = refine.details
+    reasons.extend(refine.reason)
+    if refine.status == "SUCCESS":
+        score += int(refine.score * 0.30)
+    else:
+        score -= 20
 
     analysis.analysis_score = max(0, min(100, score))
     if rr < min_rr:
         analysis.recommendation = "SKIP"
+    elif refine.status != "SUCCESS":
+        analysis.recommendation = "WAIT"
+    elif refine.scanner_agreement != "YES":
+        analysis.recommendation = "WAIT"
+    elif refine.conflict_reason:
+        analysis.recommendation = "WAIT"
     elif analysis.analysis_score < score_threshold:
         analysis.recommendation = "WAIT"
     else:
@@ -329,6 +576,10 @@ def build_signals_message(analysis: ExternalSignalAnalysis) -> str:
         f"{tp_lines}\n\n"
         "Score:\n"
         f"{analysis.analysis_score}/100\n\n"
+        "Scanner Agreement:\n"
+        f"{analysis.scanner_agreement}\n\n"
+        "Refine Score:\n"
+        f"{analysis.refine_score}/100\n\n"
         "Reason:\n"
         f"{reason}"
     )
@@ -369,6 +620,10 @@ def build_report_message(analysis: ExternalSignalAnalysis) -> str:
         f"{parsed.symbol or '-'}\n\n"
         "Reason:\n"
         f"{reason}\n\n"
+        "Refine:\n"
+        f"Scanner agreement: {analysis.scanner_agreement}\n"
+        f"Scanner direction: {analysis.scanner_direction}\n"
+        f"Conflict: {analysis.conflict_reason or '-'}\n\n"
         "Action:\n"
         f"{action}"
     )
@@ -412,6 +667,24 @@ def ensure_log(path: Path = EXTERNAL_SIGNALS_CSV) -> None:
                 "analysis_score": row.get("analysis_score", ""),
                 "recommendation": row.get("recommendation", row.get("status", "")),
                 "reason": row.get("reason", ""),
+                "rr": row.get("rr", ""),
+                "refine_status": row.get("refine_status", ""),
+                "refine_score": row.get("refine_score", ""),
+                "scanner_agreement": row.get("scanner_agreement", ""),
+                "scanner_direction": row.get("scanner_direction", ""),
+                "conflict_reason": row.get("conflict_reason", ""),
+                "trend_1h": row.get("trend_1h", ""),
+                "entry_15m": row.get("entry_15m", ""),
+                "htf_regime": row.get("htf_regime", ""),
+                "htf_alignment": row.get("htf_alignment", ""),
+                "mfi": row.get("mfi", ""),
+                "atr_pct": row.get("atr_pct", ""),
+                "support": row.get("support", ""),
+                "resistance": row.get("resistance", ""),
+                "btc_regime": row.get("btc_regime", ""),
+                "volume_ratio": row.get("volume_ratio", ""),
+                "volume_spike": row.get("volume_spike", ""),
+                "market_regime": row.get("market_regime", ""),
                 "sent_to_signals": row.get("sent_to_signals", "NO"),
                 "sent_to_cornix": row.get("sent_to_cornix", "NO"),
             }
@@ -446,6 +719,24 @@ def log_analysis(analysis: ExternalSignalAnalysis, path: Path = EXTERNAL_SIGNALS
         "analysis_score": analysis.analysis_score,
         "recommendation": analysis.recommendation,
         "reason": " | ".join(analysis.reason),
+        "rr": f"{analysis.rr:.4f}",
+        "refine_status": analysis.refine_status,
+        "refine_score": analysis.refine_score,
+        "scanner_agreement": analysis.scanner_agreement,
+        "scanner_direction": analysis.scanner_direction,
+        "conflict_reason": analysis.conflict_reason,
+        "trend_1h": analysis.refine_details.get("trend_1h", ""),
+        "entry_15m": analysis.refine_details.get("entry_15m", ""),
+        "htf_regime": analysis.refine_details.get("htf_regime", ""),
+        "htf_alignment": analysis.refine_details.get("htf_alignment", ""),
+        "mfi": analysis.refine_details.get("mfi", ""),
+        "atr_pct": analysis.refine_details.get("atr_pct", ""),
+        "support": analysis.refine_details.get("support", ""),
+        "resistance": analysis.refine_details.get("resistance", ""),
+        "btc_regime": analysis.refine_details.get("btc_regime", ""),
+        "volume_ratio": analysis.refine_details.get("volume_ratio", ""),
+        "volume_spike": analysis.refine_details.get("volume_spike", ""),
+        "market_regime": analysis.refine_details.get("market_regime", ""),
         "sent_to_signals": "YES" if analysis.sent_to_signals else "NO",
         "sent_to_cornix": "YES" if analysis.sent_to_cornix else "NO",
     }
