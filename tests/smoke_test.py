@@ -20,6 +20,7 @@ import performance_report
 import position_manager
 import review_signals
 import stats_dashboard
+import telegram_external_inbox
 from core.analytics_reporting import build_daily_performance_report, export_journal_csvs, journal_signal_export
 from core.btc_regime_filter import detect_btc_regime
 from core.loss_cooldown import LossCooldownTracker
@@ -85,6 +86,88 @@ def test_telegram_message() -> None:
     assert "Risk Mode: normal" in message
     assert message.count("For educational analysis only. Not financial advice.") == 1
     assert "No auto-trade" not in message
+
+
+def test_cornix_dry_run_format_and_signal_immutability() -> None:
+    cfg = scanner.ScannerConfig.from_env()
+    cfg.dry_run = True
+    cfg.max_leverage = 10
+    signal = sample_signal()
+    original = {
+        "direction": signal.direction,
+        "entry": signal.entry,
+        "tp1": signal.tp1,
+        "tp2": signal.tp2,
+        "sl": signal.sl,
+        "confidence": signal.confidence,
+    }
+    notifier = scanner.TelegramNotifier(cfg)
+    message = notifier.build_cornix_message(signal)
+    assert "🧪 DRY RUN - CORNIX FORMAT TEST" in message
+    assert "DO NOT AUTO TRADE" in message
+    assert "SHORT BTCUSDT" in message
+    assert "Entry:" in message
+    assert "Targets:" in message
+    assert "Stop:" in message
+    assert "Leverage:" in message
+    target_block = message.split("Targets:\n", 1)[1].split("\n\nStop:", 1)[0].splitlines()
+    assert 1 <= len([line for line in target_block if line.strip()]) <= 3
+    assert {
+        "direction": signal.direction,
+        "entry": signal.entry,
+        "tp1": signal.tp1,
+        "tp2": signal.tp2,
+        "sl": signal.sl,
+        "confidence": signal.confidence,
+    } == original
+    assert notifier.send_signal(signal) is True
+
+
+def test_missing_telegram_channel_ids_do_not_crash() -> None:
+    cfg = scanner.ScannerConfig.from_env()
+    cfg.dry_run = False
+    cfg.send_telegram = True
+    cfg.telegram_bot_token = ""
+    cfg.telegram_chat_id = ""
+    cfg.telegram_signals_chat_id = ""
+    cfg.telegram_cornix_chat_id = ""
+    cfg.telegram_reports_chat_id = ""
+    notifier = scanner.TelegramNotifier(cfg)
+    assert notifier.send_signal(sample_signal()) is False
+    assert notifier.send_daily_summary({"day": "2026-05-31"}) is False
+    assert notifier.send_position_message("POSITION REVIEW") is False
+
+
+def test_external_inbox_logging_and_debug_format() -> None:
+    path = Path(tempfile.gettempdir()) / "external_signals_smoke.csv"
+    try:
+        telegram_external_inbox.log_external_message(
+            chat_id="123",
+            message_id=456,
+            raw_text="hello external signal",
+            path=path,
+        )
+        df = pd.read_csv(path)
+        assert list(df.columns) == telegram_external_inbox.FIELDNAMES
+        assert df.loc[0, "status"] == "RECEIVED"
+        assert df.loc[0, "source"] == "External Signal Inbox"
+        report = telegram_external_inbox.build_debug_report("x" * 600)
+        assert "📥 External Signal Received" in report
+        assert "Received Successfully" in report
+        assert len(report.split("Message Preview:\n", 1)[1].split("\n\nStatus:", 1)[0]) == 500
+        update = {
+            "message": {
+                "message_id": 9,
+                "chat": {"id": 123},
+                "text": "test",
+            }
+        }
+        assert telegram_external_inbox.extract_message(update) == ("123", 9, "test")
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _wave_test_candles(kind: str = "bullish") -> pd.DataFrame:
@@ -709,6 +792,9 @@ def test_position_manager_advice() -> None:
 
 def main() -> int:
     test_telegram_message()
+    test_cornix_dry_run_format_and_signal_immutability()
+    test_missing_telegram_channel_ids_do_not_crash()
+    test_external_inbox_logging_and_debug_format()
     test_wave_bullish_higher_high_higher_low()
     test_wave_bearish_lower_high_lower_low()
     test_wave_range_or_unclear_and_score_bounds()

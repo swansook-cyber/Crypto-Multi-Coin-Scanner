@@ -311,7 +311,7 @@ def send_telegram(message: str) -> bool:
         LOGGER.info("Daily summary Telegram skipped: SEND_DAILY_SUMMARY is off")
         return False
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    chat_id = os.getenv("TELEGRAM_REPORTS_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
     if not token or not chat_id:
         LOGGER.warning("Daily summary Telegram skipped: token/chat id missing")
         return False

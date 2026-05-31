@@ -186,6 +186,10 @@ class ScannerConfig:
     gemini_model: str
     telegram_bot_token: str
     telegram_chat_id: str
+    telegram_signals_chat_id: str
+    telegram_cornix_chat_id: str
+    telegram_reports_chat_id: str
+    telegram_external_inbox_chat_id: str
 
     @classmethod
     def from_env(cls) -> "ScannerConfig":
@@ -295,6 +299,10 @@ class ScannerConfig:
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip(),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            telegram_signals_chat_id=os.getenv("TELEGRAM_SIGNALS_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip(),
+            telegram_cornix_chat_id=os.getenv("TELEGRAM_CORNIX_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip(),
+            telegram_reports_chat_id=os.getenv("TELEGRAM_REPORTS_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip(),
+            telegram_external_inbox_chat_id=os.getenv("TELEGRAM_EXTERNAL_INBOX_CHAT_ID", "").strip(),
         )
 
 
@@ -1302,6 +1310,15 @@ class TelegramNotifier:
         self.config = config
         self.session = build_retry_session()
 
+    def _channel_chat_id(self, channel: str) -> str:
+        fallback = self.config.telegram_chat_id
+        mapping = {
+            "signals": self.config.telegram_signals_chat_id or fallback,
+            "cornix": self.config.telegram_cornix_chat_id or fallback,
+            "reports": self.config.telegram_reports_chat_id or fallback,
+        }
+        return mapping.get(channel, fallback).strip()
+
     def build_message(self, signal: TradeSignal) -> str:
         signal_emoji = "🚀" if signal.direction == "LONG" else "🔻"
         volume_text = "YES" if signal.volume_spike else "NO"
@@ -1351,6 +1368,24 @@ class TelegramNotifier:
             f"TradingView: {signal.tradingview_symbol}"
         )
 
+    def build_cornix_message(self, signal: TradeSignal) -> str:
+        entry_low = min(signal.entry, signal.entry * 0.995)
+        entry_high = max(signal.entry, signal.entry * 1.005)
+        return (
+            "🧪 DRY RUN - CORNIX FORMAT TEST\n"
+            "DO NOT AUTO TRADE\n\n"
+            f"{signal.direction} {SymbolFormatter.to_binance_symbol(signal.symbol)}\n\n"
+            "Entry:\n"
+            f"{format_price(entry_low)}-{format_price(entry_high)}\n\n"
+            "Targets:\n"
+            f"{format_price(signal.tp1)}\n"
+            f"{format_price(signal.tp2)}\n\n"
+            "Stop:\n"
+            f"{format_price(signal.sl)}\n\n"
+            "Leverage:\n"
+            f"{self.config.max_leverage}x"
+        )
+
     def build_daily_summary_message(self, summary: dict[str, Any]) -> str:
         return (
             f"📅 Daily Signal Summary UTC\n"
@@ -1385,19 +1420,32 @@ class TelegramNotifier:
         message = self.build_message(signal)
         if self.config.dry_run:
             LOGGER.info("DRY_RUN Telegram signal for %s:\n%s", signal.symbol, message)
+            LOGGER.info("DRY_RUN Cornix message for %s:\n%s", signal.symbol, self.build_cornix_message(signal))
             if signal.chart_path:
                 LOGGER.info("DRY_RUN chart path: %s", signal.chart_path)
             return True
         if not self.config.send_telegram:
             LOGGER.info("SEND_TELEGRAM=0, skipped Telegram for %s", signal.symbol)
             return True
-        if not self.config.telegram_bot_token or not self.config.telegram_chat_id:
+        if not self.config.telegram_bot_token:
             LOGGER.warning("Telegram credentials are missing; skipped %s", signal.symbol)
             return False
 
-        if signal.chart_path and signal.chart_path.exists():
-            return self._send_photo(signal.chart_path, message)
-        return self._send_message(message)
+        delivered = False
+        signals_chat_id = self._channel_chat_id("signals")
+        if not signals_chat_id:
+            LOGGER.warning("Telegram signals chat id missing; skipped full signal for %s", signal.symbol)
+        elif signal.chart_path and signal.chart_path.exists():
+            delivered = self._send_photo(signal.chart_path, message, signals_chat_id, "signals") or delivered
+        else:
+            delivered = self._send_message(message, signals_chat_id, "signals") or delivered
+
+        cornix_chat_id = self._channel_chat_id("cornix")
+        if not cornix_chat_id:
+            LOGGER.info("Telegram Cornix chat id missing; skipped Cornix dry-run for %s", signal.symbol)
+        else:
+            delivered = self._send_message(self.build_cornix_message(signal), cornix_chat_id, "cornix") or delivered
+        return delivered
 
     def send_daily_summary(self, summary: dict[str, Any]) -> bool:
         message = self.build_daily_summary_message(summary)
@@ -1406,7 +1454,7 @@ class TelegramNotifier:
             return True
         if not self.config.send_telegram or not self.config.send_daily_summary:
             return True
-        return self._send_message(message)
+        return self._send_message(message, self._channel_chat_id("reports"), "reports")
 
     def send_position_message(self, message: str) -> bool:
         if self.config.dry_run:
@@ -1415,28 +1463,48 @@ class TelegramNotifier:
         if not self.config.send_telegram:
             LOGGER.info("SEND_TELEGRAM=0, skipped position management message")
             return True
-        if not self.config.telegram_bot_token or not self.config.telegram_chat_id:
+        if not self.config.telegram_bot_token:
             LOGGER.warning("Telegram credentials are missing; skipped position management message")
             return False
-        return self._send_message(message)
+        return self._send_message(message, self._channel_chat_id("reports"), "reports")
 
-    def _send_message(self, message: str) -> bool:
+    def _send_message(self, message: str, chat_id: str, channel_name: str = "telegram") -> bool:
+        if not self.config.telegram_bot_token:
+            LOGGER.warning("Telegram %s bot token missing; skipped message", channel_name)
+            return False
+        if not chat_id:
+            LOGGER.warning("Telegram %s chat id missing; skipped message", channel_name)
+            return False
         url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
-        payload = {"chat_id": self.config.telegram_chat_id, "text": message}
-        response = self.session.post(url, data=payload, timeout=20)
+        payload = {"chat_id": chat_id, "text": message}
+        try:
+            response = self.session.post(url, data=payload, timeout=20)
+        except requests.RequestException as exc:
+            LOGGER.error("Telegram %s message failed: %s", channel_name, exc)
+            return False
         if response.status_code != 200:
-            LOGGER.error("Telegram message failed: %s", response.text)
+            LOGGER.error("Telegram %s message failed: %s", channel_name, response.text)
             return False
         return True
 
-    def _send_photo(self, chart_path: Path, caption: str) -> bool:
+    def _send_photo(self, chart_path: Path, caption: str, chat_id: str, channel_name: str = "telegram") -> bool:
+        if not self.config.telegram_bot_token:
+            LOGGER.warning("Telegram %s bot token missing; skipped photo", channel_name)
+            return False
+        if not chat_id:
+            LOGGER.warning("Telegram %s chat id missing; skipped photo", channel_name)
+            return False
         url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendPhoto"
-        with chart_path.open("rb") as image:
-            files = {"photo": image}
-            data = {"chat_id": self.config.telegram_chat_id, "caption": caption[:1024]}
-            response = self.session.post(url, data=data, files=files, timeout=30)
+        try:
+            with chart_path.open("rb") as image:
+                files = {"photo": image}
+                data = {"chat_id": chat_id, "caption": caption[:1024]}
+                response = self.session.post(url, data=data, files=files, timeout=30)
+        except (OSError, requests.RequestException) as exc:
+            LOGGER.error("Telegram %s photo failed: %s", channel_name, exc)
+            return False
         if response.status_code != 200:
-            LOGGER.error("Telegram photo failed: %s", response.text)
+            LOGGER.error("Telegram %s photo failed: %s", channel_name, response.text)
             return False
         return True
 

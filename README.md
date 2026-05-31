@@ -67,8 +67,29 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 
 ```env
 TELEGRAM_CHAT_ID=your_chat_id_here
+TELEGRAM_SIGNALS_CHAT_ID=
+TELEGRAM_CORNIX_CHAT_ID=
+TELEGRAM_REPORTS_CHAT_ID=
+TELEGRAM_EXTERNAL_INBOX_CHAT_ID=
 SEND_TELEGRAM=1
 ```
+
+Optional multi-channel routing:
+
+- `TELEGRAM_SIGNALS_CHAT_ID`: full scanner signal and chart
+- `TELEGRAM_CORNIX_CHAT_ID`: Cornix-format dry-run signal text
+- `TELEGRAM_REPORTS_CHAT_ID`: daily summaries, reports, and position advisor messages
+- `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`: external message intake for logging/debug only
+
+If a new channel ID is empty, the scanner falls back to `TELEGRAM_CHAT_ID` where appropriate. External inbox messages are never forwarded to Cornix and never affect scanner signals.
+
+To poll the external inbox once:
+
+```bat
+python telegram_external_inbox.py
+```
+
+Received external messages are stored in `logs/external_signals.csv` and a debug notification is sent to the reports channel.
 
 For testing without sending alerts:
 
