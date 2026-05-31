@@ -1328,6 +1328,32 @@ def test_dashboard_renders_html() -> None:
             pass
 
 
+def test_dashboard_v2_handles_missing_and_empty_data() -> None:
+    missing = Path(tempfile.gettempdir()) / "missing_dashboard_signals.csv"
+    data = dashboard.load_dashboard_data({"signals": missing})
+    assert "signals" in data
+    assert "sent" in data
+    assert data["sent"].empty
+
+    kpis = dashboard.dashboard_kpis(pd.DataFrame())
+    assert kpis["Total sent signals"] == 0
+    assert kpis["Closed trades"] == 0
+    assert kpis["Win rate"] == 0.0
+    assert kpis["Best symbol"] == "-"
+
+    filtered = dashboard.apply_filters(
+        data["sent"],
+        results=["WIN"],
+        targets=["TP1"],
+        score_range=(80, 100),
+        confidence_range=(80, 100),
+    )
+    assert filtered.empty
+    assert dashboard.equity_curve(pd.DataFrame()).empty
+    assert dashboard.daily_net_r(pd.DataFrame()).empty
+    assert dashboard.analytics_suggestions(pd.DataFrame())
+
+
 def test_position_manager_advice() -> None:
     now = pd.Timestamp("2026-05-30T12:00:00Z")
     path = Path(tempfile.gettempdir()) / "position_manager_smoke.csv"
@@ -1415,6 +1441,7 @@ def main() -> int:
     test_complete_performance_analytics_v1_outputs()
     test_performance_analytics_production_mapping()
     test_dashboard_renders_html()
+    test_dashboard_v2_handles_missing_and_empty_data()
     test_position_manager_advice()
     print("smoke tests passed")
     return 0

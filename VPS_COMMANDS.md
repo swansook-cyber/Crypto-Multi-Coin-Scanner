@@ -210,14 +210,14 @@ cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python performance_report.py --send
 ```
 
-Dashboard V1:
+Dashboard V2:
 
 ```bash
 cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/streamlit run dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
 
-Dashboard V1 is read-only. It reads CSV logs from `logs/` and does not send Telegram, call Binance, place trades, or modify logs.
+Dashboard V2 is read-only. It reads CSV logs from `logs/` and does not send Telegram, call Binance, place trades, modify logs, or change strategy settings.
 
 Position Management Advisor:
 

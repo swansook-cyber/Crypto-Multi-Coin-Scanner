@@ -3,7 +3,7 @@
 ## Current Roadmap Priorities
 
 1. Daily Performance Report
-2. Dashboard V1
+2. Dashboard V2
 3. Position Management Advisor
 4. Position Exit Advisor
 5. Advanced TP Engine
@@ -12,7 +12,7 @@
 
 - Daily Performance Report is implemented through `performance_report.py`
 - Complete Performance Analytics V1 is implemented for scanner, external, and position-management logs
-- Dashboard V1 is implemented as a read-only Streamlit app through `dashboard.py`
+- Dashboard V2 is implemented as a read-only Streamlit analytics app through `dashboard.py`
 - Position Management Advisor is implemented through `position_manager.py` and scanner Telegram advisory routing
 - External Signal Analyzer V1 is implemented as approved-only routing for forwarded VIP signals
 - Telegram Channel Routing V1 is implemented so Signals, Cornix, and Reports have separate responsibilities
@@ -40,7 +40,7 @@ Performance Analytics V1 exports:
 - Strategy optimization using collected results
 - Confidence/setup strength calibration
 - Performance analytics by symbol, tier, session, BTC regime, market regime, source, and direction
-- Dashboard V1 usability improvements and optional deployment hardening
+- Dashboard V2 deployment hardening and calibration workflows
 
 ## Long Term
 
