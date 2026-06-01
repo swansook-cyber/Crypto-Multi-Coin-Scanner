@@ -25,6 +25,7 @@ import telegram_external_inbox
 from core.analytics_reporting import build_daily_performance_report, export_journal_csvs, journal_signal_export
 from core.btc_regime_filter import detect_btc_regime
 from core.loss_cooldown import LossCooldownTracker
+from core.performance_analytics_v1 import build_complete_report, export_v1_outputs
 from core import wave_structure_analyzer as wave
 
 
@@ -835,6 +836,160 @@ def test_daily_performance_report_metrics() -> None:
     assert "Short win rate:" in message
 
 
+def test_complete_performance_analytics_v1_outputs() -> None:
+    journal = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-05-30T00:00:00+00:00",
+                "closed_at": "2026-05-30T02:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "watchlist_tier": "A",
+                "market_session": "London",
+                "market_regime": "Trending",
+                "btc_regime": "bullish",
+                "entry": 100,
+                "tp1": 102,
+                "tp2": 104,
+                "tp3": 106,
+                "stop_loss": 98,
+                "risk_reward": 2.0,
+                "result": "WIN",
+                "hit_target": "TP3",
+                "pnl_percent": 6.0,
+                "max_profit_pct": 6.2,
+                "max_drawdown_pct": -0.5,
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "2026-05-30T01:00:00+00:00",
+                "closed_at": "2026-05-30T01:40:00+00:00",
+                "symbol": "ETHUSDT",
+                "side": "SHORT",
+                "watchlist_tier": "B",
+                "market_session": "NewYork",
+                "market_regime": "Sideway",
+                "btc_regime": "bearish",
+                "entry": 100,
+                "tp1": 98,
+                "tp2": 96,
+                "stop_loss": 102,
+                "risk_reward": 2.0,
+                "result": "LOSS",
+                "hit_target": "SL",
+                "pnl_percent": -2.0,
+                "max_profit_pct": 0.3,
+                "max_drawdown_pct": -2.1,
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "2026-05-30T02:00:00+00:00",
+                "symbol": "SOLUSDT",
+                "side": "LONG",
+                "watchlist_tier": "C",
+                "market_session": "Asia",
+                "entry": 100,
+                "tp1": 101,
+                "tp2": 102,
+                "stop_loss": 99,
+                "risk_reward": 2.0,
+                "result": "OPEN",
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "2026-05-30T03:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "entry": 101,
+                "result": "SKIPPED",
+                "signal_status": "skipped_position_management",
+                "skip_reason": "same_symbol_same_direction_open",
+            },
+            {
+                "timestamp": "2026-05-30T04:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "SHORT",
+                "entry": 101,
+                "result": "SKIPPED",
+                "signal_status": "skipped_position_management",
+                "skip_reason": "same_symbol_opposite_direction_open",
+            },
+            {
+                "timestamp": "2026-05-30T05:00:00+00:00",
+                "symbol": "ETHUSDT",
+                "side": "SHORT",
+                "entry": 99,
+                "result": "SKIPPED",
+                "signal_status": "skipped_position_management",
+                "skip_reason": "position_review_open_over_6h exit_review",
+            },
+        ]
+    )
+    external = pd.DataFrame(
+        [
+            {
+                "timestamp_utc": "2026-05-30T06:00:00+00:00",
+                "symbol": "NEARUSDT",
+                "side": "LONG",
+                "entry_low": 2.2,
+                "entry_high": 2.3,
+                "stop_loss": 2.1,
+                "tp1": 2.5,
+                "tp2": 2.7,
+                "tp3": 3.0,
+                "analysis_score": 86,
+                "recommendation": "APPROVED",
+                "sent_to_signals": "YES",
+                "sent_to_cornix": "YES",
+                "parse_status": "SUCCESS",
+            },
+            {
+                "timestamp_utc": "2026-05-30T07:00:00+00:00",
+                "symbol": "XRPUSDT",
+                "recommendation": "FAILED",
+                "sent_to_signals": "NO",
+                "sent_to_cornix": "NO",
+                "parse_status": "FAILED",
+            },
+        ]
+    )
+    report, tables = build_complete_report(journal, pd.DataFrame(), external, "2026-05-30")
+    assert report["total_sent_signals"] == 3
+    assert report["wins"] == 1
+    assert report["losses"] == 1
+    assert report["tp3_hits"] == 1
+    assert report["sl_hits"] == 1
+    assert report["hold_count"] == 1
+    assert report["opposite_signal_count"] == 1
+    assert report["exit_recommendation_count"] == 1
+    assert report["stale_position_count"] == 1
+    assert report["external_total"] == 2
+    assert report["external_approved"] == 1
+    assert report["external_rejected"] == 1
+    assert not tables["symbol_performance"].empty
+    assert not tables["source_performance"].empty
+
+    export_dir = Path(tempfile.gettempdir()) / "crypto_perf_v1_smoke"
+    try:
+        paths = export_v1_outputs(report, tables, export_dir)
+        for path in paths.values():
+            assert path.exists()
+        daily = pd.read_csv(paths["daily_performance"])
+        assert daily.loc[0, "tp3_hits"] == 1
+        position = pd.read_csv(paths["position_management"])
+        assert position.loc[0, "hold_count"] == 1
+    finally:
+        for path in export_dir.glob("*.csv"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            export_dir.rmdir()
+        except OSError:
+            pass
+
+
 def test_dashboard_renders_html() -> None:
     df = performance_report.normalize(
         pd.DataFrame(
@@ -950,6 +1105,7 @@ def main() -> int:
     test_daily_summary_and_missing_telegram_env()
     test_analytics_report_and_journal_exports()
     test_daily_performance_report_metrics()
+    test_complete_performance_analytics_v1_outputs()
     test_dashboard_renders_html()
     test_position_manager_advice()
     print("smoke tests passed")

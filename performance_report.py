@@ -13,10 +13,20 @@ import requests
 from dotenv import load_dotenv
 
 from core.analytics_reporting import load_csv_safely
+from core.performance_analytics_v1 import (
+    NA,
+    build_complete_report,
+    export_v1_outputs,
+    format_minutes,
+    format_value,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
+HISTORY = BASE_DIR / "logs" / "signals_history.csv"
+EXTERNAL = BASE_DIR / "logs" / "external_signals.csv"
+LOGS_DIR = BASE_DIR / "logs"
 REPORTS_DIR = BASE_DIR / "reports"
 SMALL_SAMPLE_CLOSED_TRADES = 30
 
@@ -127,47 +137,30 @@ def direction_win_rate(df: pd.DataFrame, side: str) -> float:
 
 
 def build_report(df: pd.DataFrame, date: str | None = None) -> dict[str, Any]:
-    sent = sent_signals(df)
-    if date is None:
-        valid_dates = sent["timestamp"].dropna()
-        date = valid_dates.max().strftime("%Y-%m-%d") if not valid_dates.empty else pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
-    day = sent[sent["timestamp"].dt.strftime("%Y-%m-%d") == date].copy() if not sent.empty else sent
-    closed = day[day["result"].isin(["WIN", "LOSS"])].copy()
-    wins = closed[closed["result"] == "WIN"].copy()
-    losses = closed[closed["result"] == "LOSS"].copy()
-    open_signals = day[day["result"] == "OPEN"].copy()
-    r_values = closed.apply(estimate_r, axis=1) if not closed.empty else pd.Series(dtype=float)
-    win_pnl = wins.apply(pnl_percent, axis=1) if not wins.empty else pd.Series(dtype=float)
-    loss_pnl = losses.apply(pnl_percent, axis=1) if not losses.empty else pd.Series(dtype=float)
+    report, _tables = build_complete_report(df, pd.DataFrame(), pd.DataFrame(), date)
+    # Backward-compatible aliases used by older dashboard/tests.
+    report["avg_win_pct"] = report.get("avg_profit_pct") or 0.0
+    report["avg_loss_pct"] = report.get("avg_loss_pct") or 0.0
+    report["win_rate"] = report.get("win_rate") or 0.0
+    report["long_win_rate"] = report.get("long_win_rate") or 0.0
+    report["short_win_rate"] = report.get("short_win_rate") or 0.0
+    return report
 
-    return {
-        "date": date,
-        "total_sent_signals": int(len(day)),
-        "closed_signals": int(len(closed)),
-        "open_signals": int(len(open_signals)),
-        "wins": int(len(wins)),
-        "losses": int(len(losses)),
-        "win_rate": float(len(wins) / len(closed) * 100) if len(closed) else 0.0,
-        "tp1_hits": int(((wins["hit_target"] == "TP1") | (wins["hit_target"] == "")).sum()) if not wins.empty else 0,
-        "tp2_hits": int((wins["hit_target"] == "TP2").sum()) if not wins.empty else 0,
-        "sl_hits": int((losses["hit_target"].isin(["SL", ""])).sum()) if not losses.empty else 0,
-        "net_r_estimate": float(r_values.sum()) if not r_values.empty else 0.0,
-        "avg_win_pct": float(win_pnl.mean()) if not win_pnl.empty else 0.0,
-        "avg_loss_pct": float(loss_pnl.mean()) if not loss_pnl.empty else 0.0,
-        "best_symbol": win_rate_by(day, "symbol", best=True),
-        "worst_symbol": win_rate_by(day, "symbol", best=False),
-        "best_tier": win_rate_by(day, "watchlist_tier", best=True),
-        "worst_tier": win_rate_by(day, "watchlist_tier", best=False),
-        "best_session": win_rate_by(day, "market_session", best=True),
-        "worst_session": win_rate_by(day, "market_session", best=False),
-        "long_win_rate": direction_win_rate(day, "LONG"),
-        "short_win_rate": direction_win_rate(day, "SHORT"),
-        "small_sample_warning": len(closed) < SMALL_SAMPLE_CLOSED_TRADES,
-    }
+
+def build_full_report(
+    journal: pd.DataFrame,
+    history: pd.DataFrame,
+    external: pd.DataFrame,
+    date: str | None = None,
+) -> tuple[dict[str, Any], dict[str, pd.DataFrame]]:
+    return build_complete_report(journal, history, external, date)
 
 
 def format_report(report: dict[str, Any]) -> str:
     warning = "\n\nSample size is still small. Use for monitoring only." if report.get("small_sample_warning") else ""
+    win_rate = format_value(report.get("win_rate"), "%")
+    long_rate = format_value(report.get("long_win_rate"), "%")
+    short_rate = format_value(report.get("short_win_rate"), "%")
     return (
         "Daily Performance Report\n"
         f"Date: {report['date']}\n\n"
@@ -176,21 +169,36 @@ def format_report(report: dict[str, Any]) -> str:
         f"Open signals: {report['open_signals']}\n"
         f"Wins: {report['wins']}\n"
         f"Losses: {report['losses']}\n"
-        f"Win rate: {report['win_rate']:.1f}%\n"
+        f"Win rate: {win_rate}\n"
         f"TP1 hits: {report['tp1_hits']}\n"
         f"TP2 hits: {report['tp2_hits']}\n"
+        f"TP3 hits: {report.get('tp3_hits', 0) if report.get('tp3_hits', 0) else NA}\n"
         f"SL hits: {report['sl_hits']}\n"
         f"Net R estimate: {report['net_r_estimate']:.2f}R\n"
-        f"Avg win: {report['avg_win_pct']:.2f}%\n"
-        f"Avg loss: {report['avg_loss_pct']:.2f}%\n\n"
+        f"Avg Profit %: {format_value(report.get('avg_profit_pct'), '%', 2)}\n"
+        f"Avg Loss %: {format_value(report.get('avg_loss_pct'), '%', 2)}\n"
+        f"Avg Drawdown %: {format_value(report.get('avg_drawdown_pct'), '%', 2)}\n"
+        f"Avg Max Profit %: {format_value(report.get('avg_max_profit_pct'), '%', 2)}\n"
+        f"Avg Time to TP: {format_minutes(report.get('avg_time_to_tp'))}\n"
+        f"Avg Time to SL: {format_minutes(report.get('avg_time_to_sl'))}\n\n"
         f"Best symbol: {report['best_symbol']}\n"
         f"Worst symbol: {report['worst_symbol']}\n"
         f"Best tier: {report['best_tier']}\n"
         f"Worst tier: {report['worst_tier']}\n"
         f"Best session: {report['best_session']}\n"
         f"Worst session: {report['worst_session']}\n"
-        f"Long win rate: {report['long_win_rate']:.1f}%\n"
-        f"Short win rate: {report['short_win_rate']:.1f}%"
+        f"Long win rate: {long_rate}\n"
+        f"Short win rate: {short_rate}\n\n"
+        "Scanner vs External:\n"
+        f"Scanner win rate: {format_value(report.get('scanner_win_rate'), '%')}\n"
+        f"External signals reviewed: {report.get('external_total', 0)}\n"
+        f"External approved: {report.get('external_approved', 0)}\n"
+        f"External rejected: {report.get('external_rejected', 0)}\n\n"
+        "Position Manager Outcomes:\n"
+        f"HOLD count: {report.get('hold_count', 0)}\n"
+        f"OPPOSITE signal count: {report.get('opposite_signal_count', 0)}\n"
+        f"EXIT recommendation count: {report.get('exit_recommendation_count', 0)}\n"
+        f"Stale position count: {report.get('stale_position_count', 0)}"
         f"{warning}"
     )
 
@@ -210,9 +218,9 @@ def persist_report(report: dict[str, Any], path: Path | None = None) -> Path:
 
 def send_telegram(message: str) -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_REPORTS_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+    chat_id = os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip()
     if not token or not chat_id:
-        print("Telegram skipped: token/chat id missing")
+        print("Telegram skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_REPORTS_CHAT_ID missing")
         return False
     response = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
@@ -230,14 +238,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--date", help="UTC date YYYY-MM-DD. Defaults to latest signal date.")
     parser.add_argument("--send", action="store_true", help="Send the report to Telegram.")
     parser.add_argument("--journal", type=Path, default=JOURNAL, help="Path to signals.csv.")
+    parser.add_argument("--history", type=Path, default=HISTORY, help="Path to signals_history.csv.")
+    parser.add_argument("--external", type=Path, default=EXTERNAL, help="Path to external_signals.csv.")
     return parser.parse_args()
 
 
 def main() -> int:
     load_dotenv(BASE_DIR / ".env")
     args = parse_args()
-    df = load_csv_safely(args.journal)
-    report = build_report(df, args.date)
+    journal = load_csv_safely(args.journal)
+    history = load_csv_safely(args.history)
+    external = load_csv_safely(args.external)
+    report, tables = build_full_report(journal, history, external, args.date)
+    export_v1_outputs(report, tables, LOGS_DIR)
     persist_report(report)
     message = format_report(report)
     print(message)

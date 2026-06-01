@@ -38,6 +38,7 @@ Main runtime components:
 - `review_signals.py`: outcome checker and TP/SL alerts
 - `daily_summary.py`: daily summary
 - `performance_report.py`: closed-outcome performance report
+- `core/performance_analytics_v1.py`: complete analytics aggregation and dashboard-ready CSV exports
 - `dashboard.py`: local HTML Dashboard V1
 - `position_manager.py`: duplicate/opposite/stale position advisor
 - `external_signal_analyzer.py`: approved-only parser/analyzer/router for forwarded VIP signals
@@ -92,6 +93,25 @@ Environment variables:
 External inbox messages must not affect scanner-generated decisions.
 
 Only APPROVED external signals may be routed to Signals and Cornix. WAIT, SKIP, RISKY, and FAILED external signals are log/report only.
+
+Performance reports must be sent to the Reports channel only. They must never route to Signals or Cornix.
+
+## Current Analytics Layer
+
+Performance Analytics V1 reads:
+
+- `logs/signals.csv`
+- `logs/signals_history.csv`
+- `logs/external_signals.csv`
+
+It exports:
+
+- `logs/daily_performance.csv`
+- `logs/symbol_performance.csv`
+- `logs/source_performance.csv`
+- `logs/position_management.csv`
+
+It tracks scanner vs external signal performance, Tier A/B/C performance, session performance, BTC and market regime performance, long/short performance, TP/SL hit stats, and Position Management Advisor outcomes.
 
 ## Product Principles
 

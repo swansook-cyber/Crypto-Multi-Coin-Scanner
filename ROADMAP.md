@@ -11,10 +11,18 @@
 ## Current / Active
 
 - Daily Performance Report is implemented through `performance_report.py`
+- Complete Performance Analytics V1 is implemented for scanner, external, and position-management logs
 - Dashboard V1 is implemented as local HTML through `dashboard.py`
 - Position Management Advisor is implemented through `position_manager.py` and scanner Telegram advisory routing
 - External Signal Analyzer V1 is implemented as approved-only routing for forwarded VIP signals
-- Production monitoring now focuses on whether these tools produce useful operational decisions
+- Production monitoring now focuses on collecting enough clean outcomes for calibration decisions
+
+Performance Analytics V1 exports:
+
+- `logs/daily_performance.csv`
+- `logs/symbol_performance.csv`
+- `logs/source_performance.csv`
+- `logs/position_management.csv`
 
 ## Next
 
@@ -30,7 +38,7 @@
 
 - Strategy optimization using collected results
 - Confidence/setup strength calibration
-- Performance analytics by symbol, tier, session, BTC regime, wave score, and direction
+- Performance analytics by symbol, tier, session, BTC regime, market regime, source, and direction
 - Dashboard V1 usability improvements
 
 ## Long Term

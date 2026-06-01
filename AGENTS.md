@@ -23,6 +23,7 @@
 - `review_signals.py` checks outcomes and sends TP/SL alerts
 - `daily_summary.py` sends daily summaries
 - `performance_report.py` creates true closed-outcome performance reporting
+- `core/performance_analytics_v1.py` aggregates scanner, external, and position-management analytics
 - `dashboard.py` creates local HTML Dashboard V1
 - `position_manager.py` prevents duplicate/opposite/stale position confusion
 - `external_signal_analyzer.py` parses and reviews forwarded external/VIP signals
@@ -40,6 +41,19 @@ Do not forward External Inbox messages into scanner-generated signals.
 Only APPROVED external analyzer results may be sent to Signals or Cornix. WAIT, SKIP, RISKY, and FAILED results are reports/logs only.
 
 Cornix output is dry-run format unless the user explicitly changes production mode.
+
+Daily Performance Report output belongs in `TELEGRAM_REPORTS_CHAT_ID` only.
+
+## Analytics Outputs
+
+Performance Analytics V1 should keep these dashboard-ready CSVs current when `performance_report.py` runs:
+
+- `logs/daily_performance.csv`
+- `logs/symbol_performance.csv`
+- `logs/source_performance.csv`
+- `logs/position_management.csv`
+
+Missing data must display as `N/A` or empty tables. Analytics work must not modify scanner strategy, filters, TP/SL, RR, watchlists, or external-signal approval routing.
 
 ## VPS Workflow
 

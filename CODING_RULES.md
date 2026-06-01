@@ -10,6 +10,7 @@
 - Preserve the review/outcome engine
 - Preserve manual execution only
 - Never add auto trading
+- Analytics changes must not alter scanner strategy, filters, scoring, RR, TP/SL, or watchlists
 
 ## Development Style
 
@@ -44,6 +45,7 @@
 - Signals channel receives full signal and chart
 - Cornix channel receives Cornix-format dry-run text
 - Reports channel receives daily summaries, reports, and position advisories
+- Daily Performance Report sends to `TELEGRAM_REPORTS_CHAT_ID` only
 - External Inbox messages must not affect scanner-generated decisions
 - Only APPROVED external signals may be sent to Signals or Cornix
 - WAIT / SKIP / RISKY / FAILED external signals are logs/reports only
@@ -55,6 +57,7 @@ Before commit, run:
 ```bash
 python -m compileall -q .
 python tests/smoke_test.py
+python performance_report.py
 ```
 
 When scanner behavior changes, also verify startup with safe settings:
