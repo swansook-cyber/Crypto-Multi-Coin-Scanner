@@ -56,6 +56,9 @@ Performance reports are routed to `TELEGRAM_REPORTS_CHAT_ID` only. They do not f
 ## Performance Analytics V1
 
 - Reads scanner outcomes from `logs/signals.csv` and `logs/signals_history.csv`
+- Uses production `logs/signals.csv` as the primary analytics source; `logs/signals_history.csv` is a fallback when the journal is unavailable
+- Counts sent trades only when `signal_status=sent`
+- Counts closed trades only when `result` is `WIN` or `LOSS`; `SKIPPED` rows are excluded from sent/closed performance
 - Reads approved/rejected external signal records from `logs/external_signals.csv`
 - Counts position-management events logged by the scanner
 - Shows missing metrics as `N/A` instead of crashing

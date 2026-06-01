@@ -824,7 +824,7 @@ def test_daily_performance_report_metrics() -> None:
     assert report["wins"] == 2
     assert report["losses"] == 1
     assert round(report["win_rate"], 1) == 66.7
-    assert report["tp1_hits"] == 1
+    assert report["tp1_hits"] == 2
     assert report["tp2_hits"] == 1
     assert report["sl_hits"] == 1
     assert report["net_r_estimate"] == 2.2
@@ -990,6 +990,75 @@ def test_complete_performance_analytics_v1_outputs() -> None:
             pass
 
 
+def test_performance_analytics_production_mapping() -> None:
+    journal = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-05-31T00:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "watchlist_tier": "A",
+                "market_session": "London",
+                "signal_status": "sent",
+                "result": "WIN",
+                "hit_target": "TP2",
+                "max_profit_pct": "2.5",
+                "max_drawdown_pct": "-0.4",
+            },
+            {
+                "timestamp": "2026-05-31T01:00:00+00:00",
+                "symbol": "ETHUSDT",
+                "side": "SHORT",
+                "watchlist_tier": "B",
+                "market_session": "NewYork",
+                "signal_status": "sent",
+                "result": "LOSS",
+                "hit_target": "SL",
+                "max_profit_pct": "",
+                "max_drawdown_pct": "-1.2",
+            },
+            {
+                "timestamp": "2026-05-31T02:00:00+00:00",
+                "symbol": "SOLUSDT",
+                "side": "LONG",
+                "watchlist_tier": "C",
+                "market_session": "Asia",
+                "signal_status": "logged_quality_filter",
+                "result": "SKIPPED",
+                "hit_target": "",
+            },
+            {
+                "timestamp": "2026-05-31T03:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "watchlist_tier": "A",
+                "market_session": "London",
+                "signal_status": "skipped_btc_regime",
+                "result": "SKIPPED",
+                "hit_target": "3",
+            },
+        ]
+    )
+    report, tables = build_complete_report(journal, pd.DataFrame(), pd.DataFrame())
+    assert report["date"] == "ALL"
+    assert report["total_sent_signals"] == 2
+    assert report["closed_signals"] == 2
+    assert report["wins"] == 1
+    assert report["losses"] == 1
+    assert round(report["win_rate"], 1) == 50.0
+    assert report["tp1_hits"] == 1
+    assert report["tp2_hits"] == 1
+    assert report["tp3_hits"] == 0
+    assert report["sl_hits"] == 1
+    assert "BTCUSDT" in report["best_symbol"]
+    assert "ETHUSDT" in report["worst_symbol"]
+    assert round(report["long_win_rate"], 1) == 100.0
+    assert round(report["short_win_rate"], 1) == 0.0
+    symbol_table = tables["symbol_performance"]
+    assert int(symbol_table["total_signals"].sum()) == 2
+    assert "SOLUSDT" not in symbol_table["symbol"].astype(str).tolist()
+
+
 def test_dashboard_renders_html() -> None:
     df = performance_report.normalize(
         pd.DataFrame(
@@ -1106,6 +1175,7 @@ def main() -> int:
     test_analytics_report_and_journal_exports()
     test_daily_performance_report_metrics()
     test_complete_performance_analytics_v1_outputs()
+    test_performance_analytics_production_mapping()
     test_dashboard_renders_html()
     test_position_manager_advice()
     print("smoke tests passed")

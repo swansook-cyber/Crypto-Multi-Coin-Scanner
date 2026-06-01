@@ -240,11 +240,11 @@ def normalize_external_data(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def combine_scanner_sources(journal: pd.DataFrame, history: pd.DataFrame) -> pd.DataFrame:
+    if not journal.empty:
+        return normalize_scanner_data(journal, "scanner")
     frames = []
     if not history.empty:
         frames.append(normalize_scanner_data(history, "scanner"))
-    if not journal.empty:
-        frames.append(normalize_scanner_data(journal, "scanner"))
     if not frames:
         return normalize_scanner_data(pd.DataFrame(), "scanner")
     combined = pd.concat(frames, ignore_index=True)
@@ -259,14 +259,13 @@ def combine_scanner_sources(journal: pd.DataFrame, history: pd.DataFrame) -> pd.
 def latest_report_date(scanner_df: pd.DataFrame, date: str | None = None) -> str:
     if date:
         return date
-    valid = scanner_df["timestamp"].dropna() if "timestamp" in scanner_df else pd.Series(dtype="datetime64[ns, UTC]")
-    if valid.empty:
-        return pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
-    return valid.max().strftime("%Y-%m-%d")
+    return "ALL"
 
 
 def filter_report_day(df: pd.DataFrame, date: str) -> pd.DataFrame:
     if df.empty or "timestamp" not in df:
+        return df.copy()
+    if not date or str(date).upper() == "ALL":
         return df.copy()
     return df[df["timestamp"].dt.strftime("%Y-%m-%d") == date].copy()
 
@@ -280,17 +279,36 @@ def sent_signals(df: pd.DataFrame) -> pd.DataFrame:
 def closed_trades(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df.copy()
-    return df[df["result"].isin(["WIN", "LOSS"]) | df["outcome"].isin(["WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"])].copy()
+    return df[df["result"].isin(["WIN", "LOSS"])].copy()
 
 
 def winning_trades(df: pd.DataFrame) -> pd.DataFrame:
     closed = closed_trades(df)
-    return closed[(closed["result"] == "WIN") | closed["outcome"].isin(["WIN_TP1", "WIN_TP2", "WIN_TP3"])].copy()
+    return closed[closed["result"] == "WIN"].copy()
 
 
 def losing_trades(df: pd.DataFrame) -> pd.DataFrame:
     closed = closed_trades(df)
-    return closed[(closed["result"] == "LOSS") | (closed["outcome"] == "LOSS")].copy()
+    return closed[closed["result"] == "LOSS"].copy()
+
+
+def hit_level(value: Any) -> int:
+    text = str(value).strip().upper()
+    if not text or text in {"NAN", "NONE", "NULL"}:
+        return 0
+    if text.startswith("TP"):
+        text = text.replace("TP", "", 1)
+    numeric = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return 0
+    return max(0, int(float(numeric)))
+
+
+def target_hits(df: pd.DataFrame, level: int) -> int:
+    if df.empty or "hit_target" not in df.columns:
+        return 0
+    levels = df["hit_target"].map(hit_level)
+    return int((levels >= level).sum())
 
 
 def estimated_r(row: pd.Series) -> float:
@@ -300,11 +318,11 @@ def estimated_r(row: pd.Series) -> float:
         return -1.0
     rr = pd.to_numeric(pd.Series([row.get("rr")]), errors="coerce").iloc[0]
     rr = 0.0 if pd.isna(rr) else float(rr)
-    target = str(row.get("hit_target", "")).upper()
+    level = hit_level(row.get("hit_target", ""))
     outcome = str(row.get("outcome", "")).upper()
-    if target == "TP3" or outcome == "WIN_TP3":
+    if level >= 3 or outcome == "WIN_TP3":
         return rr if rr > 0 else 3.0
-    if target == "TP2" or outcome == "WIN_TP2":
+    if level >= 2 or outcome == "WIN_TP2":
         return rr if rr > 0 else 2.0
     if str(row.get("result", "")).upper() == "WIN" or outcome == "WIN_TP1":
         return min(rr, 1.2) if rr > 0 else 1.0
@@ -320,7 +338,7 @@ def calculate_pnl(row: pd.Series) -> float | None:
         return None
     side = str(row.get("side", "")).upper()
     result = str(row.get("result", "")).upper()
-    target = str(row.get("hit_target", "")).upper()
+    level = hit_level(row.get("hit_target", ""))
     if result == "LOSS":
         sl = pd.to_numeric(pd.Series([row.get("sl")]), errors="coerce").iloc[0]
         if pd.isna(sl):
@@ -328,7 +346,7 @@ def calculate_pnl(row: pd.Series) -> float | None:
         raw = (sl - entry) / entry * 100 if side == "LONG" else (entry - sl) / entry * 100
         return -abs(float(raw))
     if result == "WIN":
-        column = "tp3" if target == "TP3" else "tp2" if target == "TP2" else "tp1"
+        column = "tp3" if level >= 3 else "tp2" if level >= 2 else "tp1"
         tp = pd.to_numeric(pd.Series([row.get(column)]), errors="coerce").iloc[0]
         if pd.isna(tp):
             return None
@@ -437,9 +455,9 @@ def performance_by(df: pd.DataFrame, column: str) -> pd.DataFrame:
                 "wins": int(len(wins)),
                 "losses": int(len(losses)),
                 "win_rate": format_value(win_rate, "%"),
-                "tp1_hits": int((wins["hit_target"].eq("TP1") | wins["outcome"].eq("WIN_TP1")).sum()) if not wins.empty else 0,
-                "tp2_hits": int((wins["hit_target"].eq("TP2") | wins["outcome"].eq("WIN_TP2")).sum()) if not wins.empty else 0,
-                "tp3_hits": int((wins["hit_target"].eq("TP3") | wins["outcome"].eq("WIN_TP3")).sum()) if not wins.empty else 0,
+                "tp1_hits": target_hits(wins, 1),
+                "tp2_hits": target_hits(wins, 2),
+                "tp3_hits": target_hits(wins, 3),
                 "sl_hits": int(len(losses)),
                 "avg_rr": format_value(safe_mean(sent["rr"]) if not sent.empty else None, precision=2),
                 "net_r": format_value(net_r, "R", precision=2),
@@ -520,15 +538,15 @@ def build_complete_report(
         "wins": int(len(wins)),
         "losses": int(len(losses)),
         "win_rate": safe_percent(len(wins), len(closed)),
-        "tp1_hits": int((wins["hit_target"].eq("TP1") | wins["outcome"].eq("WIN_TP1")).sum()) if not wins.empty else 0,
-        "tp2_hits": int((wins["hit_target"].eq("TP2") | wins["outcome"].eq("WIN_TP2")).sum()) if not wins.empty else 0,
-        "tp3_hits": int((wins["hit_target"].eq("TP3") | wins["outcome"].eq("WIN_TP3")).sum()) if not wins.empty else 0,
+        "tp1_hits": target_hits(wins, 1),
+        "tp2_hits": target_hits(wins, 2),
+        "tp3_hits": target_hits(wins, 3),
         "sl_hits": int(len(losses)),
         "net_r_estimate": net_r,
         "avg_profit_pct": safe_mean(pd.Series([v for v in pnl_values if v is not None and v > 0])),
         "avg_loss_pct": safe_mean(pd.Series([v for v in pnl_values if v is not None and v < 0])),
-        "avg_drawdown_pct": safe_mean(sent_day["max_drawdown_pct"]) if not sent_day.empty else None,
-        "avg_max_profit_pct": safe_mean(sent_day["max_profit_pct"]) if not sent_day.empty else None,
+        "avg_drawdown_pct": safe_mean(closed["max_drawdown_pct"]) if not closed.empty else None,
+        "avg_max_profit_pct": safe_mean(closed["max_profit_pct"]) if not closed.empty else None,
         "avg_time_to_tp": safe_mean(wins["holding_minutes"]) if not wins.empty else None,
         "avg_time_to_sl": safe_mean(losses["holding_minutes"]) if not losses.empty else None,
         "best_symbol": win_rate_by_label(sent_day, "symbol", best=True),
