@@ -70,6 +70,7 @@ Current systemd names:
 - `crypto-outcome-checker.timer`
 - `crypto-daily-summary.service`
 - `crypto-daily-summary.timer`
+- `crypto-external-inbox.service`
 
 Common production checks:
 

@@ -11,6 +11,7 @@ import argparse
 import csv
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from external_signal_analyzer import FIELDNAMES, EXTERNAL_SIGNALS_CSV, process_e
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
+OFFSET_FILE = LOG_DIR / "external_inbox_offset.txt"
 
 LOGGER = logging.getLogger("telegram_external_inbox")
 
@@ -33,6 +35,7 @@ def ensure_external_log(path: Path = EXTERNAL_SIGNALS_CSV) -> None:
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
             writer.writeheader()
+        LOGGER.info("External signal log initialized: %s", path)
 
 
 def log_external_message(
@@ -105,6 +108,7 @@ def poll_external_inbox(
     offset: int | None = None,
     timeout: int = 10,
 ) -> int | None:
+    ensure_external_log(EXTERNAL_SIGNALS_CSV)
     if not token or not external_chat_id:
         LOGGER.warning("External inbox polling skipped: token/external chat id missing")
         return offset
@@ -129,6 +133,7 @@ def poll_external_inbox(
         chat_id, message_id, raw_text = extracted
         if chat_id != str(external_chat_id):
             continue
+        LOGGER.info("External signal received: chat_id=%s message_id=%s chars=%s", chat_id, message_id, len(raw_text or ""))
         process_external_signal(
             raw_text,
             message_id,
@@ -142,9 +147,79 @@ def poll_external_inbox(
     return next_offset
 
 
+def load_offset(path: Path = OFFSET_FILE) -> int | None:
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        LOGGER.warning("External inbox offset file is invalid: %s", path)
+        return None
+
+
+def save_offset(offset: int | None, path: Path = OFFSET_FILE) -> None:
+    if offset is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(offset), encoding="utf-8")
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def run_loop(
+    token: str,
+    external_chat_id: str,
+    reports_chat_id: str,
+    signals_chat_id: str,
+    cornix_chat_id: str,
+    interval_seconds: int,
+    offset: int | None = None,
+) -> None:
+    current_offset = offset if offset is not None else load_offset()
+    LOGGER.info("External inbox listener started: interval=%ss offset=%s", interval_seconds, current_offset)
+    ensure_external_log(EXTERNAL_SIGNALS_CSV)
+    while True:
+        try:
+            current_offset = poll_external_inbox(
+                token,
+                external_chat_id,
+                reports_chat_id,
+                signals_chat_id,
+                cornix_chat_id,
+                current_offset,
+            )
+            save_offset(current_offset)
+            LOGGER.info("External inbox poll complete: next_offset=%s", current_offset)
+            time.sleep(max(1, interval_seconds))
+        except KeyboardInterrupt:
+            LOGGER.info("External inbox listener stopped")
+            raise
+        except Exception as exc:
+            LOGGER.exception("External inbox listener error: %s", exc)
+            time.sleep(30)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Poll Telegram External Signal Inbox once.")
     parser.add_argument("--offset", type=int, default=None)
+    parser.add_argument("--loop", action="store_true", help="Keep polling the external inbox.")
+    parser.add_argument("--interval", type=int, default=None, help="Loop interval in seconds.")
     return parser.parse_args()
 
 
@@ -157,7 +232,12 @@ def main() -> int:
     reports_chat_id = os.getenv("TELEGRAM_REPORTS_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
     signals_chat_id = os.getenv("TELEGRAM_SIGNALS_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
     cornix_chat_id = os.getenv("TELEGRAM_CORNIX_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+    interval = args.interval if args.interval is not None else env_int("EXTERNAL_INBOX_LOOP_INTERVAL_SECONDS", 10)
+    if args.loop or env_bool("EXTERNAL_INBOX_LOOP_MODE", False):
+        run_loop(token, external_chat_id, reports_chat_id, signals_chat_id, cornix_chat_id, interval, args.offset)
+        return 0
     next_offset = poll_external_inbox(token, external_chat_id, reports_chat_id, signals_chat_id, cornix_chat_id, args.offset)
+    save_offset(next_offset)
     print(f"Next offset: {next_offset}")
     return 0
 

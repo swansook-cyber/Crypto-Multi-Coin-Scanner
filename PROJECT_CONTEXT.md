@@ -42,7 +42,7 @@ Main runtime components:
 - `dashboard.py`: local HTML Dashboard V1
 - `position_manager.py`: duplicate/opposite/stale position advisor
 - `external_signal_analyzer.py`: approved-only parser/analyzer/router for forwarded VIP signals
-- `telegram_external_inbox.py`: external inbox polling tool
+- `telegram_external_inbox.py`: external inbox polling/listener tool
 
 ## Current Strategy
 

@@ -1,0 +1,13 @@
+[Unit]
+Description=Crypto External Signal Inbox Listener
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+EnvironmentFile=/opt/Crypto-Multi-Coin-Scanner/.env
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python telegram_external_inbox.py --loop
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

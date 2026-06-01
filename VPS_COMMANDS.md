@@ -23,6 +23,7 @@ Current systemd units:
 - `crypto-outcome-checker.timer`
 - `crypto-daily-summary.service`
 - `crypto-daily-summary.timer`
+- `crypto-external-inbox.service`
 
 ## VPS Login
 
@@ -105,6 +106,22 @@ systemctl list-timers crypto-daily-summary.timer --no-pager
 journalctl -u crypto-daily-summary.service -n 100 --no-pager
 ```
 
+External inbox listener:
+
+```bash
+systemctl status crypto-external-inbox.service --no-pager
+systemctl is-active crypto-external-inbox.service
+journalctl -u crypto-external-inbox.service -n 140 --no-pager
+```
+
+If the service has not been installed yet:
+
+```bash
+sudo cp /opt/Crypto-Multi-Coin-Scanner/deploy/systemd/crypto-external-inbox.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now crypto-external-inbox.service
+```
+
 ## Restart Services
 
 Scanner:
@@ -125,12 +142,19 @@ Daily summary timer:
 sudo systemctl restart crypto-daily-summary.timer
 ```
 
+External inbox listener:
+
+```bash
+sudo systemctl restart crypto-external-inbox.service
+```
+
 Restart all production units after a code update:
 
 ```bash
 sudo systemctl restart crypto-scanner.service
 sudo systemctl restart crypto-outcome-checker.timer
 sudo systemctl restart crypto-daily-summary.timer
+sudo systemctl restart crypto-external-inbox.service
 ```
 
 ## Git Update On VPS
@@ -143,6 +167,7 @@ git pull origin main
 sudo systemctl restart crypto-scanner.service
 sudo systemctl restart crypto-outcome-checker.timer
 sudo systemctl restart crypto-daily-summary.timer
+sudo systemctl restart crypto-external-inbox.service
 systemctl status crypto-scanner.service --no-pager
 ```
 
@@ -205,6 +230,13 @@ External Signal Inbox poll once:
 ```bash
 cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python telegram_external_inbox.py
+```
+
+External Signal Inbox listener:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python telegram_external_inbox.py --loop
 ```
 
 External Signal Analyzer V1 is approved-only:
@@ -275,6 +307,7 @@ test -f .env && echo ".env OK" || echo ".env MISSING"
 systemctl is-active crypto-scanner.service
 systemctl is-active crypto-outcome-checker.timer
 systemctl is-active crypto-daily-summary.timer
+systemctl is-active crypto-external-inbox.service
 ```
 
 Windows shortcut:
@@ -321,6 +354,16 @@ systemctl status crypto-daily-summary.timer --no-pager
 journalctl -u crypto-daily-summary.service -n 200 --no-pager
 cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python daily_summary.py --dry-run
+```
+
+No external signals:
+
+```bash
+systemctl status crypto-external-inbox.service --no-pager
+journalctl -u crypto-external-inbox.service -n 200 --no-pager
+cd /opt/Crypto-Multi-Coin-Scanner
+test -f logs/external_signals.csv && tail -n 25 logs/external_signals.csv || echo "external_signals.csv missing"
+.venv/bin/python telegram_external_inbox.py
 ```
 
 No performance report/dashboard:

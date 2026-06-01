@@ -181,6 +181,14 @@ def parse_external_signal(raw_text: str, message_id: int | str = "", source: str
     if not parsed.targets:
         parsed.parse_errors.append("target missing")
     parsed.parse_status = "SUCCESS" if not parsed.parse_errors else "FAILED"
+    LOGGER.info(
+        "External signal parsed: message_id=%s status=%s symbol=%s side=%s errors=%s",
+        message_id,
+        parsed.parse_status,
+        parsed.symbol or "-",
+        parsed.side or "-",
+        ",".join(parsed.parse_errors) if parsed.parse_errors else "-",
+    )
     return parsed
 
 
@@ -220,6 +228,12 @@ def analyze_external_signal(raw_text: str, message_id: int | str = "", source: s
     if parsed.parse_status != "SUCCESS":
         analysis.recommendation = "FAILED"
         analysis.reason = [f"❌ {error}" for error in parsed.parse_errors]
+        LOGGER.info(
+            "External signal rejected: message_id=%s recommendation=%s reason=%s",
+            message_id,
+            analysis.recommendation,
+            " | ".join(analysis.reason),
+        )
         return analysis
 
     score = 45
@@ -271,6 +285,25 @@ def analyze_external_signal(raw_text: str, message_id: int | str = "", source: s
     else:
         analysis.recommendation = "APPROVED"
     analysis.reason = reasons
+    if analysis.recommendation == "APPROVED":
+        LOGGER.info(
+            "External signal approved: message_id=%s symbol=%s side=%s score=%s rr=%.2f",
+            message_id,
+            parsed.symbol,
+            parsed.side,
+            analysis.analysis_score,
+            analysis.rr,
+        )
+    else:
+        LOGGER.info(
+            "External signal rejected: message_id=%s symbol=%s side=%s recommendation=%s score=%s rr=%.2f",
+            message_id,
+            parsed.symbol,
+            parsed.side,
+            analysis.recommendation,
+            analysis.analysis_score,
+            analysis.rr,
+        )
     return analysis
 
 
@@ -346,6 +379,7 @@ def ensure_log(path: Path = EXTERNAL_SIGNALS_CSV) -> None:
     if not path.exists():
         with path.open("w", newline="", encoding="utf-8") as handle:
             csv.DictWriter(handle, fieldnames=FIELDNAMES).writeheader()
+        LOGGER.info("External signal log created: %s", path)
         return
     try:
         with path.open("r", newline="", encoding="utf-8") as handle:
@@ -386,6 +420,7 @@ def ensure_log(path: Path = EXTERNAL_SIGNALS_CSV) -> None:
         writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
         writer.writeheader()
         writer.writerows(migrated)
+    LOGGER.info("External signal log migrated: %s", path)
 
 
 def log_analysis(analysis: ExternalSignalAnalysis, path: Path = EXTERNAL_SIGNALS_CSV) -> None:
@@ -417,6 +452,14 @@ def log_analysis(analysis: ExternalSignalAnalysis, path: Path = EXTERNAL_SIGNALS
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
         writer.writerow(row)
+    LOGGER.info(
+        "External signal logged: message_id=%s recommendation=%s sent_to_signals=%s sent_to_cornix=%s path=%s",
+        parsed.message_id,
+        analysis.recommendation,
+        row["sent_to_signals"],
+        row["sent_to_cornix"],
+        path,
+    )
 
 
 def send_telegram_message(token: str, chat_id: str, message: str, channel_name: str) -> bool:
@@ -450,7 +493,15 @@ def route_analysis(
         return analysis
     if analysis.recommendation == "APPROVED":
         analysis.sent_to_signals = send_telegram_message(token, signals_chat_id, build_signals_message(analysis), "external signals")
+        LOGGER.info("External signal routed to signals: message_id=%s success=%s", analysis.parsed.message_id, analysis.sent_to_signals)
         analysis.sent_to_cornix = send_telegram_message(token, cornix_chat_id, build_cornix_message(analysis), "external cornix")
+        LOGGER.info("External signal routed to cornix: message_id=%s success=%s", analysis.parsed.message_id, analysis.sent_to_cornix)
+    else:
+        LOGGER.info(
+            "External signal not routed to signals/cornix: message_id=%s recommendation=%s",
+            analysis.parsed.message_id,
+            analysis.recommendation,
+        )
     if reports_chat_id:
         send_telegram_message(token, reports_chat_id, build_report_message(analysis), "external reports")
     return analysis
@@ -467,6 +518,7 @@ def process_external_signal(
     log_path: Path = EXTERNAL_SIGNALS_CSV,
     send: bool = True,
 ) -> ExternalSignalAnalysis:
+    LOGGER.info("External signal received: message_id=%s source=%s chars=%s", message_id, source, len(raw_text or ""))
     analysis = analyze_external_signal(raw_text, message_id, source)
     route_analysis(analysis, token, signals_chat_id, cornix_chat_id, reports_chat_id, send=send)
     log_analysis(analysis, log_path)

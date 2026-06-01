@@ -8,6 +8,7 @@
 - Main scanner service: `crypto-scanner.service`
 - Outcome checker: `crypto-outcome-checker.service` run by `crypto-outcome-checker.timer`
 - Daily summary: `crypto-daily-summary.service` run by `crypto-daily-summary.timer`
+- External inbox listener: `crypto-external-inbox.service`
 - Execution model: Telegram signal assistant only
 - Auto trading: not implemented
 - Manual execution: required
@@ -31,6 +32,7 @@
 - Position Management Advisor via `position_manager.py`
 - External Signal Analyzer V1 via `external_signal_analyzer.py`
 - External Signal Inbox polling via `telegram_external_inbox.py`
+- External inbox VPS listener loop via `telegram_external_inbox.py --loop`
 
 ## Telegram Channels
 

@@ -89,6 +89,12 @@ To poll the external inbox once:
 python telegram_external_inbox.py
 ```
 
+For VPS production, run it as a long-running listener:
+
+```bat
+python telegram_external_inbox.py --loop
+```
+
 Received external messages are parsed, scored, stored in `logs/external_signals.csv`, and reported to the reports channel. WAIT, SKIP, RISKY, and FAILED messages are never sent to Signals or Cornix.
 
 For testing without sending alerts:
@@ -633,6 +639,30 @@ Unit=crypto-daily-summary.service
 WantedBy=timers.target
 ```
 
+Create `/etc/systemd/system/crypto-external-inbox.service`:
+
+```ini
+[Unit]
+Description=Crypto External Signal Inbox Listener
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+EnvironmentFile=/opt/Crypto-Multi-Coin-Scanner/.env
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python telegram_external_inbox.py --loop
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The same unit template is also available at:
+
+```text
+deploy/systemd/crypto-external-inbox.service
+```
+
 Enable:
 
 ```bash
@@ -640,6 +670,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now crypto-scanner.service
 sudo systemctl enable --now crypto-outcome-checker.timer
 sudo systemctl enable --now crypto-daily-summary.timer
+sudo systemctl enable --now crypto-external-inbox.service
 ```
 
 The daily timer example runs at 23:55 server time. Keep `PROMO_ENABLED=false`; this project is internal lab signal tracking only.
