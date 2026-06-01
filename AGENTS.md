@@ -38,7 +38,7 @@
 
 Do not forward External Inbox messages into scanner-generated signals.
 
-Only APPROVED external analyzer results may be sent to Signals or Cornix. WAIT, SKIP, RISKY, and FAILED results are reports/logs only.
+Only APPROVED external analyzer results may be sent to Signals or Cornix. WAIT, SKIP, RISKY, and FAILED results are CSV-only and summary-report only; do not send immediate Telegram messages for them.
 
 Cornix output is dry-run format unless the user explicitly changes production mode.
 

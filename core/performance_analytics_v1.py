@@ -500,14 +500,30 @@ def external_counts(external_df: pd.DataFrame, date: str | None = None) -> dict[
             "external_rejected": 0,
             "external_sent_to_signals": 0,
             "external_sent_to_cornix": 0,
+            "external_approval_rate": None,
+            "external_top_reject_reasons": NA,
+            "external_top_approved_symbols": NA,
         }
     approved = data["recommendation"].eq("APPROVED")
+    rejected = ~approved
+    top_approved_symbols = (
+        data.loc[approved, "symbol"].replace("", NA).value_counts().head(5)
+        if approved.any()
+        else pd.Series(dtype=int)
+    )
+    reject_reasons = data.loc[rejected, "skip_reason"].fillna("").astype(str)
+    blank_reasons = reject_reasons.str.strip().eq("")
+    reject_reasons.loc[blank_reasons] = data.loc[rejected, "recommendation"].fillna("").astype(str).loc[blank_reasons]
+    top_reject_reasons = reject_reasons.replace("", NA).value_counts().head(5)
     return {
         "external_total": int(len(data)),
         "external_approved": int(approved.sum()),
-        "external_rejected": int((~approved).sum()),
+        "external_rejected": int(rejected.sum()),
         "external_sent_to_signals": int(data["sent_to_signals"].eq("YES").sum()),
         "external_sent_to_cornix": int(data["sent_to_cornix"].eq("YES").sum()),
+        "external_approval_rate": safe_percent(int(approved.sum()), int(len(data))),
+        "external_top_reject_reasons": ", ".join(f"{key}: {count}" for key, count in top_reject_reasons.items()) if not top_reject_reasons.empty else NA,
+        "external_top_approved_symbols": ", ".join(f"{key}: {count}" for key, count in top_approved_symbols.items()) if not top_approved_symbols.empty else NA,
     }
 
 

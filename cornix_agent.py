@@ -299,9 +299,9 @@ class ScannerConfig:
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip(),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
-            telegram_signals_chat_id=os.getenv("TELEGRAM_SIGNALS_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip(),
-            telegram_cornix_chat_id=os.getenv("TELEGRAM_CORNIX_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip(),
-            telegram_reports_chat_id=os.getenv("TELEGRAM_REPORTS_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip(),
+            telegram_signals_chat_id=os.getenv("TELEGRAM_SIGNALS_CHAT_ID", "").strip(),
+            telegram_cornix_chat_id=os.getenv("TELEGRAM_CORNIX_CHAT_ID", "").strip(),
+            telegram_reports_chat_id=os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip(),
             telegram_external_inbox_chat_id=os.getenv("TELEGRAM_EXTERNAL_INBOX_CHAT_ID", "").strip(),
         )
 
@@ -1311,13 +1311,12 @@ class TelegramNotifier:
         self.session = build_retry_session()
 
     def _channel_chat_id(self, channel: str) -> str:
-        fallback = self.config.telegram_chat_id
         mapping = {
-            "signals": self.config.telegram_signals_chat_id or fallback,
-            "cornix": self.config.telegram_cornix_chat_id or fallback,
-            "reports": self.config.telegram_reports_chat_id or fallback,
+            "signals": self.config.telegram_signals_chat_id,
+            "cornix": self.config.telegram_cornix_chat_id,
+            "reports": self.config.telegram_reports_chat_id,
         }
-        return mapping.get(channel, fallback).strip()
+        return mapping.get(channel, "").strip()
 
     def build_message(self, signal: TradeSignal) -> str:
         signal_emoji = "🚀" if signal.direction == "LONG" else "🔻"

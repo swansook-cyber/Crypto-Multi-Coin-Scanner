@@ -92,9 +92,9 @@ Environment variables:
 
 External inbox messages must not affect scanner-generated decisions.
 
-Only APPROVED external signals may be routed to Signals and Cornix. WAIT, SKIP, RISKY, and FAILED external signals are log/report only.
+Only APPROVED external signals may be routed to Signals and Cornix. WAIT, SKIP, RISKY, and FAILED external signals are CSV-only and should appear in summary reporting, not immediate Telegram messages.
 
-Performance reports must be sent to the Reports channel only. They must never route to Signals or Cornix.
+Performance reports, TP/SL outcomes, and position-management messages must be sent to the Reports channel only. They must never route to Signals or Cornix.
 
 ## Current Analytics Layer
 

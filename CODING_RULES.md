@@ -48,7 +48,7 @@
 - Daily Performance Report sends to `TELEGRAM_REPORTS_CHAT_ID` only
 - External Inbox messages must not affect scanner-generated decisions
 - Only APPROVED external signals may be sent to Signals or Cornix
-- WAIT / SKIP / RISKY / FAILED external signals are logs/reports only
+- WAIT / SKIP / RISKY / FAILED external signals are CSV-only and summary-report only; no immediate Telegram message
 
 ## Validation
 

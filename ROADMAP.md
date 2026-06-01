@@ -15,6 +15,7 @@
 - Dashboard V1 is implemented as local HTML through `dashboard.py`
 - Position Management Advisor is implemented through `position_manager.py` and scanner Telegram advisory routing
 - External Signal Analyzer V1 is implemented as approved-only routing for forwarded VIP signals
+- Telegram Channel Routing V1 is implemented so Signals, Cornix, and Reports have separate responsibilities
 - Production monitoring now focuses on collecting enough clean outcomes for calibration decisions
 
 Performance Analytics V1 exports:

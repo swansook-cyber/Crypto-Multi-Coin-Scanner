@@ -498,12 +498,10 @@ def route_analysis(
         LOGGER.info("External signal routed to cornix: message_id=%s success=%s", analysis.parsed.message_id, analysis.sent_to_cornix)
     else:
         LOGGER.info(
-            "External signal not routed to signals/cornix: message_id=%s recommendation=%s",
+            "External signal CSV-only, no Telegram routing: message_id=%s recommendation=%s",
             analysis.parsed.message_id,
             analysis.recommendation,
         )
-    if reports_chat_id:
-        send_telegram_message(token, reports_chat_id, build_report_message(analysis), "external reports")
     return analysis
 
 

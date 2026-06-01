@@ -229,9 +229,9 @@ def main() -> int:
     args = parse_args()
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     external_chat_id = os.getenv("TELEGRAM_EXTERNAL_INBOX_CHAT_ID", "").strip()
-    reports_chat_id = os.getenv("TELEGRAM_REPORTS_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
-    signals_chat_id = os.getenv("TELEGRAM_SIGNALS_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
-    cornix_chat_id = os.getenv("TELEGRAM_CORNIX_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+    reports_chat_id = os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip()
+    signals_chat_id = os.getenv("TELEGRAM_SIGNALS_CHAT_ID", "").strip()
+    cornix_chat_id = os.getenv("TELEGRAM_CORNIX_CHAT_ID", "").strip()
     interval = args.interval if args.interval is not None else env_int("EXTERNAL_INBOX_LOOP_INTERVAL_SECONDS", 10)
     if args.loop or env_bool("EXTERNAL_INBOX_LOOP_MODE", False):
         run_loop(token, external_chat_id, reports_chat_id, signals_chat_id, cornix_chat_id, interval, args.offset)

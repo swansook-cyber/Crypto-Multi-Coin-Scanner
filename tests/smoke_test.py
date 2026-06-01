@@ -125,6 +125,40 @@ def test_cornix_dry_run_format_and_signal_immutability() -> None:
     assert notifier.send_signal(signal) is True
 
 
+def test_internal_signal_channel_routing() -> None:
+    cfg = scanner.ScannerConfig.from_env()
+    cfg.dry_run = False
+    cfg.send_telegram = True
+    cfg.send_daily_summary = True
+    cfg.telegram_bot_token = "token"
+    cfg.telegram_chat_id = "legacy"
+    cfg.telegram_signals_chat_id = "signals"
+    cfg.telegram_cornix_chat_id = "cornix"
+    cfg.telegram_reports_chat_id = "reports"
+    notifier = scanner.TelegramNotifier(cfg)
+    calls: list[tuple[str, str]] = []
+
+    def fake_message(_message: str, chat_id: str, channel_name: str = "telegram") -> bool:
+        calls.append((chat_id, channel_name))
+        return True
+
+    notifier._send_message = fake_message  # type: ignore[method-assign]
+    notifier._send_photo = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
+
+    assert notifier.send_signal(sample_signal()) is True
+    assert ("signals", "signals") in calls
+    assert ("cornix", "cornix") in calls
+    assert not any(channel == "reports" for _chat, channel in calls)
+
+    calls.clear()
+    assert notifier.send_position_message("POSITION REVIEW") is True
+    assert calls == [("reports", "reports")]
+
+    calls.clear()
+    assert notifier.send_daily_summary({"day": "2026-05-31"}) is True
+    assert calls == [("reports", "reports")]
+
+
 def test_missing_telegram_channel_ids_do_not_crash() -> None:
     cfg = scanner.ScannerConfig.from_env()
     cfg.dry_run = False
@@ -252,7 +286,7 @@ def test_external_signal_score_threshold_and_routing() -> None:
         assert analysis.recommendation == "WAIT"
         assert ("signals", "external signals") not in calls
         assert ("cornix", "external cornix") not in calls
-        assert ("reports", "external reports") in calls
+        assert ("reports", "external reports") not in calls
     finally:
         external_signal_analyzer.send_telegram_message = original_send
         if old_threshold is None:
@@ -293,6 +327,7 @@ def test_external_signal_approved_routes_to_signals_and_cornix_and_logs() -> Non
         assert analysis.sent_to_cornix is True
         assert any(call[0] == "signals" and call[1] == "external signals" for call in calls)
         assert any(call[0] == "cornix" and call[1] == "external cornix" for call in calls)
+        assert not any(call[0] == "reports" for call in calls)
         assert "DRY RUN - EXTERNAL SIGNAL CORNIX FORMAT" in [call[2] for call in calls if call[0] == "cornix"][0]
         logged = pd.read_csv(path)
         assert logged.loc[0, "recommendation"] == "APPROVED"
@@ -308,6 +343,47 @@ def test_external_signal_approved_routes_to_signals_and_cornix_and_logs() -> Non
             path.unlink()
         except OSError:
             pass
+
+
+def test_outcome_alert_reports_only() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class FakeSession:
+        def post(self, _url, data=None, timeout=None):
+            calls.append((data["chat_id"], data["text"]))
+
+            class Response:
+                status_code = 200
+                text = "ok"
+
+            return Response()
+
+    old_send = os.environ.get("SEND_TELEGRAM")
+    old_outcomes = os.environ.get("SEND_OUTCOME_ALERTS")
+    old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    old_legacy = os.environ.get("TELEGRAM_CHAT_ID")
+    old_reports = os.environ.get("TELEGRAM_REPORTS_CHAT_ID")
+    os.environ["SEND_TELEGRAM"] = "1"
+    os.environ["SEND_OUTCOME_ALERTS"] = "1"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+    os.environ["TELEGRAM_CHAT_ID"] = "legacy"
+    os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports"
+    try:
+        assert review_signals.send_telegram_alert(FakeSession(), "TP1 HIT") is True
+        assert calls == [("reports", "TP1 HIT")]
+    finally:
+        restore = {
+            "SEND_TELEGRAM": old_send,
+            "SEND_OUTCOME_ALERTS": old_outcomes,
+            "TELEGRAM_BOT_TOKEN": old_token,
+            "TELEGRAM_CHAT_ID": old_legacy,
+            "TELEGRAM_REPORTS_CHAT_ID": old_reports,
+        }
+        for key, value in restore.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _wave_test_candles(kind: str = "bullish") -> pd.DataFrame:
@@ -1156,12 +1232,14 @@ def test_position_manager_advice() -> None:
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
+    test_internal_signal_channel_routing()
     test_missing_telegram_channel_ids_do_not_crash()
     test_external_inbox_logging_and_debug_format()
     test_external_signal_parse_long_short_and_symbols()
     test_external_signal_missing_fields_not_approved()
     test_external_signal_score_threshold_and_routing()
     test_external_signal_approved_routes_to_signals_and_cornix_and_logs()
+    test_outcome_alert_reports_only()
     test_wave_bullish_higher_high_higher_low()
     test_wave_bearish_lower_high_lower_low()
     test_wave_range_or_unclear_and_score_bounds()

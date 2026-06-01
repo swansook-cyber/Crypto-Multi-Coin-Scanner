@@ -242,7 +242,7 @@ cd /opt/Crypto-Multi-Coin-Scanner
 External Signal Analyzer V1 is approved-only:
 
 - APPROVED external signals may route to Signals and Cornix
-- WAIT / SKIP / RISKY / FAILED signals are stored in logs and reports only
+- WAIT / SKIP / RISKY / FAILED signals are stored in `logs/external_signals.csv` only and appear in summaries
 - Cornix output remains dry-run text only
 
 ## Telegram Multi-Channel Config
@@ -271,7 +271,7 @@ Routing:
 - External Inbox: incoming external messages are parsed by External Analyzer V1
 - External Analyzer V1: only APPROVED forwarded VIP signals can route to Signals/Cornix
 
-If a channel-specific ID is empty, the app falls back to `TELEGRAM_CHAT_ID` where appropriate.
+For production channel routing, set the channel-specific IDs so Signals, Cornix, and Reports do not mix in one destination.
 
 ## Log And Data Files
 

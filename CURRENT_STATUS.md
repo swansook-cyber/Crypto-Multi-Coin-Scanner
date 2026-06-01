@@ -37,11 +37,11 @@
 ## Telegram Channels
 
 - Signals: `TELEGRAM_SIGNALS_CHAT_ID`
-  - Full signal message and chart image
+  - Full LONG/SHORT signal message and chart image only
 - Cornix: `TELEGRAM_CORNIX_CHAT_ID`
-  - Cornix-format dry-run message only
+  - Cornix-format LONG/SHORT dry-run execution text only
 - Reports: `TELEGRAM_REPORTS_CHAT_ID`
-  - Daily summary, daily performance report, diagnostics, and position management advisories
+  - TP/SL outcomes, position management advisories, daily summaries, performance reports, and analytics
 - External Inbox: `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`
   - Incoming external signal messages are parsed, scored, logged, and reviewed
 
@@ -49,9 +49,9 @@ External analyzer routing:
 
 - APPROVED external signals may go to Signals and Cornix
 - WAIT / SKIP / RISKY / FAILED external signals must not go to Signals or Cornix
-- Rejected or failed external signals are logged and may be reported to Reports only
+- WAIT / SKIP / RISKY / FAILED external signals are CSV-only and appear in summaries; no immediate Telegram message is sent
 
-If a channel-specific chat ID is empty, the scanner falls back to `TELEGRAM_CHAT_ID` where appropriate.
+Channel-specific chat IDs are required for production channel routing. This prevents Signals, Cornix, and Reports messages from mixing in one destination.
 
 Performance reports are routed to `TELEGRAM_REPORTS_CHAT_ID` only. They do not fall back to Signals or Cornix.
 

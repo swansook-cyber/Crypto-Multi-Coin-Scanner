@@ -81,7 +81,7 @@ Optional multi-channel routing:
 - `TELEGRAM_REPORTS_CHAT_ID`: daily summaries, reports, and position advisor messages
 - `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`: external message intake for approved-only analysis
 
-If a new channel ID is empty, the scanner falls back to `TELEGRAM_CHAT_ID` where appropriate. External inbox messages never affect scanner-generated signals. Only APPROVED external analyzer results may be routed to Signals and Cornix.
+For production channel routing, set the channel-specific IDs. External inbox messages never affect scanner-generated signals. Only APPROVED external analyzer results may be routed to Signals and Cornix. WAIT, SKIP, RISKY, and FAILED external signals are CSV-only and appear in summary reporting.
 
 To poll the external inbox once:
 

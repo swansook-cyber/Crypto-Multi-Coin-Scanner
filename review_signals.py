@@ -21,6 +21,7 @@ from urllib3.util.retry import Retry
 
 from core.analytics_engine import update_validation_artifacts
 from core.outcome_tracker import HISTORY_COLUMNS, sync_history_files
+from telegram_sender import TelegramRoutes, send_text
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -423,20 +424,12 @@ def send_telegram_alert(session: requests.Session, message: str) -> bool:
     if not env_bool("SEND_TELEGRAM", True) or not env_bool("SEND_OUTCOME_ALERTS", True):
         return False
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat_id:
-        LOGGER.warning("Outcome alert skipped: Telegram token/chat id missing")
+    reports_chat_id = os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip()
+    if not token or not reports_chat_id:
+        LOGGER.warning("Outcome alert skipped: Telegram token/reports chat id missing")
         return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        response = session.post(url, data={"chat_id": chat_id, "text": message}, timeout=20)
-    except requests.RequestException as exc:
-        LOGGER.error("Outcome alert failed: %s", exc)
-        return False
-    if response.status_code != 200:
-        LOGGER.error("Outcome alert failed: %s", response.text)
-        return False
-    return True
+    routes = TelegramRoutes(token=token, reports_chat_id=reports_chat_id)
+    return send_text(session, routes, "reports", message, "outcome alert")
 
 
 def fetch_klines(session: requests.Session, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
