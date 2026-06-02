@@ -344,44 +344,6 @@ def target_alert_already_sent(row: pd.Series) -> bool:
     return alert_already_sent(row.get(outcome_alert_column(row.get("hit_target", "SL")), 0))
 
 
-def build_legacy_outcome_alert(row: pd.Series) -> str:
-    side = str(row["side"]).upper()
-    result = str(row["result"]).upper()
-    hit_target = str(row.get("hit_target", "")).upper()
-    entry = float(row["entry"])
-    stop_loss = float(row["stop_loss"])
-    tp1 = float(row["tp1"])
-    tp2 = float(row["tp2"])
-    period = format_period(row.get("timestamp"), row.get("closed_at"))
-
-    if result == "WIN":
-        target_price = tp2 if hit_target == "TP2" else tp1
-        profit_pct = (target_price - entry) / entry * 100 if side == "LONG" else (entry - target_price) / entry * 100
-        return (
-            "✅ TAKE PROFIT HIT\n\n"
-            f"🪙 {display_symbol(row['symbol'])}\n"
-            f"📈 Direction: {side}\n"
-            f"🎯 Hit: {hit_target}\n"
-            f"💰 Entry: {format_price(entry)}\n"
-            f"🎯 TP1: {format_price(tp1)}\n"
-            f"🎯 TP2: {format_price(tp2)}\n"
-            f"🛑 SL: {format_price(stop_loss)}\n"
-            f"📊 Profit: +{profit_pct:.2f}%\n"
-            f"⏱ Period: {period}"
-        )
-
-    loss_pct = (entry - stop_loss) / entry * 100 if side == "LONG" else (stop_loss - entry) / entry * 100
-    return (
-        "🛑 STOP LOSS HIT\n\n"
-        f"🪙 {display_symbol(row['symbol'])}\n"
-        f"📈 Direction: {side}\n"
-        f"💰 Entry: {format_price(entry)}\n"
-        f"🛑 SL: {format_price(stop_loss)}\n"
-        f"📉 Loss: -{abs(loss_pct):.2f}%\n"
-        f"⏱ Period: {period}"
-    )
-
-
 def build_outcome_alert(row: pd.Series) -> str:
     result = str(row["result"]).upper()
     hit_target = str(row.get("hit_target", "")).upper()

@@ -371,6 +371,10 @@ def test_outcome_alert_reports_only() -> None:
     try:
         assert review_signals.send_telegram_alert(FakeSession(), "TP1 HIT") is True
         assert calls == [("reports", "TP1 HIT")]
+        os.environ["TELEGRAM_REPORTS_CHAT_ID"] = ""
+        calls.clear()
+        assert review_signals.send_telegram_alert(FakeSession(), "SL HIT") is False
+        assert calls == []
     finally:
         restore = {
             "SEND_TELEGRAM": old_send,
