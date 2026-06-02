@@ -21,7 +21,6 @@ from urllib3.util.retry import Retry
 
 from core.analytics_engine import update_validation_artifacts
 from core.outcome_tracker import HISTORY_COLUMNS, sync_history_files
-from telegram_sender import TelegramRoutes, send_text
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -384,14 +383,28 @@ def build_outcome_alert(row: pd.Series) -> str:
 
 def send_telegram_alert(session: requests.Session, message: str) -> bool:
     if not env_bool("SEND_TELEGRAM", True) or not env_bool("SEND_OUTCOME_ALERTS", True):
+        LOGGER.info("Outcome alert skipped: SEND_TELEGRAM or SEND_OUTCOME_ALERTS is off")
         return False
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     reports_chat_id = os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip()
+    LOGGER.info("Outcome alert reports chat id target: %s", reports_chat_id or "-")
     if not token or not reports_chat_id:
         LOGGER.warning("Outcome alert skipped: Telegram token/reports chat id missing")
         return False
-    routes = TelegramRoutes(token=token, reports_chat_id=reports_chat_id)
-    return send_text(session, routes, "reports", message, "outcome alert")
+    try:
+        response = session.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": reports_chat_id, "text": message},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        LOGGER.error("Outcome alert Telegram send failed: %s", exc)
+        return False
+    if response.status_code != 200:
+        LOGGER.error("Outcome alert Telegram send failed: status=%s body=%s", response.status_code, response.text)
+        return False
+    LOGGER.info("Outcome alert Telegram send success: status=%s", response.status_code)
+    return True
 
 
 def fetch_klines(session: requests.Session, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
@@ -530,10 +543,33 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Review signal outcomes from Binance Futures candles.")
     parser.add_argument("--notify", action="store_true", help="Send Telegram alerts for newly closed outcomes.")
     parser.add_argument("--dry-run", action="store_true", help="Review outcomes without sending Telegram alerts.")
+    parser.add_argument("--resend-unsent", action="store_true", help="Resend closed WIN/LOSS alerts where outcome_alert_sent is not 1.")
+    parser.add_argument("--force-resend-outcome-alerts", action="store_true", help="Resend all closed WIN/LOSS outcome alerts, including already sent rows.")
     return parser.parse_args()
 
 
-def run_review_cycle(notify: bool, session: requests.Session, lookahead_hours: int, print_report: bool = True) -> ReviewStats:
+def should_skip_outcome_alert(row: pd.Series, outcome_id: str, resend_unsent: bool, force_resend: bool) -> bool:
+    if force_resend:
+        return False
+    if alert_already_sent(row.get("outcome_alert_sent", 0)):
+        return True
+    if resend_unsent:
+        return False
+    if target_alert_already_sent(row):
+        return True
+    if has_outcome_id(row.get("outcome_id", "")):
+        return True
+    return outcome_id in PROCESSED_OUTCOMES
+
+
+def run_review_cycle(
+    notify: bool,
+    session: requests.Session,
+    lookahead_hours: int,
+    print_report: bool = True,
+    resend_unsent: bool = False,
+    force_resend: bool = False,
+) -> ReviewStats:
     stats = ReviewStats()
     df = reload_journal()
     if df is None:
@@ -575,14 +611,9 @@ def run_review_cycle(notify: bool, session: requests.Session, lookahead_hours: i
             continue
 
         outcome_id = build_outcome_id(updated_row)
-        if target_alert_already_sent(updated_row) or has_outcome_id(updated_row.get("outcome_id", "")):
+        if should_skip_outcome_alert(updated_row, outcome_id, resend_unsent, force_resend):
             stats.skipped_alerts += 1
             LOGGER.info("Outcome duplicate skipped: %s", updated_row.get("outcome_id", outcome_id))
-            time.sleep(0.2)
-            continue
-        if outcome_id in PROCESSED_OUTCOMES:
-            stats.skipped_alerts += 1
-            LOGGER.info("Outcome duplicate skipped: %s", outcome_id)
             time.sleep(0.2)
             continue
         if not notify:
@@ -590,7 +621,15 @@ def run_review_cycle(notify: bool, session: requests.Session, lookahead_hours: i
             time.sleep(0.2)
             continue
 
-        LOGGER.info("Processing outcome_id: %s", outcome_id)
+        LOGGER.info(
+            "Outcome alert detected: outcome_id=%s symbol=%s result=%s hit_target=%s resend_unsent=%s force_resend=%s",
+            outcome_id,
+            updated_row.get("symbol", ""),
+            updated_result,
+            updated_row.get("hit_target", ""),
+            resend_unsent,
+            force_resend,
+        )
         sent = send_telegram_alert(session, build_outcome_alert(updated_row))
         if sent:
             stats.sent_alerts += 1
@@ -603,6 +642,7 @@ def run_review_cycle(notify: bool, session: requests.Session, lookahead_hours: i
             persist_journal(df)
         else:
             stats.skipped_alerts += 1
+            LOGGER.error("Outcome alert not marked sent because Telegram delivery failed: %s", outcome_id)
         time.sleep(0.2)
 
     persist_journal(df)
@@ -649,7 +689,15 @@ def main() -> int:
         return run_loop(notify=True, lookahead_hours=lookahead_hours, interval_seconds=interval_seconds)
 
     session = build_session()
-    run_review_cycle(notify=args.notify and not args.dry_run, session=session, lookahead_hours=lookahead_hours, print_report=True)
+    notify = (args.notify or args.resend_unsent or args.force_resend_outcome_alerts) and not args.dry_run
+    run_review_cycle(
+        notify=notify,
+        session=session,
+        lookahead_hours=lookahead_hours,
+        print_report=True,
+        resend_unsent=args.resend_unsent,
+        force_resend=args.force_resend_outcome_alerts,
+    )
     return 0
 
 

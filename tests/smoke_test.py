@@ -390,6 +390,118 @@ def test_outcome_alert_reports_only() -> None:
                 os.environ[key] = value
 
 
+def _closed_outcome_row() -> dict:
+    return {
+        "timestamp": "2026-05-28T00:00:00+00:00",
+        "closed_at": "2026-05-28T02:15:00+00:00",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "entry": 100,
+        "stop_loss": 98,
+        "tp1": 102,
+        "tp2": 104,
+        "risk_reward": 2.0,
+        "result": "WIN",
+        "hit_target": "TP2",
+        "signal_status": "sent",
+        "outcome_alert_sent": 0,
+        "outcome_alert_at": "",
+        "outcome_id": "",
+        "tp1_alert_sent": 0,
+        "tp2_alert_sent": 0,
+        "sl_alert_sent": 0,
+        "outcome_alert_sent_at": "",
+    }
+
+
+def test_outcome_alert_success_marks_sent_and_failure_does_not() -> None:
+    class FakeSession:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+            self.calls: list[tuple[str, str]] = []
+
+        def post(self, _url, data=None, timeout=None):
+            self.calls.append((data["chat_id"], data["text"]))
+            status = self.status_code
+
+            class Response:
+                status_code = status
+                text = "ok" if status == 200 else "telegram error"
+
+            return Response()
+
+    old_values = {
+        "SEND_TELEGRAM": os.environ.get("SEND_TELEGRAM"),
+        "SEND_OUTCOME_ALERTS": os.environ.get("SEND_OUTCOME_ALERTS"),
+        "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN"),
+        "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID"),
+        "TELEGRAM_REPORTS_CHAT_ID": os.environ.get("TELEGRAM_REPORTS_CHAT_ID"),
+    }
+    old_journal = review_signals.JOURNAL
+    old_history = review_signals.HISTORY
+    success_path = Path(tempfile.gettempdir()) / "outcome_success_smoke.csv"
+    fail_path = Path(tempfile.gettempdir()) / "outcome_fail_smoke.csv"
+    history_path = Path(tempfile.gettempdir()) / "outcome_history_smoke.csv"
+    rejected_path = history_path.with_name("rejected_signals_smoke.csv")
+    try:
+        os.environ["SEND_TELEGRAM"] = "1"
+        os.environ["SEND_OUTCOME_ALERTS"] = "1"
+        os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+        os.environ["TELEGRAM_CHAT_ID"] = "legacy"
+        os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports"
+        review_signals.HISTORY = history_path
+
+        pd.DataFrame([_closed_outcome_row()]).to_csv(success_path, index=False)
+        review_signals.JOURNAL = success_path
+        review_signals.PROCESSED_OUTCOMES.clear()
+        success_session = FakeSession(200)
+        stats = review_signals.run_review_cycle(
+            notify=True,
+            session=success_session,
+            lookahead_hours=24,
+            print_report=False,
+            resend_unsent=True,
+        )
+        saved = pd.read_csv(success_path)
+        assert stats.sent_alerts == 1
+        assert success_session.calls and success_session.calls[0][0] == "reports"
+        assert int(saved.loc[0, "outcome_alert_sent"]) == 1
+        assert str(saved.loc[0, "outcome_alert_at"]).strip()
+        assert str(saved.loc[0, "outcome_id"]).strip()
+
+        pd.DataFrame([_closed_outcome_row()]).to_csv(fail_path, index=False)
+        review_signals.JOURNAL = fail_path
+        review_signals.PROCESSED_OUTCOMES.clear()
+        fail_session = FakeSession(500)
+        stats = review_signals.run_review_cycle(
+            notify=True,
+            session=fail_session,
+            lookahead_hours=24,
+            print_report=False,
+            resend_unsent=True,
+        )
+        failed = pd.read_csv(fail_path)
+        assert stats.sent_alerts == 0
+        assert fail_session.calls and fail_session.calls[0][0] == "reports"
+        assert int(failed.loc[0, "outcome_alert_sent"]) == 0
+        assert str(failed.loc[0, "outcome_alert_at"]).strip() in {"", "nan"}
+        assert str(failed.loc[0, "outcome_id"]).strip() in {"", "nan"}
+    finally:
+        review_signals.JOURNAL = old_journal
+        review_signals.HISTORY = old_history
+        review_signals.PROCESSED_OUTCOMES.clear()
+        for key, value in old_values.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        for path in [success_path, fail_path, history_path, rejected_path]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def _wave_test_candles(kind: str = "bullish") -> pd.DataFrame:
     rows = []
     base_time = pd.Timestamp("2026-05-28T00:00:00Z")
@@ -1244,6 +1356,7 @@ def main() -> int:
     test_external_signal_score_threshold_and_routing()
     test_external_signal_approved_routes_to_signals_and_cornix_and_logs()
     test_outcome_alert_reports_only()
+    test_outcome_alert_success_marks_sent_and_failure_does_not()
     test_wave_bullish_higher_high_higher_low()
     test_wave_bearish_lower_high_lower_low()
     test_wave_range_or_unclear_and_score_bounds()
