@@ -99,6 +99,21 @@ def env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def telegram_channel_ids() -> dict[str, str]:
+    return {
+        "reports": os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip(),
+        "signals": os.getenv("TELEGRAM_SIGNALS_CHAT_ID", "").strip(),
+        "cornix": os.getenv("TELEGRAM_CORNIX_CHAT_ID", "").strip(),
+    }
+
+
+def log_telegram_startup_routes() -> None:
+    channels = telegram_channel_ids()
+    LOGGER.info("REPORTS_CHAT_ID=%s", channels["reports"] or "-")
+    LOGGER.info("SIGNALS_CHAT_ID=%s", channels["signals"] or "-")
+    LOGGER.info("CORNIX_CHAT_ID=%s", channels["cornix"] or "-")
+
+
 def build_session() -> requests.Session:
     retry = Retry(
         total=3,
@@ -381,13 +396,25 @@ def build_outcome_alert(row: pd.Series) -> str:
     )
 
 
-def send_telegram_alert(session: requests.Session, message: str) -> bool:
-    if not env_bool("SEND_TELEGRAM", True) or not env_bool("SEND_OUTCOME_ALERTS", True):
+def send_report_message(
+    session: requests.Session,
+    message: str,
+    label: str,
+    symbol: str = "-",
+    result: str = "-",
+    require_outcome_enabled: bool = True,
+) -> bool:
+    if not env_bool("SEND_TELEGRAM", True) or (require_outcome_enabled and not env_bool("SEND_OUTCOME_ALERTS", True)):
         LOGGER.info("Outcome alert skipped: SEND_TELEGRAM or SEND_OUTCOME_ALERTS is off")
         return False
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    reports_chat_id = os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip()
-    LOGGER.info("Outcome alert reports chat id target: %s", reports_chat_id or "-")
+    reports_chat_id = telegram_channel_ids()["reports"]
+    LOGGER.info(
+        "OUTCOME ALERT ROUTE chat_id=%s symbol=%s result=%s",
+        reports_chat_id or "-",
+        symbol or "-",
+        result or "-",
+    )
     if not token or not reports_chat_id:
         LOGGER.warning("Outcome alert skipped: Telegram token/reports chat id missing")
         return False
@@ -398,13 +425,28 @@ def send_telegram_alert(session: requests.Session, message: str) -> bool:
             timeout=20,
         )
     except requests.RequestException as exc:
-        LOGGER.error("Outcome alert Telegram send failed: %s", exc)
+        LOGGER.error("%s Telegram send failed: %s", label, exc)
         return False
     if response.status_code != 200:
-        LOGGER.error("Outcome alert Telegram send failed: status=%s body=%s", response.status_code, response.text)
+        LOGGER.error("%s Telegram send failed: status=%s body=%s", label, response.status_code, response.text)
         return False
-    LOGGER.info("Outcome alert Telegram send success: status=%s", response.status_code)
+    LOGGER.info("%s Telegram send success: status=%s", label, response.status_code)
     return True
+
+
+def send_telegram_alert(session: requests.Session, message: str, symbol: str = "-", result: str = "-") -> bool:
+    return send_report_message(session, message, "Outcome alert", symbol, result)
+
+
+def send_test_report(session: requests.Session) -> bool:
+    reports_chat_id = telegram_channel_ids()["reports"]
+    print(f"Test report destination chat id: {reports_chat_id or '-'}")
+    message = (
+        "🧪 Crypto Scanner Reports Channel Test\n"
+        "Destination: TELEGRAM_REPORTS_CHAT_ID only\n"
+        "No trade signal. No outcome update."
+    )
+    return send_report_message(session, message, "Test report", "TEST", "REPORT", require_outcome_enabled=False)
 
 
 def fetch_klines(session: requests.Session, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
@@ -545,6 +587,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Review outcomes without sending Telegram alerts.")
     parser.add_argument("--resend-unsent", action="store_true", help="Resend closed WIN/LOSS alerts where outcome_alert_sent is not 1.")
     parser.add_argument("--force-resend-outcome-alerts", action="store_true", help="Resend all closed WIN/LOSS outcome alerts, including already sent rows.")
+    parser.add_argument("--test-report", action="store_true", help="Send a diagnostic message to TELEGRAM_REPORTS_CHAT_ID only.")
     return parser.parse_args()
 
 
@@ -630,7 +673,12 @@ def run_review_cycle(
             resend_unsent,
             force_resend,
         )
-        sent = send_telegram_alert(session, build_outcome_alert(updated_row))
+        sent = send_telegram_alert(
+            session,
+            build_outcome_alert(updated_row),
+            str(updated_row.get("symbol", "")),
+            updated_result,
+        )
         if sent:
             stats.sent_alerts += 1
             PROCESSED_OUTCOMES.add(outcome_id)
@@ -678,6 +726,7 @@ def run_loop(notify: bool, lookahead_hours: int, interval_seconds: int) -> int:
 def main() -> int:
     args = parse_args()
     load_dotenv(BASE_DIR / ".env")
+    log_telegram_startup_routes()
     lookahead_hours = env_int("REVIEW_LOOKAHEAD_HOURS", 24)
     interval_seconds = env_int(
         "OUTCOME_LOOP_INTERVAL_SECONDS",
@@ -685,10 +734,13 @@ def main() -> int:
     )
     loop_mode = env_bool("OUTCOME_LOOP_MODE", False)
 
+    session = build_session()
+    if args.test_report:
+        return 0 if send_test_report(session) else 1
+
     if loop_mode:
         return run_loop(notify=True, lookahead_hours=lookahead_hours, interval_seconds=interval_seconds)
 
-    session = build_session()
     notify = (args.notify or args.resend_unsent or args.force_resend_outcome_alerts) and not args.dry_run
     run_review_cycle(
         notify=notify,

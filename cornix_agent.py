@@ -1309,6 +1309,9 @@ class TelegramNotifier:
     def __init__(self, config: ScannerConfig) -> None:
         self.config = config
         self.session = build_retry_session()
+        LOGGER.info("REPORTS_CHAT_ID=%s", self.config.telegram_reports_chat_id or "-")
+        LOGGER.info("SIGNALS_CHAT_ID=%s", self.config.telegram_signals_chat_id or "-")
+        LOGGER.info("CORNIX_CHAT_ID=%s", self.config.telegram_cornix_chat_id or "-")
 
     def _channel_chat_id(self, channel: str) -> str:
         mapping = {

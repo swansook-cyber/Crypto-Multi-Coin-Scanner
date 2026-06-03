@@ -369,11 +369,14 @@ def test_outcome_alert_reports_only() -> None:
     os.environ["TELEGRAM_CHAT_ID"] = "legacy"
     os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports"
     try:
-        assert review_signals.send_telegram_alert(FakeSession(), "TP1 HIT") is True
+        assert review_signals.send_telegram_alert(FakeSession(), "TP1 HIT", "BTCUSDT", "WIN") is True
         assert calls == [("reports", "TP1 HIT")]
+        calls.clear()
+        assert review_signals.send_test_report(FakeSession()) is True
+        assert calls == [("reports", "🧪 Crypto Scanner Reports Channel Test\nDestination: TELEGRAM_REPORTS_CHAT_ID only\nNo trade signal. No outcome update.")]
         os.environ["TELEGRAM_REPORTS_CHAT_ID"] = ""
         calls.clear()
-        assert review_signals.send_telegram_alert(FakeSession(), "SL HIT") is False
+        assert review_signals.send_telegram_alert(FakeSession(), "SL HIT", "BTCUSDT", "LOSS") is False
         assert calls == []
     finally:
         restore = {
