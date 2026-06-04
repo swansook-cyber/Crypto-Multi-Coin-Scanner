@@ -214,9 +214,10 @@ Dashboard V1:
 
 ```bash
 cd /opt/Crypto-Multi-Coin-Scanner
-.venv/bin/python dashboard.py
-ls -lh reports/dashboard.html
+.venv/bin/streamlit run dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
+
+Dashboard V1 is read-only. It reads CSV logs from `logs/` and does not send Telegram, call Binance, place trades, or modify logs.
 
 Position Management Advisor:
 
@@ -285,10 +286,10 @@ tail -n 220 logs/performance_report.txt
 tail -n 30 logs/equity_curve.csv
 ```
 
-Generated local dashboard:
+Dashboard service check:
 
 ```bash
-ls -lh reports/dashboard.html
+pgrep -af streamlit || echo "streamlit dashboard is not running"
 ```
 
 ## Health Check
@@ -371,6 +372,5 @@ No performance report/dashboard:
 ```bash
 cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python performance_report.py
-.venv/bin/python dashboard.py
-ls -lh reports/
+.venv/bin/streamlit run dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```

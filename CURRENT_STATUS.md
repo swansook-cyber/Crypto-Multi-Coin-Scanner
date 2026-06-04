@@ -28,7 +28,7 @@
 - Daily summary reporting
 - Daily Performance Report via `performance_report.py`
 - Complete Performance Analytics V1 via `core/performance_analytics_v1.py`
-- Dashboard V1 as local HTML via `dashboard.py`
+- Dashboard V1 as read-only Streamlit app via `dashboard.py`
 - Position Management Advisor via `position_manager.py`
 - External Signal Analyzer V1 via `external_signal_analyzer.py`
 - External Signal Inbox polling via `telegram_external_inbox.py`
@@ -90,7 +90,7 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 
 - Position Exit Advisor: pending
 - Advanced TP Engine: pending
-- Dashboard V1 improvements: ongoing
+- Dashboard V1 Streamlit usability improvements: ongoing
 - Confidence/setup strength calibration: pending more real outcome data
 
 ## Production Notes

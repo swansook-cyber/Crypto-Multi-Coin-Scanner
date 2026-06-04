@@ -250,10 +250,23 @@ This reads `logs/signals.csv` and focuses on closed outcomes, not just signal ac
 Run:
 
 ```bat
-python dashboard.py
+streamlit run dashboard.py
 ```
 
-This writes a lightweight local HTML dashboard to `reports/dashboard.html` with overview cards, latest signals, symbol/tier/session/direction performance, open positions, and recent TP/SL events.
+Dashboard V1 is a read-only Streamlit dashboard for local performance monitoring. It reads existing CSV logs only and never sends Telegram messages, calls Binance, modifies logs, or places trades.
+
+It shows KPI cards, win/loss by day, win rate by symbol/tier/session/direction, TP/SL distribution, score bucket performance, external VIP approval/rejection summary, recent signals, closed trades, best/worst symbols, open positions, and position manager history.
+
+Data sources:
+
+```text
+logs/signals.csv
+logs/daily_performance.csv
+logs/symbol_performance.csv
+logs/source_performance.csv
+logs/position_management.csv
+logs/external_signals.csv
+```
 
 ## Position Management Advisor
 
