@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,13 @@ EXTERNAL = BASE_DIR / "logs" / "external_signals.csv"
 LOGS_DIR = BASE_DIR / "logs"
 REPORTS_DIR = BASE_DIR / "reports"
 SMALL_SAMPLE_CLOSED_TRADES = 30
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+LOGGER = logging.getLogger("performance_report")
 
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -219,27 +227,54 @@ def persist_report(report: dict[str, Any], path: Path | None = None) -> Path:
     return output
 
 
-def send_telegram(message: str) -> bool:
+def reports_chat_id() -> str:
+    return os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip()
+
+
+def log_startup_route() -> None:
+    LOGGER.info("PERFORMANCE REPORT ROUTE chat_id=%s", reports_chat_id() or "-")
+
+
+def send_telegram(message: str, session: requests.Session | None = None) -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip()
+    chat_id = reports_chat_id()
+    LOGGER.info("PERFORMANCE REPORT ROUTE chat_id=%s", chat_id or "-")
     if not token or not chat_id:
-        print("Telegram skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_REPORTS_CHAT_ID missing")
+        LOGGER.warning("Performance report Telegram skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_REPORTS_CHAT_ID missing")
         return False
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data={"chat_id": chat_id, "text": message},
-        timeout=20,
-    )
+    client = session or requests.Session()
+    try:
+        response = client.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": message},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        LOGGER.error("Performance report Telegram failed: %s", exc)
+        return False
     if response.status_code != 200:
-        print(f"Telegram failed: {response.text}")
+        LOGGER.error("Performance report Telegram failed: status=%s body=%s", response.status_code, response.text)
         return False
+    LOGGER.info("Performance report Telegram send success: status=%s", response.status_code)
     return True
+
+
+def send_test_report() -> bool:
+    chat_id = reports_chat_id()
+    print(f"Performance report destination chat id: {chat_id or '-'}")
+    message = (
+        "🧪 Crypto Scanner Performance Report Test\n"
+        "Destination: TELEGRAM_REPORTS_CHAT_ID only\n"
+        "No signal. No trade execution."
+    )
+    return send_telegram(message)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create a daily performance report from closed outcomes.")
     parser.add_argument("--date", help="UTC date YYYY-MM-DD. Defaults to latest signal date.")
     parser.add_argument("--send", action="store_true", help="Send the report to Telegram.")
+    parser.add_argument("--test-report", action="store_true", help="Send a diagnostic message to TELEGRAM_REPORTS_CHAT_ID only.")
     parser.add_argument("--journal", type=Path, default=JOURNAL, help="Path to signals.csv.")
     parser.add_argument("--history", type=Path, default=HISTORY, help="Path to signals_history.csv.")
     parser.add_argument("--external", type=Path, default=EXTERNAL, help="Path to external_signals.csv.")
@@ -249,6 +284,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     load_dotenv(BASE_DIR / ".env")
     args = parse_args()
+    log_startup_route()
+    if args.test_report:
+        return 0 if send_test_report() else 1
     journal = load_csv_safely(args.journal)
     history = load_csv_safely(args.history)
     external = load_csv_safely(args.external)

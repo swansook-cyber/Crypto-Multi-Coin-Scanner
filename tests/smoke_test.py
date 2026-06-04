@@ -1031,6 +1031,45 @@ def test_daily_performance_report_metrics() -> None:
     assert "Short win rate:" in message
 
 
+def test_performance_report_routes_to_reports_only() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class FakeSession:
+        def post(self, _url, data=None, timeout=None):
+            calls.append((data["chat_id"], data["text"]))
+
+            class Response:
+                status_code = 200
+                text = "ok"
+
+            return Response()
+
+    old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    old_legacy = os.environ.get("TELEGRAM_CHAT_ID")
+    old_reports = os.environ.get("TELEGRAM_REPORTS_CHAT_ID")
+    os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+    os.environ["TELEGRAM_CHAT_ID"] = "legacy"
+    os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports"
+    try:
+        assert performance_report.send_telegram("Daily Performance Report", FakeSession()) is True
+        assert calls == [("reports", "Daily Performance Report")]
+        os.environ["TELEGRAM_REPORTS_CHAT_ID"] = ""
+        calls.clear()
+        assert performance_report.send_telegram("Daily Performance Report", FakeSession()) is False
+        assert calls == []
+    finally:
+        restore = {
+            "TELEGRAM_BOT_TOKEN": old_token,
+            "TELEGRAM_CHAT_ID": old_legacy,
+            "TELEGRAM_REPORTS_CHAT_ID": old_reports,
+        }
+        for key, value in restore.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_complete_performance_analytics_v1_outputs() -> None:
     journal = pd.DataFrame(
         [
@@ -1372,6 +1411,7 @@ def main() -> int:
     test_daily_summary_and_missing_telegram_env()
     test_analytics_report_and_journal_exports()
     test_daily_performance_report_metrics()
+    test_performance_report_routes_to_reports_only()
     test_complete_performance_analytics_v1_outputs()
     test_performance_analytics_production_mapping()
     test_dashboard_renders_html()

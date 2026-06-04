@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Crypto Scanner Performance Report daily
+
+[Timer]
+OnCalendar=*-*-* 23:58:00
+Persistent=true
+Unit=crypto-performance-report.service
+
+[Install]
+WantedBy=timers.target
+

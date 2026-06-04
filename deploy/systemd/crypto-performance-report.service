@@ -1,0 +1,10 @@
+[Unit]
+Description=Crypto Multi-Coin Scanner Performance Report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python /opt/Crypto-Multi-Coin-Scanner/performance_report.py --send
+
