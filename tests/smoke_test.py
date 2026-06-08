@@ -1450,6 +1450,24 @@ def test_dashboard_v2_handles_missing_and_empty_data() -> None:
 def test_position_manager_advice() -> None:
     now = pd.Timestamp("2026-05-30T12:00:00Z")
     path = Path(tempfile.gettempdir()) / "position_manager_smoke.csv"
+    original_snapshot = position_manager.fetch_position_snapshot
+
+    def fake_snapshot(_symbol: str) -> position_manager.PositionSnapshot:
+        return position_manager.PositionSnapshot(
+            current_price=101.0,
+            trend_status="bullish",
+            confirmation_15m="bullish",
+            volume_status="normal",
+            mfi=58.0,
+            atr_pct=0.75,
+            support=98.0,
+            resistance=104.0,
+            market_regime="Trending",
+            scanner_bias="LONG",
+            available=True,
+        )
+
+    position_manager.fetch_position_snapshot = fake_snapshot
     try:
         pd.DataFrame(
             [
@@ -1495,11 +1513,16 @@ def test_position_manager_advice() -> None:
         assert advice.should_send_signal is False
         assert advice.action == "position_review"
         assert "POSITION REVIEW" in advice.message
+        assert "Recommendation:" in advice.message
+        assert "Suggested actions:" in advice.message
+        assert "Current R:" in advice.message
+        assert "AI/System Analysis:" in advice.message
 
         fresh = {"symbol": "SOLUSDT", "direction": "LONG", "entry": 100}
         advice = position_manager.evaluate_new_signal(fresh, path, now=now)
         assert advice.should_send_signal is True
     finally:
+        position_manager.fetch_position_snapshot = original_snapshot
         try:
             path.unlink()
         except OSError:

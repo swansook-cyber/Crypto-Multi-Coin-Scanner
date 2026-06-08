@@ -299,7 +299,11 @@ def latest_signals(df: pd.DataFrame, limit: int = 25) -> pd.DataFrame:
 
 def open_positions(df: pd.DataFrame) -> pd.DataFrame:
     open_df = latest_open_positions(df)
-    columns = ["timestamp", "symbol", "side", "entry", "tp1", "tp2", "stop_loss", "watchlist_tier", "market_session"]
+    columns = [
+        "timestamp", "symbol", "side", "entry", "tp1", "tp2", "stop_loss",
+        "position_recommendation", "current_r", "distance_to_tp1_pct", "distance_to_sl_pct",
+        "position_confidence", "position_reason", "watchlist_tier", "market_session",
+    ]
     available = [column for column in columns if column in open_df.columns]
     if open_df.empty:
         return pd.DataFrame(columns=available)

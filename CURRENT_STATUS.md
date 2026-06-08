@@ -29,7 +29,7 @@
 - Daily Performance Report via `performance_report.py`
 - Complete Performance Analytics V1 via `core/performance_analytics_v1.py`
 - Dashboard V2 as read-only Streamlit analytics app via `dashboard.py`
-- Position Management Advisor via `position_manager.py`
+- Position Management Advisor V2 via `position_manager.py`
 - External Signal Refine V2 via `external_signal_analyzer.py`
 - External Signal Inbox polling via `telegram_external_inbox.py`
 - External inbox VPS listener loop via `telegram_external_inbox.py --loop`

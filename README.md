@@ -280,7 +280,7 @@ Run:
 python position_manager.py
 ```
 
-The advisor reads open signals from `logs/signals.csv` and flags duplicate, opposite, or stale positions. It is Telegram advisory only and never places orders.
+The advisor reads open signals from `logs/signals.csv` and flags duplicate, opposite, or stale positions. V2 adds action guidance such as KEEP POSITION, HOLD WITH CAUTION, REDUCE RISK, EARLY EXIT, or WAIT / NO ACTION. It is Telegram advisory only and never places orders.
 
 ## Data-Driven Validation
 

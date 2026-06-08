@@ -13,7 +13,7 @@
 - Daily Performance Report is implemented through `performance_report.py`
 - Complete Performance Analytics V1 is implemented for scanner, external, and position-management logs
 - Dashboard V2 is implemented as a read-only Streamlit analytics app through `dashboard.py`
-- Position Management Advisor is implemented through `position_manager.py` and scanner Telegram advisory routing
+- Position Management Advisor V2 is implemented through `position_manager.py` with action-guided Telegram advisory routing
 - External Signal Refine V2 is implemented as approved-only routing with scanner-style market re-analysis for forwarded VIP signals
 - Telegram Channel Routing V1 is implemented so Signals, Cornix, and Reports have separate responsibilities
 - Production monitoring now focuses on collecting enough clean outcomes for calibration decisions
