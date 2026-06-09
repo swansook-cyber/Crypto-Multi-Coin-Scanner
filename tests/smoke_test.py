@@ -374,6 +374,13 @@ def test_external_signal_approved_routes_to_signals_and_cornix_and_logs() -> Non
         assert logged.loc[0, "scanner_agreement"] == "YES"
         assert int(logged.loc[0, "refine_score"]) == 90
         assert logged.loc[0, "trend_1h"] == "bullish"
+        assert logged.loc[0, "status"] == "APPROVED"
+        assert logged.loc[0, "direction"] == "LONG"
+        assert float(logged.loc[0, "entry"]) > 0
+        assert float(logged.loc[0, "sl"]) > 0
+        assert int(logged.loc[0, "setup_strength"]) >= 70
+        assert "RR acceptable" in str(logged.loc[0, "approved_reason"])
+        assert logged.loc[0, "result"] == "OPEN"
     finally:
         external_signal_analyzer.send_telegram_message = original_send
         external_signal_analyzer.perform_refine_analysis = original_refine
@@ -429,6 +436,8 @@ def test_external_signal_refine_conflict_not_approved_or_routed() -> None:
         assert logged.loc[0, "sent_to_cornix"] == "NO"
         assert logged.loc[0, "scanner_agreement"] == "NO"
         assert "scanner_direction" in str(logged.loc[0, "conflict_reason"])
+        assert logged.loc[0, "status"] == "REJECTED"
+        assert "trend conflict" in str(logged.loc[0, "reject_reason"]).lower()
     finally:
         external_signal_analyzer.send_telegram_message = original_send
         external_signal_analyzer.perform_refine_analysis = original_refine
@@ -535,10 +544,12 @@ def test_outcome_alert_success_marks_sent_and_failure_does_not() -> None:
     }
     old_journal = review_signals.JOURNAL
     old_history = review_signals.HISTORY
+    old_external = review_signals.EXTERNAL_SIGNALS
     success_path = Path(tempfile.gettempdir()) / "outcome_success_smoke.csv"
     fail_path = Path(tempfile.gettempdir()) / "outcome_fail_smoke.csv"
     history_path = Path(tempfile.gettempdir()) / "outcome_history_smoke.csv"
     rejected_path = history_path.with_name("rejected_signals_smoke.csv")
+    external_path = Path(tempfile.gettempdir()) / "missing_external_outcome_smoke.csv"
     try:
         os.environ["SEND_TELEGRAM"] = "1"
         os.environ["SEND_OUTCOME_ALERTS"] = "1"
@@ -546,6 +557,7 @@ def test_outcome_alert_success_marks_sent_and_failure_does_not() -> None:
         os.environ["TELEGRAM_CHAT_ID"] = "legacy"
         os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports"
         review_signals.HISTORY = history_path
+        review_signals.EXTERNAL_SIGNALS = external_path
 
         pd.DataFrame([_closed_outcome_row()]).to_csv(success_path, index=False)
         review_signals.JOURNAL = success_path
@@ -585,6 +597,7 @@ def test_outcome_alert_success_marks_sent_and_failure_does_not() -> None:
     finally:
         review_signals.JOURNAL = old_journal
         review_signals.HISTORY = old_history
+        review_signals.EXTERNAL_SIGNALS = old_external
         review_signals.PROCESSED_OUTCOMES.clear()
         for key, value in old_values.items():
             if value is None:
@@ -802,6 +815,63 @@ def test_review_old_journal_columns() -> None:
     finally:
         review_signals.JOURNAL = old
         review_signals.PROCESSED_OUTCOMES.clear()
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def test_external_approved_outcome_tracking_updates_csv() -> None:
+    path = Path(tempfile.gettempdir()) / "external_outcome_tracking_smoke.csv"
+    old_external = review_signals.EXTERNAL_SIGNALS
+    old_fetch = review_signals.fetch_klines
+
+    def fake_fetch(_session, _symbol, _start_ms, _end_ms):
+        return pd.DataFrame(
+            [
+                {
+                    "open_time": pd.Timestamp("2026-05-28T00:00:00Z"),
+                    "close_time": pd.Timestamp("2026-05-28T00:15:00Z"),
+                    "open": 100.0,
+                    "high": 104.2,
+                    "low": 99.5,
+                    "close": 103.0,
+                }
+            ]
+        )
+
+    try:
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-05-28T00:00:00+00:00",
+                    "source_type": "external",
+                    "symbol": "NEARUSDT",
+                    "direction": "LONG",
+                    "entry": 100.0,
+                    "sl": 98.0,
+                    "tp1": 102.0,
+                    "tp2": 104.0,
+                    "recommendation": "APPROVED",
+                    "status": "APPROVED",
+                    "sent_to_signals": "YES",
+                    "sent_to_cornix": "YES",
+                    "result": "OPEN",
+                }
+            ]
+        ).to_csv(path, index=False)
+        review_signals.EXTERNAL_SIGNALS = path
+        review_signals.fetch_klines = fake_fetch
+        stats = review_signals.review_external_signals(review_signals.build_session(), lookahead_hours=24)
+        saved = pd.read_csv(path)
+        assert stats.tp_hits == 1
+        assert saved.loc[0, "result"] == "WIN"
+        assert saved.loc[0, "hit_target"] == "TP2"
+        assert float(saved.loc[0, "net_r_estimate"]) == 2.0
+        assert float(saved.loc[0, "holding_minutes"]) == 15.0
+    finally:
+        review_signals.EXTERNAL_SIGNALS = old_external
+        review_signals.fetch_klines = old_fetch
         try:
             path.unlink()
         except OSError:
@@ -1265,18 +1335,45 @@ def test_complete_performance_analytics_v1_outputs() -> None:
                 "tp2": 2.7,
                 "tp3": 3.0,
                 "analysis_score": 86,
+                "setup_strength": 86,
                 "recommendation": "APPROVED",
+                "status": "APPROVED",
                 "sent_to_signals": "YES",
                 "sent_to_cornix": "YES",
                 "parse_status": "SUCCESS",
+                "result": "WIN",
+                "hit_target": "TP2",
+                "net_r_estimate": 1.8,
+                "max_profit_pct": 8.0,
+                "max_drawdown_pct": -0.5,
+                "holding_minutes": 45,
+                "approved_reason": "RR acceptable; trend aligned",
             },
             {
                 "timestamp_utc": "2026-05-30T07:00:00+00:00",
                 "symbol": "XRPUSDT",
                 "recommendation": "FAILED",
+                "status": "REJECTED",
                 "sent_to_signals": "NO",
                 "sent_to_cornix": "NO",
                 "parse_status": "FAILED",
+                "reject_reason": "missing stop loss",
+                "result": "EXPIRED",
+            },
+            {
+                "timestamp_utc": "2026-05-30T08:00:00+00:00",
+                "symbol": "ADAUSDT",
+                "side": "SHORT",
+                "entry": 1.0,
+                "stop_loss": 1.02,
+                "tp1": 0.98,
+                "analysis_score": 82,
+                "recommendation": "APPROVED",
+                "status": "APPROVED",
+                "sent_to_signals": "YES",
+                "sent_to_cornix": "YES",
+                "parse_status": "SUCCESS",
+                "result": "OPEN",
             },
         ]
     )
@@ -1290,9 +1387,17 @@ def test_complete_performance_analytics_v1_outputs() -> None:
     assert report["opposite_signal_count"] == 1
     assert report["exit_recommendation_count"] == 1
     assert report["stale_position_count"] == 1
-    assert report["external_total"] == 2
-    assert report["external_approved"] == 1
+    assert report["external_total"] == 3
+    assert report["external_approved"] == 2
     assert report["external_rejected"] == 1
+    assert report["external_wins"] == 1
+    assert report["external_losses"] == 0
+    assert report["external_open"] == 1
+    assert report["external_win_rate"] == 100.0
+    assert report["external_net_r_estimate"] == 1.8
+    assert "missing stop loss" in report["external_top_reject_reasons"]
+    assert "NEARUSDT" in report["external_top_approved_symbols"]
+    assert "XRPUSDT" in report["external_top_rejected_symbols"]
     assert not tables["symbol_performance"].empty
     assert not tables["source_performance"].empty
 
@@ -1549,6 +1654,7 @@ def main() -> int:
     test_loss_cooldown_three_losses_and_missing_journal()
     test_scanner_survives_wave_analyzer_failure()
     test_review_old_journal_columns()
+    test_external_approved_outcome_tracking_updates_csv()
     test_stats_old_and_new_fields()
     test_outcome_message_and_dedupe()
     test_daily_summary_and_missing_telegram_env()

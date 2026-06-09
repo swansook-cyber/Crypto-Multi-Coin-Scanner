@@ -180,62 +180,95 @@ def normalize_scanner_data(df: pd.DataFrame, source: str = "scanner") -> pd.Data
 def normalize_external_data(df: pd.DataFrame) -> pd.DataFrame:
     defaults = {
         "timestamp_utc": "",
+        "timestamp": "",
         "source": "external",
+        "source_type": "external",
         "symbol": "",
         "side": "",
+        "direction": "",
         "entry_low": "",
         "entry_high": "",
+        "entry": "",
         "stop_loss": "",
+        "sl": "",
         "tp1": "",
         "tp2": "",
         "tp3": "",
         "recommendation": "",
+        "status": "",
         "analysis_score": "",
+        "confidence": "",
+        "setup_strength": "",
+        "rr": "",
+        "mfi": "",
+        "atr_pct": "",
+        "market_regime": "",
+        "btc_regime": "",
+        "htf_alignment": "",
+        "volume_spike": "",
+        "reject_reason": "",
+        "approved_reason": "",
+        "result": "OPEN",
+        "hit_target": "",
+        "closed_at": "",
+        "max_profit_pct": "",
+        "max_drawdown_pct": "",
+        "holding_minutes": "",
+        "net_r_estimate": "",
         "sent_to_signals": "NO",
         "sent_to_cornix": "NO",
         "parse_status": "",
     }
     data = _ensure(df, defaults)
     normalized = pd.DataFrame(index=data.index)
-    normalized["timestamp"] = _date_series(data["timestamp_utc"])
-    normalized["closed_at"] = pd.NaT
+    timestamp_source = data["timestamp"].where(data["timestamp"].fillna("").astype(str).str.strip().ne(""), data["timestamp_utc"])
+    normalized["timestamp"] = _date_series(timestamp_source)
+    normalized["closed_at"] = _date_series(data["closed_at"])
     normalized["symbol"] = data["symbol"].fillna("").astype(str).str.upper()
-    normalized["side"] = data["side"].fillna("").astype(str).str.upper()
+    side_source = data["direction"].where(data["direction"].fillna("").astype(str).str.strip().ne(""), data["side"])
+    normalized["side"] = side_source.fillna("").astype(str).str.upper()
     normalized["tier"] = "External"
     normalized["session"] = "External"
     entry_low = _num(data["entry_low"])
     entry_high = _num(data["entry_high"])
-    normalized["entry"] = pd.concat([entry_low, entry_high], axis=1).mean(axis=1)
-    normalized["sl"] = _num(data["stop_loss"])
+    explicit_entry = _num(data["entry"])
+    normalized["entry"] = explicit_entry.fillna(pd.concat([entry_low, entry_high], axis=1).mean(axis=1))
+    explicit_sl = _num(data["sl"])
+    normalized["sl"] = explicit_sl.fillna(_num(data["stop_loss"]))
     normalized["tp1"] = _num(data["tp1"])
     normalized["tp2"] = _num(data["tp2"])
     normalized["tp3"] = _num(data["tp3"])
-    normalized["rr"] = pd.NA
-    normalized["real_rr"] = pd.NA
-    normalized["setup_strength"] = _num(data["analysis_score"])
+    normalized["rr"] = _num(data["rr"])
+    normalized["real_rr"] = _num(data["net_r_estimate"])
+    normalized["setup_strength"] = _num(data["setup_strength"]).fillna(_num(data["confidence"])).fillna(_num(data["analysis_score"]))
     normalized["score"] = _num(data["analysis_score"])
-    normalized["market_regime"] = NA
-    normalized["btc_regime"] = NA
-    normalized["htf_alignment"] = NA
-    normalized["volume_spike"] = NA
-    normalized["mfi"] = pd.NA
-    normalized["atr"] = pd.NA
+    normalized["market_regime"] = data["market_regime"].fillna(NA).replace("", NA).astype(str)
+    normalized["btc_regime"] = data["btc_regime"].fillna(NA).replace("", NA).astype(str).str.lower()
+    normalized["htf_alignment"] = data["htf_alignment"].fillna(NA).replace("", NA).astype(str)
+    normalized["volume_spike"] = data["volume_spike"].fillna(NA).replace("", NA).astype(str)
+    normalized["mfi"] = _num(data["mfi"])
+    normalized["atr"] = _num(data["atr_pct"])
     normalized["body_percent"] = pd.NA
     normalized["atr_expansion"] = pd.NA
-    normalized["result"] = "OPEN"
-    normalized["hit_target"] = ""
+    normalized["result"] = data["result"].fillna("OPEN").replace("", "OPEN").astype(str).str.upper()
+    normalized["hit_target"] = data["hit_target"].fillna("").astype(str).str.upper()
     normalized["outcome"] = data["recommendation"].fillna("").astype(str).str.upper()
     normalized["pnl_percent"] = pd.NA
-    normalized["holding_minutes"] = pd.NA
-    normalized["max_profit_pct"] = pd.NA
-    normalized["max_drawdown_pct"] = pd.NA
-    normalized["signal_status"] = data["recommendation"].fillna("").astype(str).str.upper().map(lambda value: "sent" if value == "APPROVED" else "rejected")
-    normalized["skip_reason"] = data["recommendation"].fillna("").astype(str)
+    normalized["holding_minutes"] = _num(data["holding_minutes"])
+    normalized["max_profit_pct"] = _num(data["max_profit_pct"])
+    normalized["max_drawdown_pct"] = _num(data["max_drawdown_pct"])
+    status_source = data["status"].where(data["status"].fillna("").astype(str).str.strip().ne(""), data["recommendation"])
+    normalized["signal_status"] = status_source.fillna("").astype(str).str.upper().map(lambda value: "sent" if value == "APPROVED" else "rejected")
+    reject_reason = data["reject_reason"].fillna("").astype(str)
+    normalized["skip_reason"] = reject_reason.where(reject_reason.str.strip().ne(""), data["recommendation"].fillna("").astype(str))
     normalized["source"] = "external"
     normalized["sent_to_signals"] = data["sent_to_signals"].fillna("NO").astype(str).str.upper()
     normalized["sent_to_cornix"] = data["sent_to_cornix"].fillna("NO").astype(str).str.upper()
     normalized["parse_status"] = data["parse_status"].fillna("").astype(str).str.upper()
     normalized["recommendation"] = data["recommendation"].fillna("").astype(str).str.upper()
+    normalized["status"] = status_source.fillna("").astype(str).str.upper()
+    normalized["reject_reason"] = data["reject_reason"].fillna("").astype(str)
+    normalized["approved_reason"] = data["approved_reason"].fillna("").astype(str)
     return normalized
 
 
@@ -503,12 +536,29 @@ def external_counts(external_df: pd.DataFrame, date: str | None = None) -> dict[
             "external_approval_rate": None,
             "external_top_reject_reasons": NA,
             "external_top_approved_symbols": NA,
+            "external_top_rejected_symbols": NA,
+            "external_wins": 0,
+            "external_losses": 0,
+            "external_open": 0,
+            "external_win_rate": None,
+            "external_net_r_estimate": 0.0,
         }
     approved = data["recommendation"].eq("APPROVED")
     rejected = ~approved
+    approved_data = data[approved].copy()
+    external_wins = int((approved_data["result"] == "WIN").sum())
+    external_losses = int((approved_data["result"] == "LOSS").sum())
+    external_open = int((approved_data["result"] == "OPEN").sum())
+    external_closed = external_wins + external_losses
+    net_r_values = pd.to_numeric(approved_data["real_rr"], errors="coerce").fillna(0)
     top_approved_symbols = (
         data.loc[approved, "symbol"].replace("", NA).value_counts().head(5)
         if approved.any()
+        else pd.Series(dtype=int)
+    )
+    top_rejected_symbols = (
+        data.loc[rejected, "symbol"].replace("", NA).value_counts().head(5)
+        if rejected.any()
         else pd.Series(dtype=int)
     )
     reject_reasons = data.loc[rejected, "skip_reason"].fillna("").astype(str)
@@ -524,6 +574,12 @@ def external_counts(external_df: pd.DataFrame, date: str | None = None) -> dict[
         "external_approval_rate": safe_percent(int(approved.sum()), int(len(data))),
         "external_top_reject_reasons": ", ".join(f"{key}: {count}" for key, count in top_reject_reasons.items()) if not top_reject_reasons.empty else NA,
         "external_top_approved_symbols": ", ".join(f"{key}: {count}" for key, count in top_approved_symbols.items()) if not top_approved_symbols.empty else NA,
+        "external_top_rejected_symbols": ", ".join(f"{key}: {count}" for key, count in top_rejected_symbols.items()) if not top_rejected_symbols.empty else NA,
+        "external_wins": external_wins,
+        "external_losses": external_losses,
+        "external_open": external_open,
+        "external_win_rate": safe_percent(external_wins, external_closed),
+        "external_net_r_estimate": float(net_r_values.sum()),
     }
 
 

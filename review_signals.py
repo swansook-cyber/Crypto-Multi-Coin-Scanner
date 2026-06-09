@@ -27,6 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
 HISTORY = BASE_DIR / "logs" / "signals_history.csv"
 REJECTED = BASE_DIR / "logs" / "rejected_signals.csv"
+EXTERNAL_SIGNALS = BASE_DIR / "logs" / "external_signals.csv"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 ERROR_RETRY_SECONDS = 60
 
@@ -62,6 +63,26 @@ OUTCOME_COLUMNS = {
     "tp2_alert_sent": 0,
     "sl_alert_sent": 0,
     "outcome_alert_sent_at": "",
+}
+
+EXTERNAL_OUTCOME_COLUMNS = {
+    "timestamp": "",
+    "source_type": "external",
+    "direction": "",
+    "entry": "",
+    "sl": "",
+    "confidence": "",
+    "setup_strength": "",
+    "status": "",
+    "reject_reason": "",
+    "approved_reason": "",
+    "result": "OPEN",
+    "hit_target": "",
+    "closed_at": "",
+    "max_profit_pct": "",
+    "max_drawdown_pct": "",
+    "holding_minutes": "",
+    "net_r_estimate": "",
 }
 
 PROCESSED_OUTCOMES: set[str] = set()
@@ -233,6 +254,65 @@ def persist_journal(df: pd.DataFrame) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     LOGGER.info("CSV persisted: %s", JOURNAL)
+
+
+def ensure_external_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for column, default in EXTERNAL_OUTCOME_COLUMNS.items():
+        if column not in df.columns:
+            df[column] = default
+        df[column] = df[column].astype("object")
+
+    if "timestamp_utc" in df.columns:
+        empty_timestamp = df["timestamp"].fillna("").astype(str).str.strip().eq("")
+        df.loc[empty_timestamp, "timestamp"] = df.loc[empty_timestamp, "timestamp_utc"]
+    if "side" in df.columns:
+        empty_direction = df["direction"].fillna("").astype(str).str.strip().eq("")
+        df.loc[empty_direction, "direction"] = df.loc[empty_direction, "side"]
+    if "entry_low" in df.columns and "entry_high" in df.columns:
+        entry_low = pd.to_numeric(df["entry_low"], errors="coerce")
+        entry_high = pd.to_numeric(df["entry_high"], errors="coerce")
+        mid_entry = pd.concat([entry_low, entry_high], axis=1).mean(axis=1)
+        empty_entry = df["entry"].fillna("").astype(str).str.strip().eq("")
+        df.loc[empty_entry, "entry"] = mid_entry.loc[empty_entry]
+    if "stop_loss" in df.columns:
+        empty_sl = df["sl"].fillna("").astype(str).str.strip().eq("")
+        df.loc[empty_sl, "sl"] = df.loc[empty_sl, "stop_loss"]
+    if "analysis_score" in df.columns:
+        empty_strength = df["setup_strength"].fillna("").astype(str).str.strip().eq("")
+        df.loc[empty_strength, "setup_strength"] = df.loc[empty_strength, "analysis_score"]
+        empty_confidence = df["confidence"].fillna("").astype(str).str.strip().eq("")
+        df.loc[empty_confidence, "confidence"] = df.loc[empty_confidence, "analysis_score"]
+    if "recommendation" in df.columns:
+        empty_status = df["status"].fillna("").astype(str).str.strip().eq("")
+        mapped = df["recommendation"].fillna("").astype(str).str.upper().map(
+            lambda value: "APPROVED" if value == "APPROVED" else "REJECTED"
+        )
+        df.loc[empty_status, "status"] = mapped.loc[empty_status]
+    return df
+
+
+def load_external_signals() -> pd.DataFrame | None:
+    if not EXTERNAL_SIGNALS.exists():
+        LOGGER.info("No external signal log found at logs/external_signals.csv")
+        return None
+    try:
+        df = pd.read_csv(EXTERNAL_SIGNALS)
+    except pd.errors.EmptyDataError:
+        LOGGER.info("External signal log is empty.")
+        return None
+    if df.empty:
+        LOGGER.info("External signal log is empty.")
+        return None
+    return ensure_external_columns(df)
+
+
+def persist_external_signals(df: pd.DataFrame) -> None:
+    EXTERNAL_SIGNALS.parent.mkdir(parents=True, exist_ok=True)
+    with EXTERNAL_SIGNALS.open("w", newline="", encoding="utf-8") as handle:
+        df.to_csv(handle, index=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    LOGGER.info("External signal CSV persisted: %s", EXTERNAL_SIGNALS)
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -538,6 +618,123 @@ def review_signal(session: requests.Session, row: pd.Series, lookahead_hours: in
     return evaluate_outcome(row, candles)
 
 
+def is_external_approved(row: pd.Series) -> bool:
+    status = str(row.get("status", "") or "").strip().upper()
+    recommendation = str(row.get("recommendation", "") or "").strip().upper()
+    sent_to_signals = str(row.get("sent_to_signals", "") or "").strip().upper()
+    return status == "APPROVED" or recommendation == "APPROVED" or sent_to_signals == "YES"
+
+
+def external_review_row(row: pd.Series) -> pd.Series | None:
+    timestamp = row.get("timestamp", row.get("timestamp_utc", ""))
+    symbol = clean_symbol(row.get("symbol", ""))
+    side = str(row.get("direction", row.get("side", "")) or "").strip().upper()
+    entry = safe_float(row.get("entry"))
+    if entry <= 0:
+        low = safe_float(row.get("entry_low"))
+        high = safe_float(row.get("entry_high"))
+        values = [value for value in [low, high] if value > 0]
+        entry = sum(values) / len(values) if values else 0.0
+    stop_loss = safe_float(row.get("sl", row.get("stop_loss")))
+    tp1 = safe_float(row.get("tp1"))
+    tp2 = safe_float(row.get("tp2"), tp1)
+
+    if not timestamp or not symbol or side not in {"LONG", "SHORT"} or entry <= 0 or stop_loss <= 0 or tp1 <= 0:
+        return None
+    if tp2 <= 0:
+        tp2 = tp1
+
+    return pd.Series(
+        {
+            "timestamp": timestamp,
+            "symbol": symbol,
+            "side": side,
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "tp1": tp1,
+            "tp2": tp2,
+        }
+    )
+
+
+def net_r_from_external(row: pd.Series, outcome: Outcome) -> float:
+    result = outcome.result.upper()
+    if result == "LOSS":
+        return -1.0
+    if result != "WIN":
+        return 0.0
+    side = str(row.get("direction", row.get("side", "")) or "").upper()
+    entry = safe_float(row.get("entry"))
+    if entry <= 0:
+        low = safe_float(row.get("entry_low"))
+        high = safe_float(row.get("entry_high"))
+        values = [value for value in [low, high] if value > 0]
+        entry = sum(values) / len(values) if values else 0.0
+    stop_loss = safe_float(row.get("sl", row.get("stop_loss")))
+    target_column = "tp2" if outcome.hit_target.upper() == "TP2" else "tp1"
+    target = safe_float(row.get(target_column))
+    risk_pct = abs(entry - stop_loss) / entry * 100 if entry > 0 else 0.0
+    if risk_pct <= 0 or target <= 0:
+        rr = safe_float(row.get("rr"))
+        return rr if outcome.hit_target.upper() == "TP2" and rr > 0 else 1.0
+    profit_pct = abs(target - entry) / entry * 100
+    return profit_pct / risk_pct
+
+
+def review_external_signals(session: requests.Session, lookahead_hours: int) -> ReviewStats:
+    stats = ReviewStats()
+    df = load_external_signals()
+    if df is None:
+        return stats
+
+    changed = False
+    for index, row in df.iterrows():
+        if not is_external_approved(row):
+            continue
+        if str(row.get("result", "OPEN") or "OPEN").upper() not in {"", "OPEN", "NAN"}:
+            continue
+        review_row = external_review_row(row)
+        if review_row is None:
+            LOGGER.info("External outcome skipped: incomplete approved row message_id=%s", row.get("message_id", ""))
+            continue
+        try:
+            outcome = review_signal(session, review_row, lookahead_hours)
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            stats.errors += 1
+            LOGGER.error("External outcome review skipped for %s: %s", review_row.get("symbol", "UNKNOWN"), exc)
+            continue
+
+        stats.open_trades += int(outcome.result == "OPEN")
+        df.at[index, "result"] = outcome.result
+        df.at[index, "hit_target"] = outcome.hit_target
+        df.at[index, "closed_at"] = outcome.closed_at
+        df.at[index, "max_profit_pct"] = f"{outcome.max_profit_pct:.2f}"
+        df.at[index, "max_drawdown_pct"] = f"{outcome.max_drawdown_pct:.2f}"
+        df.at[index, "net_r_estimate"] = f"{net_r_from_external(row, outcome):.4f}"
+        if outcome.closed_at:
+            start = pd.to_datetime(review_row["timestamp"], utc=True, errors="coerce")
+            end = pd.to_datetime(outcome.closed_at, utc=True, errors="coerce")
+            if not pd.isna(start) and not pd.isna(end):
+                df.at[index, "holding_minutes"] = f"{max(0, (end - start).total_seconds() / 60):.1f}"
+        if outcome.result == "WIN":
+            stats.tp_hits += 1
+        elif outcome.result == "LOSS":
+            stats.sl_hits += 1
+        changed = True
+        LOGGER.info(
+            "External outcome reviewed: symbol=%s result=%s hit_target=%s net_r=%s",
+            review_row.get("symbol", ""),
+            outcome.result,
+            outcome.hit_target or "-",
+            df.at[index, "net_r_estimate"],
+        )
+        time.sleep(0.2)
+
+    if changed:
+        persist_external_signals(df)
+    return stats
+
+
 def print_summary(df: pd.DataFrame) -> None:
     total = len(df)
     wins = int((df["result"] == "WIN").sum())
@@ -695,6 +892,11 @@ def run_review_cycle(
 
     persist_journal(df)
     sync_signal_history(df)
+    external_stats = review_external_signals(session, lookahead_hours)
+    stats.open_trades += external_stats.open_trades
+    stats.tp_hits += external_stats.tp_hits
+    stats.sl_hits += external_stats.sl_hits
+    stats.errors += external_stats.errors
     if print_report:
         print_summary(df)
     return stats

@@ -33,13 +33,18 @@ LOGGER = logging.getLogger("external_signal_analyzer")
 
 FIELDNAMES = [
     "timestamp_utc",
+    "timestamp",
     "source",
+    "source_type",
     "message_id",
     "symbol",
     "side",
+    "direction",
     "entry_low",
     "entry_high",
+    "entry",
     "stop_loss",
+    "sl",
     "tp1",
     "tp2",
     "tp3",
@@ -48,8 +53,13 @@ FIELDNAMES = [
     "raw_text",
     "parse_status",
     "analysis_score",
+    "confidence",
+    "setup_strength",
     "recommendation",
+    "status",
     "reason",
+    "reject_reason",
+    "approved_reason",
     "rr",
     "refine_status",
     "refine_score",
@@ -68,6 +78,13 @@ FIELDNAMES = [
     "volume_ratio",
     "volume_spike",
     "market_regime",
+    "result",
+    "hit_target",
+    "closed_at",
+    "max_profit_pct",
+    "max_drawdown_pct",
+    "holding_minutes",
+    "net_r_estimate",
     "sent_to_signals",
     "sent_to_cornix",
 ]
@@ -271,6 +288,36 @@ def calculate_rr(parsed: ParsedExternalSignal) -> float:
     if risk <= 0 or reward <= 0:
         return 0.0
     return reward / risk
+
+
+def readable_reasons(analysis: ExternalSignalAnalysis) -> tuple[str, str]:
+    reject_map = [
+        ("RR below", "RR below threshold"),
+        ("volume", "weak volume"),
+        ("conflicts with scanner", "trend conflict"),
+        ("MFI does not", "MFI not confirmed"),
+        ("sideway", "market regime not suitable"),
+        ("ATR is too low", "low volatility"),
+        ("Fresh market data unavailable", "market data unavailable"),
+        ("stop loss missing", "missing stop loss"),
+        ("entry missing", "missing entry"),
+        ("target missing", "missing target"),
+        ("symbol missing", "missing symbol"),
+        ("side missing", "missing direction"),
+    ]
+    approved = []
+    rejected = []
+    for reason in analysis.reason:
+        clean = re.sub(r"^[✅❌⚠️\s]+", "", str(reason)).strip()
+        if not clean:
+            continue
+        if analysis.recommendation == "APPROVED":
+            approved.append(clean)
+        else:
+            matched = next((label for needle, label in reject_map if needle.lower() in clean.lower()), clean)
+            if matched not in rejected:
+                rejected.append(matched)
+    return " | ".join(rejected), " | ".join(approved)
 
 
 def _latest_float(df: pd.DataFrame, column: str, default: float = 0.0) -> float:
@@ -650,13 +697,18 @@ def ensure_log(path: Path = EXTERNAL_SIGNALS_CSV) -> None:
         migrated.append(
             {
                 "timestamp_utc": row.get("timestamp_utc", ""),
+                "timestamp": row.get("timestamp", row.get("timestamp_utc", "")),
                 "source": row.get("source", "External Signal Inbox"),
+                "source_type": row.get("source_type", "external"),
                 "message_id": row.get("message_id", ""),
                 "symbol": row.get("symbol", ""),
                 "side": row.get("side", ""),
+                "direction": row.get("direction", row.get("side", "")),
                 "entry_low": row.get("entry_low", ""),
                 "entry_high": row.get("entry_high", ""),
+                "entry": row.get("entry", ""),
                 "stop_loss": row.get("stop_loss", ""),
+                "sl": row.get("sl", row.get("stop_loss", "")),
                 "tp1": row.get("tp1", ""),
                 "tp2": row.get("tp2", ""),
                 "tp3": row.get("tp3", ""),
@@ -665,8 +717,13 @@ def ensure_log(path: Path = EXTERNAL_SIGNALS_CSV) -> None:
                 "raw_text": row.get("raw_text", ""),
                 "parse_status": row.get("parse_status", ""),
                 "analysis_score": row.get("analysis_score", ""),
+                "confidence": row.get("confidence", row.get("analysis_score", "")),
+                "setup_strength": row.get("setup_strength", row.get("analysis_score", "")),
                 "recommendation": row.get("recommendation", row.get("status", "")),
+                "status": row.get("status", row.get("recommendation", "")),
                 "reason": row.get("reason", ""),
+                "reject_reason": row.get("reject_reason", ""),
+                "approved_reason": row.get("approved_reason", ""),
                 "rr": row.get("rr", ""),
                 "refine_status": row.get("refine_status", ""),
                 "refine_score": row.get("refine_score", ""),
@@ -685,6 +742,13 @@ def ensure_log(path: Path = EXTERNAL_SIGNALS_CSV) -> None:
                 "volume_ratio": row.get("volume_ratio", ""),
                 "volume_spike": row.get("volume_spike", ""),
                 "market_regime": row.get("market_regime", ""),
+                "result": row.get("result", "OPEN"),
+                "hit_target": row.get("hit_target", ""),
+                "closed_at": row.get("closed_at", ""),
+                "max_profit_pct": row.get("max_profit_pct", ""),
+                "max_drawdown_pct": row.get("max_drawdown_pct", ""),
+                "holding_minutes": row.get("holding_minutes", ""),
+                "net_r_estimate": row.get("net_r_estimate", ""),
                 "sent_to_signals": row.get("sent_to_signals", "NO"),
                 "sent_to_cornix": row.get("sent_to_cornix", "NO"),
             }
@@ -700,15 +764,24 @@ def log_analysis(analysis: ExternalSignalAnalysis, path: Path = EXTERNAL_SIGNALS
     ensure_log(path)
     parsed = analysis.parsed
     targets = parsed.targets[:3]
+    timestamp = datetime.now(timezone.utc).isoformat()
+    reject_reason, approved_reason = readable_reasons(analysis)
+    status = "APPROVED" if analysis.recommendation == "APPROVED" else "REJECTED"
+    mid_entry = entry_mid(parsed)
     row = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": timestamp,
+        "timestamp": timestamp,
         "source": parsed.source,
+        "source_type": "external",
         "message_id": parsed.message_id,
         "symbol": parsed.symbol,
         "side": parsed.side,
+        "direction": parsed.side,
         "entry_low": "" if parsed.entry_low is None else parsed.entry_low,
         "entry_high": "" if parsed.entry_high is None else parsed.entry_high,
+        "entry": "" if mid_entry <= 0 else f"{mid_entry:.8f}",
         "stop_loss": "" if parsed.stop_loss is None else parsed.stop_loss,
+        "sl": "" if parsed.stop_loss is None else parsed.stop_loss,
         "tp1": targets[0] if len(targets) > 0 else "",
         "tp2": targets[1] if len(targets) > 1 else "",
         "tp3": targets[2] if len(targets) > 2 else "",
@@ -717,8 +790,13 @@ def log_analysis(analysis: ExternalSignalAnalysis, path: Path = EXTERNAL_SIGNALS
         "raw_text": parsed.raw_text,
         "parse_status": parsed.parse_status,
         "analysis_score": analysis.analysis_score,
+        "confidence": analysis.analysis_score,
+        "setup_strength": analysis.analysis_score,
         "recommendation": analysis.recommendation,
+        "status": status,
         "reason": " | ".join(analysis.reason),
+        "reject_reason": reject_reason,
+        "approved_reason": approved_reason,
         "rr": f"{analysis.rr:.4f}",
         "refine_status": analysis.refine_status,
         "refine_score": analysis.refine_score,
@@ -737,6 +815,13 @@ def log_analysis(analysis: ExternalSignalAnalysis, path: Path = EXTERNAL_SIGNALS
         "volume_ratio": analysis.refine_details.get("volume_ratio", ""),
         "volume_spike": analysis.refine_details.get("volume_spike", ""),
         "market_regime": analysis.refine_details.get("market_regime", ""),
+        "result": "OPEN" if analysis.recommendation == "APPROVED" else "EXPIRED",
+        "hit_target": "",
+        "closed_at": "",
+        "max_profit_pct": "",
+        "max_drawdown_pct": "",
+        "holding_minutes": "",
+        "net_r_estimate": "",
         "sent_to_signals": "YES" if analysis.sent_to_signals else "NO",
         "sent_to_cornix": "YES" if analysis.sent_to_cornix else "NO",
     }
