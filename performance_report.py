@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 LOGGER = logging.getLogger("performance_report")
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -216,6 +220,8 @@ def format_report(report: dict[str, Any]) -> str:
         f"{report.get('external_top_approved_symbols') or NA}\n\n"
         "Top Rejected Symbols:\n"
         f"{report.get('external_top_rejected_symbols') or NA}\n\n"
+        "Performance Analytics V2 Warnings:\n"
+        f"{report.get('performance_warnings') or NA}\n\n"
         "Position Manager Outcomes:\n"
         f"HOLD count: {report.get('hold_count', 0)}\n"
         f"OPPOSITE signal count: {report.get('opposite_signal_count', 0)}\n"

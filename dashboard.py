@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 
 from core.analytics_reporting import load_csv_safely
+from core.performance_analytics_v2 import build_performance_v2, generate_performance_warnings
 from performance_report import build_report, estimate_r, normalize, sent_signals
 from position_manager import latest_open_positions
 
@@ -30,6 +31,11 @@ DATA_PATHS = {
     "source_performance": LOGS_DIR / "source_performance.csv",
     "position_management": LOGS_DIR / "position_management.csv",
     "external_signals": LOGS_DIR / "external_signals.csv",
+    "symbol_performance_v2": LOGS_DIR / "symbol_performance_v2.csv",
+    "session_performance_v2": LOGS_DIR / "session_performance_v2.csv",
+    "direction_performance_v2": LOGS_DIR / "direction_performance_v2.csv",
+    "tier_performance_v2": LOGS_DIR / "tier_performance_v2.csv",
+    "performance_warnings": LOGS_DIR / "performance_warnings.csv",
 }
 
 
@@ -429,6 +435,11 @@ def analytics_suggestions(df: pd.DataFrame) -> list[str]:
     return suggestions
 
 
+def warning_table(df: pd.DataFrame) -> pd.DataFrame:
+    warnings = generate_performance_warnings(df)
+    return pd.DataFrame({"warning": warnings})
+
+
 def _format_metric(value: Any) -> str:
     if value is None:
         return "N/A"
@@ -520,6 +531,7 @@ def _streamlit_app() -> None:
     confidence_perf = performance_table(filtered, "confidence_range")
     distribution = tp_sl_distribution(filtered)
     quality = quality_views(filtered)
+    v2 = build_performance_v2(filtered)
 
     with st.expander("Executive Summary", expanded=True):
         col1, col2, col3 = st.columns(3)
@@ -532,6 +544,22 @@ def _streamlit_app() -> None:
         st.info("Analytics suggestion only. These observations do not auto-change config or strategy.")
         for suggestion in analytics_suggestions(filtered):
             st.write(f"- {suggestion}")
+
+    with st.expander("Top Performers", expanded=True):
+        st.write("Top 10 symbols ranked by Net R, win rate, and trades.")
+        st.dataframe(v2["top_symbols"], use_container_width=True)
+
+    with st.expander("Worst Performers", expanded=True):
+        st.write("Bottom 10 symbols ranked by Net R, win rate, and trades.")
+        st.dataframe(v2["bottom_symbols"], use_container_width=True)
+
+    with st.expander("Warnings", expanded=True):
+        warnings = warning_table(filtered)
+        if warnings.empty:
+            st.success("No V2 weak-performance warnings for the current filters.")
+        else:
+            for warning in warnings["warning"].tolist():
+                st.warning(warning)
 
     with st.expander("Win/Loss Analytics", expanded=True):
         left, right = st.columns(2)
@@ -640,6 +668,8 @@ def render_dashboard(df: pd.DataFrame, output: Path = DASHBOARD_HTML) -> Path:
     session_perf = performance_table(sent, "market_session")
     direction_perf = performance_table(sent, "side")
     kpis = dashboard_kpis(sent)
+    v2 = build_performance_v2(sent)
+    warnings_html = "<br><br>".join(str(item).replace("\n", "<br>") for item in v2["warnings"]) if v2["warnings"] else "No warnings."
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -675,6 +705,9 @@ def render_dashboard(df: pd.DataFrame, output: Path = DASHBOARD_HTML) -> Path:
   </section>
 
   <section><h2>Recent Sent Signals</h2>{_table_html(latest_signals(sent))}</section>
+  <section><h2>Top Performers</h2>{_table_html(v2["top_symbols"])}</section>
+  <section><h2>Worst Performers</h2>{_table_html(v2["bottom_symbols"])}</section>
+  <section><h2>Warnings</h2><p>{warnings_html}</p></section>
   <section><h2>Closed Trades</h2>{_table_html(recent_events(sent))}</section>
   <section><h2>Symbol Performance</h2>{_table_html(symbol_perf)}</section>
   <section><h2>Tier Performance</h2>{_table_html(tier_perf)}</section>

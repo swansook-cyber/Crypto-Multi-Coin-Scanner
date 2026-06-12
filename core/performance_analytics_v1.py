@@ -12,6 +12,8 @@ from typing import Any
 
 import pandas as pd
 
+from core.performance_analytics_v2 import build_performance_v2
+
 
 NA = "N/A"
 SMALL_SAMPLE_CLOSED_TRADES = 30
@@ -637,6 +639,7 @@ def build_complete_report(
     }
 
     source_perf = performance_by(sent_day, "source")
+    v2 = build_performance_v2(sent_day)
     external_summary = pd.DataFrame(
         [
             {
@@ -655,6 +658,8 @@ def build_complete_report(
     else:
         source_perf = pd.concat([source_perf.drop(columns=["win_rate_sort"], errors="ignore"), external_summary], ignore_index=True, sort=False)
 
+    report["performance_warnings"] = "\n\n".join(v2["warnings"]) if v2["warnings"] else NA
+
     tables = {
         "symbol_performance": performance_by(sent_day, "symbol").drop(columns=["win_rate_sort"], errors="ignore"),
         "tier_performance": performance_by(sent_day, "tier").drop(columns=["win_rate_sort"], errors="ignore"),
@@ -664,6 +669,13 @@ def build_complete_report(
         "direction_performance": performance_by(sent_day, "side").drop(columns=["win_rate_sort"], errors="ignore"),
         "source_performance": source_perf,
         "position_management": pd.DataFrame([{"date": report_date, **pos_counts}]),
+        "symbol_performance_v2": v2["symbol_performance_v2"],
+        "top_symbols": v2["top_symbols"],
+        "bottom_symbols": v2["bottom_symbols"],
+        "session_performance_v2": v2["session_performance_v2"],
+        "direction_performance_v2": v2["direction_performance_v2"],
+        "tier_performance_v2": v2["tier_performance_v2"],
+        "performance_warnings": pd.DataFrame({"warning": v2["warnings"]}),
     }
     return report, tables
 
@@ -675,6 +687,11 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
         "symbol_performance": logs_dir / "symbol_performance.csv",
         "source_performance": logs_dir / "source_performance.csv",
         "position_management": logs_dir / "position_management.csv",
+        "symbol_performance_v2": logs_dir / "symbol_performance_v2.csv",
+        "session_performance_v2": logs_dir / "session_performance_v2.csv",
+        "direction_performance_v2": logs_dir / "direction_performance_v2.csv",
+        "tier_performance_v2": logs_dir / "tier_performance_v2.csv",
+        "performance_warnings": logs_dir / "performance_warnings.csv",
     }
 
     daily_row = pd.DataFrame([{column: report.get(column, NA) for column in DAILY_PERFORMANCE_COLUMNS}])
@@ -689,6 +706,11 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
 
     tables.get("symbol_performance", pd.DataFrame()).to_csv(paths["symbol_performance"], index=False)
     tables.get("source_performance", pd.DataFrame()).to_csv(paths["source_performance"], index=False)
+    tables.get("symbol_performance_v2", pd.DataFrame()).to_csv(paths["symbol_performance_v2"], index=False)
+    tables.get("session_performance_v2", pd.DataFrame()).to_csv(paths["session_performance_v2"], index=False)
+    tables.get("direction_performance_v2", pd.DataFrame()).to_csv(paths["direction_performance_v2"], index=False)
+    tables.get("tier_performance_v2", pd.DataFrame()).to_csv(paths["tier_performance_v2"], index=False)
+    tables.get("performance_warnings", pd.DataFrame()).to_csv(paths["performance_warnings"], index=False)
     position_row = tables.get("position_management", pd.DataFrame())
     if paths["position_management"].exists():
         existing_position = load_csv_safely(paths["position_management"])

@@ -26,6 +26,7 @@ from core.analytics_reporting import build_daily_performance_report, export_jour
 from core.btc_regime_filter import detect_btc_regime
 from core.loss_cooldown import LossCooldownTracker
 from core.performance_analytics_v1 import build_complete_report, export_v1_outputs
+from core.performance_analytics_v2 import build_performance_v2, canonical_session, generate_performance_warnings
 from core import wave_structure_analyzer as wave
 
 
@@ -1491,6 +1492,74 @@ def test_performance_analytics_production_mapping() -> None:
     assert "SOLUSDT" not in symbol_table["symbol"].astype(str).tolist()
 
 
+def test_performance_analytics_v2_tables_and_warnings() -> None:
+    rows = []
+    for index in range(6):
+        rows.append(
+            {
+                "timestamp": f"2026-06-01T0{index}:00:00+00:00",
+                "closed_at": f"2026-06-01T0{index}:30:00+00:00",
+                "symbol": "SEIUSDT",
+                "side": "LONG",
+                "tier": "C",
+                "session": "NewYork",
+                "entry": 100,
+                "sl": 99,
+                "tp1": 101,
+                "tp2": 102,
+                "rr": 2.0,
+                "signal_status": "sent",
+                "result": "LOSS",
+                "hit_target": "SL",
+                "max_profit_pct": 0.2,
+                "max_drawdown_pct": -1.0,
+                "holding_minutes": 30,
+            }
+        )
+    for index in range(5):
+        rows.append(
+            {
+                "timestamp": f"2026-06-01T1{index}:00:00+00:00",
+                "closed_at": f"2026-06-01T1{index}:45:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "SHORT",
+                "tier": "A",
+                "session": "London+NewYork",
+                "entry": 100,
+                "sl": 102,
+                "tp1": 98,
+                "tp2": 96,
+                "rr": 2.0,
+                "signal_status": "sent",
+                "result": "WIN",
+                "hit_target": "TP2",
+                "max_profit_pct": 4.0,
+                "max_drawdown_pct": -0.3,
+                "holding_minutes": 45,
+            }
+        )
+    df = pd.DataFrame(rows)
+    v2 = build_performance_v2(df)
+    symbol_table = v2["symbol_performance_v2"]
+    session_table = v2["session_performance_v2"]
+    direction_table = v2["direction_performance_v2"]
+    tier_table = v2["tier_performance_v2"]
+    assert canonical_session("London_NewYork") == "London+NewYork"
+    assert "SEIUSDT" in symbol_table["Symbol"].tolist()
+    assert int(symbol_table[symbol_table["Symbol"] == "SEIUSDT"].iloc[0]["Trades"]) == 6
+    assert float(symbol_table[symbol_table["Symbol"] == "SEIUSDT"].iloc[0]["Win Rate"]) == 0.0
+    assert "NewYork" in session_table["Session"].tolist()
+    assert "LONG" in direction_table["Direction"].tolist()
+    assert "C" in tier_table["Tier"].tolist()
+    warnings = generate_performance_warnings(df)
+    assert any("Symbol Warning" in warning and "SEIUSDT" in warning for warning in warnings)
+    assert any("Session Warning" in warning and "NewYork" in warning for warning in warnings)
+    assert any("Direction Warning" in warning and "LONG" in warning for warning in warnings)
+    assert any("Tier Warning" in warning and "C" in warning for warning in warnings)
+    assert v2["top_symbols"].iloc[0]["Symbol"] == "BTCUSDT"
+    assert v2["bottom_symbols"].iloc[0]["Symbol"] == "SEIUSDT"
+
+
 def test_dashboard_renders_html() -> None:
     df = performance_report.normalize(
         pd.DataFrame(
@@ -1519,6 +1588,9 @@ def test_dashboard_renders_html() -> None:
         assert "Crypto Scanner Dashboard" in html
         assert "Overview" not in html or "Total Signals" in html
         assert "Open Positions" in html
+        assert "Top Performers" in html
+        assert "Worst Performers" in html
+        assert "Warnings" in html
     finally:
         try:
             output.unlink()
@@ -1663,6 +1735,7 @@ def main() -> int:
     test_performance_report_routes_to_reports_only()
     test_complete_performance_analytics_v1_outputs()
     test_performance_analytics_production_mapping()
+    test_performance_analytics_v2_tables_and_warnings()
     test_dashboard_renders_html()
     test_dashboard_v2_handles_missing_and_empty_data()
     test_position_manager_advice()
