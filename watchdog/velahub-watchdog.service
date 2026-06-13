@@ -1,0 +1,15 @@
+[Unit]
+Description=VelaHub External Watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python watchdog/monitor.py --loop
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

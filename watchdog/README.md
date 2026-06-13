@@ -42,11 +42,13 @@ WATCHDOG_ENABLED=true
 WATCHDOG_INTERVAL_SECONDS=300
 WATCHDOG_FAILURE_THRESHOLD=3
 WATCHDOG_TELEGRAM_ENABLED=true
+WATCHDOG_DAILY_REPORT_HOUR=8
+TELEGRAM_VELAHUB_MONITOR_CHAT_ID=
 ```
 
 Telegram uses `TELEGRAM_BOT_TOKEN` and sends to
-`TELEGRAM_REPORTS_CHAT_ID`. If reports chat is missing, it falls back to
-`TELEGRAM_CHAT_ID`. It never sends to Cornix.
+`TELEGRAM_VELAHUB_MONITOR_CHAT_ID` only. Monitoring messages never go to
+Signals, Cornix, Reports/Admin, or legacy private chat channels.
 
 ## Alert Rules
 
@@ -54,5 +56,6 @@ Telegram uses `TELEGRAM_BOT_TOKEN` and sends to
 - Failure: timeout, connection error, or HTTP `>= 400`
 - Offline alert: after 3 consecutive failures by default
 - Recovery alert: sent when an offline service becomes healthy again
+- Daily report: sent once per day at `WATCHDOG_DAILY_REPORT_HOUR` in server local time
 
 State is saved in `watchdog/state.json`.

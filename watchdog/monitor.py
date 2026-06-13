@@ -115,6 +115,9 @@ def default_service_state() -> dict[str, Any]:
         "outage_started_at": "",
         "last_error": "",
         "outage_count": 0,
+        "total_checks": 0,
+        "successful_checks": 0,
+        "failure_count": 0,
         "longest_downtime_seconds": 0,
     }
 
@@ -155,6 +158,10 @@ def check_service(session: requests.Session, url: str) -> HealthResult:
         response = session.get(url, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=True)
     except requests.Timeout:
         return HealthResult(False, error="timeout")
+    except requests.exceptions.SSLError as exc:
+        return HealthResult(False, error=f"SSL failure: {exc}")
+    except requests.exceptions.ConnectionError as exc:
+        return HealthResult(False, error=f"connection/DNS failure: {exc}")
     except requests.RequestException as exc:
         return HealthResult(False, error=str(exc))
     if 200 <= response.status_code <= 399:
@@ -163,10 +170,7 @@ def check_service(session: requests.Session, url: str) -> HealthResult:
 
 
 def telegram_target_chat_id() -> str:
-    reports = os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip()
-    if reports:
-        return reports
-    return os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    return os.getenv("TELEGRAM_VELAHUB_MONITOR_CHAT_ID", "").strip()
 
 
 def send_telegram(message: str, session: requests.Session | None = None) -> bool:
@@ -175,9 +179,9 @@ def send_telegram(message: str, session: requests.Session | None = None) -> bool
         return False
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = telegram_target_chat_id()
-    LOGGER.info("WATCHDOG TELEGRAM ROUTE chat_id=%s", chat_id or "-")
+    LOGGER.info("VELAHUB WATCHDOG TELEGRAM ROUTE chat_id=%s", chat_id or "-")
     if not token or not chat_id:
-        LOGGER.warning("Watchdog Telegram skipped: missing TELEGRAM_BOT_TOKEN or reports/admin chat id")
+        LOGGER.warning("Watchdog Telegram skipped: missing TELEGRAM_BOT_TOKEN or TELEGRAM_VELAHUB_MONITOR_CHAT_ID")
         return False
     client = session or requests.Session()
     try:
@@ -201,9 +205,10 @@ def build_offline_message(service: dict[str, str], item: dict[str, Any]) -> str:
         "🚨 VelaHub Service Offline\n\n"
         f"Service: {service['name']}\n"
         f"URL: {service['url']}\n"
+        f"Downtime: {format_duration(0)}\n"
         f"Failures: {item.get('consecutive_failures', 0)}\n"
         f"Last error: {item.get('last_error', '-') or '-'}\n"
-        f"Detected at: {item.get('last_failure', '-') or '-'}"
+        f"Timestamp: {item.get('last_failure', '-') or '-'}"
     )
 
 
@@ -213,7 +218,7 @@ def build_recovery_message(service: dict[str, str], downtime_seconds: float) -> 
         f"Service: {service['name']}\n"
         f"URL: {service['url']}\n"
         f"Downtime: {format_duration(downtime_seconds)}\n"
-        f"Recovered at: {utc_now_iso()}"
+        f"Timestamp: {utc_now_iso()}"
     )
 
 
@@ -227,8 +232,10 @@ def update_service_state(
 ) -> dict[str, Any]:
     now = utc_now_iso()
     previous_status = str(item.get("status", "unknown"))
+    item["total_checks"] = int(item.get("total_checks") or 0) + 1
 
     if result.healthy:
+        item["successful_checks"] = int(item.get("successful_checks") or 0) + 1
         item["consecutive_failures"] = 0
         item["last_success"] = now
         item["last_error"] = ""
@@ -248,6 +255,7 @@ def update_service_state(
     item["last_failure"] = now
     item["last_error"] = result.error or (f"HTTP {result.status_code}" if result.status_code else "unknown error")
     item["consecutive_failures"] = int(item.get("consecutive_failures") or 0) + 1
+    item["failure_count"] = int(item.get("failure_count") or 0) + 1
     if item["consecutive_failures"] >= failure_threshold and previous_status != "offline":
         item["status"] = "offline"
         item["outage_started_at"] = now
@@ -293,11 +301,16 @@ def build_daily_report(services_path: Path = SERVICES_FILE, state_path: Path = S
     lines = ["📊 VelaHub Watchdog Daily Report", f"Date: {utc_now().date().isoformat()}", ""]
     for service in services:
         item = state.get(service["url"], default_service_state())
+        total_checks = int(item.get("total_checks") or 0)
+        successful_checks = int(item.get("successful_checks") or 0)
+        uptime_pct = successful_checks / total_checks * 100 if total_checks else 0.0
         lines.extend(
             [
                 f"{service['name']}",
                 f"URL: {service['url']}",
                 f"Status: {item.get('status', 'unknown')}",
+                f"Uptime: {uptime_pct:.1f}%",
+                f"Failure count: {item.get('failure_count', 0)}",
                 f"Last success: {item.get('last_success', '-') or '-'}",
                 f"Last failure: {item.get('last_failure', '-') or '-'}",
                 f"Outage count: {item.get('outage_count', 0)}",
@@ -308,11 +321,30 @@ def build_daily_report(services_path: Path = SERVICES_FILE, state_path: Path = S
     return "\n".join(lines).strip()
 
 
+def maybe_send_daily_report(state: dict[str, dict[str, Any]], session: requests.Session) -> dict[str, dict[str, Any]]:
+    hour = env_int("WATCHDOG_DAILY_REPORT_HOUR", 8)
+    now = datetime.now()
+    meta = state.get("_meta", {})
+    if now.hour != hour:
+        return state
+    today = now.date().isoformat()
+    if meta.get("last_daily_report_date") == today:
+        return state
+    send_telegram(build_daily_report(), session)
+    meta["last_daily_report_date"] = today
+    state["_meta"] = meta
+    save_state(state)
+    LOGGER.info("Daily watchdog report sent for %s", today)
+    return state
+
+
 def run_loop(interval_seconds: int) -> int:
     LOGGER.info("VelaHub watchdog loop started interval=%s", interval_seconds)
     while True:
+        session = requests.Session()
         try:
-            run_once()
+            state = run_once(session=session)
+            maybe_send_daily_report(state, session)
             LOGGER.info("Next watchdog check in %s seconds", interval_seconds)
             time.sleep(interval_seconds)
         except Exception as exc:

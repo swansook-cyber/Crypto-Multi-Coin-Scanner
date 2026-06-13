@@ -1,9 +1,5 @@
 [
   {
-    "name": "VelaHub Dashboard",
-    "url": "https://dashboard.velalab.net"
-  },
-  {
     "name": "VelaHub Hub",
     "url": "https://hub.velalab.net"
   },
@@ -22,5 +18,9 @@
   {
     "name": "VelaHub HR",
     "url": "https://hr.velalab.net"
+  },
+  {
+    "name": "VelaHub Dashboard",
+    "url": "https://dashboard.velalab.net"
   }
 ]

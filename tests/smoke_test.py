@@ -1724,8 +1724,16 @@ def test_velahub_watchdog_threshold_recovery_and_report() -> None:
     )
     old_threshold = os.environ.get("WATCHDOG_FAILURE_THRESHOLD")
     old_enabled = os.environ.get("WATCHDOG_TELEGRAM_ENABLED")
+    old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    old_monitor_chat = os.environ.get("TELEGRAM_VELAHUB_MONITOR_CHAT_ID")
+    old_reports = os.environ.get("TELEGRAM_REPORTS_CHAT_ID")
+    old_legacy = os.environ.get("TELEGRAM_CHAT_ID")
     os.environ["WATCHDOG_FAILURE_THRESHOLD"] = "3"
     os.environ["WATCHDOG_TELEGRAM_ENABLED"] = "1"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+    os.environ["TELEGRAM_VELAHUB_MONITOR_CHAT_ID"] = "velahub-monitor"
+    os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports-should-not-be-used"
+    os.environ["TELEGRAM_CHAT_ID"] = "legacy-should-not-be-used"
 
     class Response:
         def __init__(self, status_code: int) -> None:
@@ -1735,13 +1743,13 @@ def test_velahub_watchdog_threshold_recovery_and_report() -> None:
     class FakeSession:
         def __init__(self) -> None:
             self.get_statuses = [500, 500, 500, 200]
-            self.posts: list[str] = []
+            self.posts: list[tuple[str, str]] = []
 
         def get(self, _url, timeout=None, allow_redirects=True):
             return Response(self.get_statuses.pop(0))
 
         def post(self, _url, data=None, timeout=None):
-            self.posts.append(data["text"])
+            self.posts.append((data["chat_id"], data["text"]))
             return Response(200)
 
     session = FakeSession()
@@ -1758,19 +1766,27 @@ def test_velahub_watchdog_threshold_recovery_and_report() -> None:
         assert item["status"] == "offline"
         assert int(item["consecutive_failures"]) == 3
         assert len(session.posts) == 1
-        assert "Service Offline" in session.posts[0]
+        assert session.posts[0][0] == "velahub-monitor"
+        assert "Service Offline" in session.posts[0][1]
 
         state = watchdog_monitor.run_once(services_path, state_path, session=session)
         item = state["https://smoke.example"]
         assert item["status"] == "online"
         assert int(item["consecutive_failures"]) == 0
         assert len(session.posts) == 2
-        assert "Service Recovered" in session.posts[1]
+        assert session.posts[1][0] == "velahub-monitor"
+        assert "Service Recovered" in session.posts[1][1]
 
         report = watchdog_monitor.build_daily_report(services_path, state_path)
         assert "VelaHub Watchdog Daily Report" in report
         assert "Smoke Service" in report
+        assert "Uptime:" in report
+        assert "Failure count: 3" in report
         assert "Outage count: 1" in report
+
+        os.environ["TELEGRAM_VELAHUB_MONITOR_CHAT_ID"] = ""
+        assert watchdog_monitor.send_telegram("should not route to fallback", session) is False
+        assert len(session.posts) == 2
     finally:
         if old_threshold is None:
             os.environ.pop("WATCHDOG_FAILURE_THRESHOLD", None)
@@ -1780,6 +1796,16 @@ def test_velahub_watchdog_threshold_recovery_and_report() -> None:
             os.environ.pop("WATCHDOG_TELEGRAM_ENABLED", None)
         else:
             os.environ["WATCHDOG_TELEGRAM_ENABLED"] = old_enabled
+        for key, value in {
+            "TELEGRAM_BOT_TOKEN": old_token,
+            "TELEGRAM_VELAHUB_MONITOR_CHAT_ID": old_monitor_chat,
+            "TELEGRAM_REPORTS_CHAT_ID": old_reports,
+            "TELEGRAM_CHAT_ID": old_legacy,
+        }.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         for path in [services_path, state_path]:
             try:
                 path.unlink()
