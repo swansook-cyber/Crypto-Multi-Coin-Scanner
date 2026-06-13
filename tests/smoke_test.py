@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import importlib.util
+import json
 import tempfile
 import sys
 import os
@@ -28,6 +30,13 @@ from core.loss_cooldown import LossCooldownTracker
 from core.performance_analytics_v1 import build_complete_report, export_v1_outputs
 from core.performance_analytics_v2 import build_performance_v2, canonical_session, generate_performance_warnings
 from core import wave_structure_analyzer as wave
+
+WATCHDOG_MONITOR_PATH = Path(__file__).resolve().parents[1] / "watchdog" / "monitor.py"
+WATCHDOG_SPEC = importlib.util.spec_from_file_location("velahub_watchdog_monitor", WATCHDOG_MONITOR_PATH)
+watchdog_monitor = importlib.util.module_from_spec(WATCHDOG_SPEC)
+assert WATCHDOG_SPEC and WATCHDOG_SPEC.loader
+sys.modules["velahub_watchdog_monitor"] = watchdog_monitor
+WATCHDOG_SPEC.loader.exec_module(watchdog_monitor)
 
 
 def sample_signal() -> scanner.TradeSignal:
@@ -1706,6 +1715,78 @@ def test_position_manager_advice() -> None:
             pass
 
 
+def test_velahub_watchdog_threshold_recovery_and_report() -> None:
+    services_path = Path(tempfile.gettempdir()) / "velahub_services_smoke.json"
+    state_path = Path(tempfile.gettempdir()) / "velahub_state_smoke.json"
+    services_path.write_text(
+        json.dumps([{"name": "Smoke Service", "url": "https://smoke.example"}]),
+        encoding="utf-8",
+    )
+    old_threshold = os.environ.get("WATCHDOG_FAILURE_THRESHOLD")
+    old_enabled = os.environ.get("WATCHDOG_TELEGRAM_ENABLED")
+    os.environ["WATCHDOG_FAILURE_THRESHOLD"] = "3"
+    os.environ["WATCHDOG_TELEGRAM_ENABLED"] = "1"
+
+    class Response:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+            self.text = "ok"
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.get_statuses = [500, 500, 500, 200]
+            self.posts: list[str] = []
+
+        def get(self, _url, timeout=None, allow_redirects=True):
+            return Response(self.get_statuses.pop(0))
+
+        def post(self, _url, data=None, timeout=None):
+            self.posts.append(data["text"])
+            return Response(200)
+
+    session = FakeSession()
+    try:
+        for _ in range(2):
+            state = watchdog_monitor.run_once(services_path, state_path, session=session)
+        item = state["https://smoke.example"]
+        assert item["status"] == "unknown"
+        assert int(item["consecutive_failures"]) == 2
+        assert not session.posts
+
+        state = watchdog_monitor.run_once(services_path, state_path, session=session)
+        item = state["https://smoke.example"]
+        assert item["status"] == "offline"
+        assert int(item["consecutive_failures"]) == 3
+        assert len(session.posts) == 1
+        assert "Service Offline" in session.posts[0]
+
+        state = watchdog_monitor.run_once(services_path, state_path, session=session)
+        item = state["https://smoke.example"]
+        assert item["status"] == "online"
+        assert int(item["consecutive_failures"]) == 0
+        assert len(session.posts) == 2
+        assert "Service Recovered" in session.posts[1]
+
+        report = watchdog_monitor.build_daily_report(services_path, state_path)
+        assert "VelaHub Watchdog Daily Report" in report
+        assert "Smoke Service" in report
+        assert "Outage count: 1" in report
+    finally:
+        if old_threshold is None:
+            os.environ.pop("WATCHDOG_FAILURE_THRESHOLD", None)
+        else:
+            os.environ["WATCHDOG_FAILURE_THRESHOLD"] = old_threshold
+        if old_enabled is None:
+            os.environ.pop("WATCHDOG_TELEGRAM_ENABLED", None)
+        else:
+            os.environ["WATCHDOG_TELEGRAM_ENABLED"] = old_enabled
+        for path in [services_path, state_path]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -1739,6 +1820,7 @@ def main() -> int:
     test_dashboard_renders_html()
     test_dashboard_v2_handles_missing_and_empty_data()
     test_position_manager_advice()
+    test_velahub_watchdog_threshold_recovery_and_report()
     print("smoke tests passed")
     return 0
 

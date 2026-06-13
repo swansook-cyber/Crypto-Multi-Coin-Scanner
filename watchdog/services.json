@@ -1,0 +1,26 @@
+[
+  {
+    "name": "VelaHub Dashboard",
+    "url": "https://dashboard.velalab.net"
+  },
+  {
+    "name": "VelaHub Hub",
+    "url": "https://hub.velalab.net"
+  },
+  {
+    "name": "VelaHub Media",
+    "url": "https://media.velalab.net"
+  },
+  {
+    "name": "VelaHub Files",
+    "url": "https://files.velalab.net"
+  },
+  {
+    "name": "VelaHub Flow",
+    "url": "https://flow.velalab.net"
+  },
+  {
+    "name": "VelaHub HR",
+    "url": "https://hr.velalab.net"
+  }
+]
