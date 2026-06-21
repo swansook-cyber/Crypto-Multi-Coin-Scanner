@@ -1887,6 +1887,10 @@ def test_position_watcher_tp1_breakeven_alert_and_dedupe() -> None:
         send_telegram=True,
         token="token",
         reports_chat_id="reports",
+        cornix_chat_id="cornix",
+        command_mode="report_only",
+        send_report_copy=True,
+        dry_run=False,
     )
     session = FakeSession()
     try:
@@ -1911,6 +1915,126 @@ def test_position_watcher_tp1_breakeven_alert_and_dedupe() -> None:
             path.unlink()
         except OSError:
             pass
+
+
+def _watcher_config(mode: str = "cornix_command", dry_run: bool = False) -> position_watcher.WatcherConfig:
+    return position_watcher.WatcherConfig(
+        enabled=True,
+        interval_seconds=60,
+        send_alerts=True,
+        send_telegram=True,
+        token="token",
+        reports_chat_id="reports",
+        cornix_chat_id="cornix",
+        command_mode=mode,
+        send_report_copy=True,
+        dry_run=dry_run,
+    )
+
+
+def _watcher_row(side: str = "LONG", entry: float | str = 70.744, tp1: float = 72.468) -> dict:
+    return {
+        "timestamp": "2026-06-01T00:00:00+00:00",
+        "symbol": "HYPEUSDT",
+        "side": side,
+        "entry": entry,
+        "tp1": tp1,
+        "tp2": 74.0 if side == "LONG" else 67.0,
+        "stop_loss": 69.0 if side == "LONG" else 72.0,
+        "result": "OPEN",
+        "signal_status": "sent",
+    }
+
+
+class WatcherResponse:
+    def __init__(self, status_code: int, payload: dict | None = None, text: str = "ok") -> None:
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(self.text)
+
+
+class WatcherFakeSession:
+    def __init__(self, price: str) -> None:
+        self.price = price
+        self.posts: list[tuple[str, str]] = []
+
+    def get(self, _url, params=None, timeout=None):
+        return WatcherResponse(200, {"price": self.price})
+
+    def post(self, _url, data=None, timeout=None):
+        self.posts.append((data["chat_id"], data["text"]))
+        return WatcherResponse(200)
+
+
+def test_position_watcher_cornix_command_long_short_and_dedupe() -> None:
+    for side, price, tp1 in [("LONG", "72.500", 72.468), ("SHORT", "68.000", 68.500)]:
+        path = Path(tempfile.gettempdir()) / f"position_watcher_{side.lower()}_command_smoke.csv"
+        pd.DataFrame([_watcher_row(side=side, tp1=tp1)]).to_csv(path, index=False)
+        session = WatcherFakeSession(price)
+        try:
+            stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
+            assert stats.tp1_reached == 1
+            assert stats.cornix_commands_sent == 1
+            assert len(session.posts) == 2
+            assert session.posts[0][0] == "cornix"
+            assert "MOVE SL TO BREAKEVEN" in session.posts[0][1]
+            assert f"Direction: {side}" in session.posts[0][1]
+            assert session.posts[1][0] == "reports"
+            saved = pd.read_csv(path)
+            assert int(saved.loc[0, "tp1_alert_sent"]) == 1
+            assert int(saved.loc[0, "cornix_be_command_sent"]) == 1
+            assert saved.loc[0, "cornix_be_command_status"] == "SENT"
+
+            stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
+            assert stats.skipped_duplicates == 1
+            assert len(session.posts) == 2
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def test_position_watcher_command_safety_modes() -> None:
+    missing_entry = Path(tempfile.gettempdir()) / "position_watcher_missing_entry_smoke.csv"
+    report_only = Path(tempfile.gettempdir()) / "position_watcher_report_only_smoke.csv"
+    dry_run = Path(tempfile.gettempdir()) / "position_watcher_dry_run_smoke.csv"
+    try:
+        pd.DataFrame([_watcher_row(entry="")]).to_csv(missing_entry, index=False)
+        session = WatcherFakeSession("72.500")
+        stats = position_watcher.process_once(missing_entry, session, _watcher_config("cornix_command"))
+        assert stats.tp1_reached == 0
+        assert len(session.posts) == 0
+
+        pd.DataFrame([_watcher_row()]).to_csv(report_only, index=False)
+        session = WatcherFakeSession("72.500")
+        stats = position_watcher.process_once(report_only, session, _watcher_config("report_only"))
+        assert stats.alerts_sent == 1
+        assert len(session.posts) == 1
+        assert session.posts[0][0] == "reports"
+
+        pd.DataFrame([_watcher_row()]).to_csv(dry_run, index=False)
+        session = WatcherFakeSession("72.500")
+        stats = position_watcher.process_once(dry_run, session, _watcher_config("cornix_command", dry_run=True))
+        assert stats.cornix_commands_sent == 1
+        assert len(session.posts) == 1
+        assert session.posts[0][0] == "reports"
+        assert "DRY RUN - POSITION WATCHER CORNIX COMMAND COPY" in session.posts[0][1]
+        saved = pd.read_csv(dry_run)
+        assert int(saved.loc[0].get("cornix_be_command_sent", 0)) == 0
+    finally:
+        for path in [missing_entry, report_only, dry_run]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 def test_velahub_watchdog_threshold_recovery_and_report() -> None:
@@ -2047,6 +2171,8 @@ def main() -> int:
     test_dashboard_v3_equity_drawdown_monthly_simulator()
     test_position_manager_advice()
     test_position_watcher_tp1_breakeven_alert_and_dedupe()
+    test_position_watcher_cornix_command_long_short_and_dedupe()
+    test_position_watcher_command_safety_modes()
     test_velahub_watchdog_threshold_recovery_and_report()
     print("smoke tests passed")
     return 0

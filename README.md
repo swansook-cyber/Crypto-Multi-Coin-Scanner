@@ -580,7 +580,9 @@ Run continuously:
 python position_watcher.py
 ```
 
-The watcher checks open rows in `logs/signals.csv` every `POSITION_WATCHER_INTERVAL_SECONDS` seconds. When TP1 is reached, it sends a Reports-channel advisory to move SL to breakeven and records `tp1_alert_sent`, `tp1_alert_at`, `breakeven_recommended`, and `breakeven_price` to prevent duplicate alerts. It does not place orders and does not change scanner entry logic.
+The watcher checks open rows in `logs/signals.csv` every `POSITION_WATCHER_INTERVAL_SECONDS` seconds. When TP1 is reached, it sends a Reports-channel advisory to move SL to breakeven and records `tp1_alert_sent`, `tp1_alert_at`, `breakeven_recommended`, and `breakeven_price` to prevent duplicate alerts. It does not place orders, auto-close positions, or change scanner entry logic.
+
+V2 adds optional Cornix command mode. Default is still report-only.
 
 Config:
 
@@ -588,7 +590,18 @@ Config:
 POSITION_WATCHER_ENABLED=1
 POSITION_WATCHER_INTERVAL_SECONDS=60
 SEND_TP1_BREAKEVEN_ALERTS=1
+POSITION_WATCHER_COMMAND_MODE=report_only
+POSITION_WATCHER_CORNIX_CHAT_ID=
+POSITION_WATCHER_SEND_REPORT_COPY=1
+POSITION_WATCHER_DRY_RUN=0
 ```
+
+Allowed command modes:
+
+- `report_only`: send advisory message to Reports only.
+- `cornix_command`: send a simple Cornix-compatible breakeven command to `POSITION_WATCHER_CORNIX_CHAT_ID`; send a Reports copy when `POSITION_WATCHER_SEND_REPORT_COPY=1`.
+
+Cornix breakeven command format is isolated in `format_cornix_breakeven_command()` inside `position_watcher.py`. Keep `POSITION_WATCHER_DRY_RUN=1` while validating a Cornix channel.
 
 ## Daily Summary
 

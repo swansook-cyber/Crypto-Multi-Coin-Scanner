@@ -39,6 +39,10 @@ WATCHER_COLUMNS = {
     "tp1_alert_at": "",
     "breakeven_recommended": 0,
     "breakeven_price": "",
+    "cornix_be_command_sent": 0,
+    "cornix_be_command_at": "",
+    "cornix_be_command_status": "",
+    "cornix_be_command_error": "",
 }
 
 
@@ -50,6 +54,10 @@ class WatcherConfig:
     send_telegram: bool
     token: str
     reports_chat_id: str
+    cornix_chat_id: str
+    command_mode: str
+    send_report_copy: bool
+    dry_run: bool
 
 
 @dataclass
@@ -58,6 +66,8 @@ class WatcherStats:
     tp1_reached: int = 0
     alerts_sent: int = 0
     skipped_duplicates: int = 0
+    cornix_commands_sent: int = 0
+    report_copies_sent: int = 0
     errors: int = 0
 
 
@@ -87,6 +97,10 @@ def env_int(name: str, default: int) -> int:
 
 def load_config() -> WatcherConfig:
     load_dotenv(BASE_DIR / ".env")
+    command_mode = os.getenv("POSITION_WATCHER_COMMAND_MODE", "report_only").strip().lower()
+    if command_mode not in {"report_only", "cornix_command"}:
+        LOGGER.warning("Invalid POSITION_WATCHER_COMMAND_MODE=%s; using report_only", command_mode)
+        command_mode = "report_only"
     return WatcherConfig(
         enabled=env_bool("POSITION_WATCHER_ENABLED", True),
         interval_seconds=max(10, env_int("POSITION_WATCHER_INTERVAL_SECONDS", 60)),
@@ -94,6 +108,10 @@ def load_config() -> WatcherConfig:
         send_telegram=env_bool("SEND_TELEGRAM", True),
         token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         reports_chat_id=os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip(),
+        cornix_chat_id=os.getenv("POSITION_WATCHER_CORNIX_CHAT_ID", os.getenv("TELEGRAM_CORNIX_CHAT_ID", "")).strip(),
+        command_mode=command_mode,
+        send_report_copy=env_bool("POSITION_WATCHER_SEND_REPORT_COPY", True),
+        dry_run=env_bool("POSITION_WATCHER_DRY_RUN", False),
     )
 
 
@@ -156,6 +174,25 @@ def alert_already_sent(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "sent"}
 
 
+def position_is_valid_for_command(row: pd.Series) -> tuple[bool, str]:
+    symbol = str(row.get("symbol", "")).strip().upper()
+    side = str(row.get("side", "")).strip().upper()
+    entry = pd.to_numeric(pd.Series([row.get("entry")]), errors="coerce").iloc[0]
+    tp1 = pd.to_numeric(pd.Series([row.get("tp1")]), errors="coerce").iloc[0]
+    result = str(row.get("result", "OPEN")).strip().upper()
+    if not symbol:
+        return False, "symbol missing"
+    if side not in {"LONG", "SHORT"}:
+        return False, "direction missing"
+    if result != "OPEN":
+        return False, "trade is closed"
+    if pd.isna(entry):
+        return False, "entry missing"
+    if pd.isna(tp1):
+        return False, "tp1 missing"
+    return True, ""
+
+
 def fetch_current_price(session: requests.Session, symbol: str) -> float:
     response = session.get(BINANCE_PRICE_URL, params={"symbol": symbol.upper()}, timeout=10)
     response.raise_for_status()
@@ -212,6 +249,27 @@ def build_alert_message(row: pd.Series, current_price: float) -> str:
     )
 
 
+def format_cornix_breakeven_command(row: pd.Series) -> str:
+    return (
+        "MOVE SL TO BREAKEVEN\n\n"
+        f"Symbol: {row.get('symbol')}\n"
+        f"Direction: {row.get('side')}\n"
+        f"New Stop: {format_price(row.get('entry'))}\n\n"
+        "Reason:\n"
+        "TP1 reached."
+    )
+
+
+def build_report_copy(row: pd.Series, current_price: float, cornix_message: str, dry_run: bool) -> str:
+    prefix = "DRY RUN - " if dry_run else ""
+    return (
+        f"{prefix}POSITION WATCHER CORNIX COMMAND COPY\n\n"
+        f"{build_alert_message(row, current_price)}\n\n"
+        "Cornix command:\n"
+        f"{cornix_message}"
+    )
+
+
 def save_journal(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -237,6 +295,23 @@ def send_breakeven_alert(
     return send_text(session, routes, "reports", message, "position watcher")
 
 
+def send_cornix_breakeven_command(
+    session: requests.Session,
+    config: WatcherConfig,
+    message: str,
+    symbol: str,
+) -> tuple[bool, str]:
+    LOGGER.info("Position watcher Cornix command attempt: symbol=%s dry_run=%s", symbol, config.dry_run)
+    if config.dry_run:
+        LOGGER.info("DRY_RUN Cornix breakeven command for %s:\n%s", symbol, message)
+        return True, "DRY_RUN"
+    if not config.send_telegram or not config.send_alerts:
+        return False, "telegram disabled"
+    routes = TelegramRoutes(token=config.token, cornix_chat_id=config.cornix_chat_id)
+    sent = send_text(session, routes, "cornix", message, "position watcher cornix")
+    return sent, "SENT" if sent else "FAILED"
+
+
 def process_once(
     journal_path: Path = JOURNAL,
     session: requests.Session | None = None,
@@ -244,6 +319,19 @@ def process_once(
     dry_run: bool = False,
 ) -> WatcherStats:
     config = config or load_config()
+    if dry_run:
+        config = WatcherConfig(
+            enabled=config.enabled,
+            interval_seconds=config.interval_seconds,
+            send_alerts=config.send_alerts,
+            send_telegram=config.send_telegram,
+            token=config.token,
+            reports_chat_id=config.reports_chat_id,
+            cornix_chat_id=config.cornix_chat_id,
+            command_mode=config.command_mode,
+            send_report_copy=config.send_report_copy,
+            dry_run=True,
+        )
     session = session or build_session()
     stats = WatcherStats()
     df = ensure_columns(load_csv_safely(journal_path))
@@ -255,9 +343,12 @@ def process_once(
 
     for index, row in positions.iterrows():
         symbol = str(row.get("symbol", "")).upper()
-        if not symbol:
+        is_valid, invalid_reason = position_is_valid_for_command(row)
+        if not is_valid:
+            LOGGER.warning("Position watcher skipped row: %s", invalid_reason)
+            stats.errors += 1
             continue
-        if alert_already_sent(row.get("tp1_alert_sent")) or alert_already_sent(row.get("breakeven_recommended")):
+        if alert_already_sent(row.get("tp1_alert_sent")) or alert_already_sent(row.get("breakeven_recommended")) or alert_already_sent(row.get("cornix_be_command_sent")):
             stats.skipped_duplicates += 1
             continue
         try:
@@ -269,12 +360,36 @@ def process_once(
         if not tp1_reached(row, current_price):
             continue
         stats.tp1_reached += 1
-        message = build_alert_message(row, current_price)
-        if send_breakeven_alert(session, config, message, dry_run=dry_run):
+        sent_any = False
+        command_status = ""
+        command_error = ""
+        if config.command_mode == "cornix_command":
+            command = format_cornix_breakeven_command(row)
+            sent_command, command_status = send_cornix_breakeven_command(session, config, command, symbol)
+            if sent_command:
+                sent_any = True
+                stats.cornix_commands_sent += 1
+                if not config.dry_run:
+                    df.at[index, "cornix_be_command_sent"] = 1
+                df.at[index, "cornix_be_command_at"] = datetime.now(timezone.utc).isoformat()
+            else:
+                command_error = command_status or "Cornix send failed"
+            df.at[index, "cornix_be_command_status"] = command_status
+            df.at[index, "cornix_be_command_error"] = command_error
+            if sent_command and config.send_report_copy:
+                report_copy = build_report_copy(row, current_price, command, config.dry_run)
+                if send_breakeven_alert(session, config, report_copy, dry_run=False):
+                    stats.report_copies_sent += 1
+        else:
+            message = build_alert_message(row, current_price)
+            sent_any = send_breakeven_alert(session, config, message, dry_run=config.dry_run)
+
+        if sent_any:
             stats.alerts_sent += 1
-            df.at[index, "tp1_alert_sent"] = 1
+            if not config.dry_run:
+                df.at[index, "tp1_alert_sent"] = 1
+                df.at[index, "breakeven_recommended"] = 1
             df.at[index, "tp1_alert_at"] = datetime.now(timezone.utc).isoformat()
-            df.at[index, "breakeven_recommended"] = 1
             df.at[index, "breakeven_price"] = row.get("entry")
             save_journal(df, journal_path)
         else:
@@ -292,10 +407,12 @@ def run_loop(config: WatcherConfig, journal_path: Path, dry_run: bool = False) -
         try:
             stats = process_once(journal_path, session, config, dry_run=dry_run)
             LOGGER.info(
-                "Position watcher loop: open=%s tp1_reached=%s alerts=%s duplicates=%s errors=%s",
+                "Position watcher loop: open=%s tp1_reached=%s alerts=%s cornix=%s report_copies=%s duplicates=%s errors=%s",
                 stats.checked,
                 stats.tp1_reached,
                 stats.alerts_sent,
+                stats.cornix_commands_sent,
+                stats.report_copies_sent,
                 stats.skipped_duplicates,
                 stats.errors,
             )
