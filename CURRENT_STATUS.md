@@ -30,6 +30,7 @@
 - Complete Performance Analytics V1 via `core/performance_analytics_v1.py`
 - Dashboard V2 as read-only Streamlit analytics app via `dashboard.py`
 - Position Management Advisor V2 via `position_manager.py`
+- Tier C Experimental Report-Only Mode via `ENABLE_TIER_C_REPORT_ONLY`
 - External Signal Refine V2 via `external_signal_analyzer.py`
 - External Signal Inbox polling via `telegram_external_inbox.py`
 - External inbox VPS listener loop via `telegram_external_inbox.py --loop`
@@ -78,6 +79,7 @@ Tracked metrics include win/loss, win rate, TP1/TP2/TP3/SL hits, average profit/
 - Tier A: core/high-liquidity symbols
 - Tier B: standard momentum symbols
 - Tier C: experimental/high-filter symbols
+- Optional `ENABLE_TIER_C_REPORT_ONLY=true` sends qualifying Tier C setups to Reports only and keeps them out of Signals/Cornix
 
 Tier mode uses:
 

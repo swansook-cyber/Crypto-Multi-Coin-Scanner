@@ -58,7 +58,10 @@ class PositionReview:
     current_price: float
     current_r: float
     distance_to_tp1_pct: float
+    distance_to_tp2_pct: float
     distance_to_sl_pct: float
+    unrealized_profit_pct: float
+    atr_multiple_from_entry: float
     max_profit_pct: float
     max_drawdown_pct: float
     trend_status: str
@@ -266,19 +269,24 @@ def estimate_current_pnl(existing: pd.Series, current_price: float | None) -> st
     return f"{pnl:+.2f}%"
 
 
-def position_math(existing: pd.Series, current_price: float) -> tuple[float, float, float]:
+def position_math(existing: pd.Series, current_price: float) -> tuple[float, float, float, float, float, float]:
     entry = _safe_float(existing.get("entry"))
     sl = _safe_float(existing.get("stop_loss"))
     tp1 = _safe_float(existing.get("tp1"))
+    tp2 = _safe_float(existing.get("tp2"))
     side = str(existing.get("side", "")).upper()
     if entry <= 0 or current_price <= 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     risk = entry - sl if side == "LONG" else sl - entry
     progress = current_price - entry if side == "LONG" else entry - current_price
     current_r = progress / risk if risk > 0 else 0.0
     distance_to_tp1 = ((tp1 - current_price) / current_price * 100) if side == "LONG" else ((current_price - tp1) / current_price * 100)
+    distance_to_tp2 = ((tp2 - current_price) / current_price * 100) if side == "LONG" else ((current_price - tp2) / current_price * 100)
     distance_to_sl = ((current_price - sl) / current_price * 100) if side == "LONG" else ((sl - current_price) / current_price * 100)
-    return float(current_r), float(distance_to_tp1), float(distance_to_sl)
+    unrealized_profit = (current_price - entry) / entry * 100 if side == "LONG" else (entry - current_price) / entry * 100
+    atr_pct = _safe_float(existing.get("atr_pct"), _safe_float(existing.get("atr")))
+    atr_multiple = abs(unrealized_profit) / atr_pct if atr_pct > 0 else 0.0
+    return float(current_r), float(distance_to_tp1), float(distance_to_tp2), float(distance_to_sl), float(unrealized_profit), float(atr_multiple)
 
 
 def _direction_matches(side: str, status: str) -> bool:
@@ -300,7 +308,11 @@ def analyze_open_position(
     duration, open_hours = duration_text(existing.get("timestamp"), now)
     market = snapshot or fetch_position_snapshot(str(existing.get("symbol", "")))
     current_price = market.current_price or _safe_float(existing.get("entry"))
-    current_r, distance_to_tp1, distance_to_sl = position_math(existing, current_price)
+    current_r, distance_to_tp1, distance_to_tp2, distance_to_sl, unrealized_profit_pct, atr_multiple = position_math(existing, current_price)
+    if atr_multiple == 0 and market.atr_pct > 0 and current_price > 0:
+        entry = _safe_float(existing.get("entry"))
+        move_pct = abs((current_price - entry) / entry * 100) if entry > 0 else 0.0
+        atr_multiple = move_pct / market.atr_pct if market.atr_pct > 0 else 0.0
     max_profit_pct = _safe_float(existing.get("max_profit_pct"), max(0.0, current_r))
     max_drawdown_pct = _safe_float(existing.get("max_drawdown_pct"), min(0.0, current_r))
 
@@ -314,16 +326,27 @@ def analyze_open_position(
         opposite_signal_risk = True
 
     time_decay_status = "fresh" if open_hours < 4 else "stale" if open_hours > 10 else "watch"
+    near_tp1 = current_r >= 0.75 or (distance_to_tp1 >= 0 and distance_to_tp1 <= max(0.25, market.atr_pct * 0.5))
     if opposite_signal_risk or not structure_valid or distance_to_sl <= 0:
-        recommendation = "EARLY EXIT"
+        recommendation = "CLOSE POSITION"
         confidence = 82
         reason = "Structure or opposite-direction risk is against the open position."
-        actions = ["do not add size", "consider partial close", "wait for new setup"]
+        actions = ["do not add size", "review manual exit plan", "wait for a new clean setup"]
     elif open_hours > 10 and (not momentum_valid or not mfi_valid or market.volume_status == "weak"):
-        recommendation = "REDUCE RISK"
+        recommendation = "REDUCE EXPOSURE"
         confidence = 76
         reason = "Position is stale and momentum is fading before TP1."
-        actions = ["do not add size", "consider tightening SL", "consider partial close", "monitor next 1H candle"]
+        actions = ["do not add size", "consider reducing exposure", "consider tightening SL", "monitor next 1H candle"]
+    elif current_r >= 1.0:
+        recommendation = "MOVE SL TO BREAKEVEN"
+        confidence = 80
+        reason = "Position has reached at least 1R; risk can be reviewed without adding exposure."
+        actions = ["do not add size", "consider moving SL toward breakeven", "monitor next 1H candle"]
+    elif near_tp1 and (market.volume_status == "weak" or not momentum_valid):
+        recommendation = "TAKE PARTIAL PROFIT"
+        confidence = 82
+        reason = "Price is near TP1 while momentum or volume is weakening."
+        actions = ["do not add size", "consider partial profit-taking", "monitor next 1H candle"]
     elif open_hours > 6 and current_r < 1:
         recommendation = "HOLD WITH CAUTION"
         confidence = 68
@@ -353,7 +376,10 @@ def analyze_open_position(
         current_price=current_price,
         current_r=current_r,
         distance_to_tp1_pct=distance_to_tp1,
+        distance_to_tp2_pct=distance_to_tp2,
         distance_to_sl_pct=distance_to_sl,
+        unrealized_profit_pct=unrealized_profit_pct,
+        atr_multiple_from_entry=atr_multiple,
         max_profit_pct=max_profit_pct,
         max_drawdown_pct=max_drawdown_pct,
         trend_status=market.trend_status,
@@ -391,7 +417,10 @@ def build_position_review_message(existing: pd.Series, review: PositionReview, n
         f"Open duration: {duration}\n"
         f"Current R: {review.current_r:+.2f}R\n"
         f"Distance to TP1: {review.distance_to_tp1_pct:+.2f}%\n"
+        f"Distance to TP2: {review.distance_to_tp2_pct:+.2f}%\n"
         f"Distance to SL: {review.distance_to_sl_pct:+.2f}%\n\n"
+        f"Unrealized profit: {review.unrealized_profit_pct:+.2f}%\n"
+        f"ATR multiple from entry: {review.atr_multiple_from_entry:.2f}x\n\n"
         "AI/System Analysis:\n"
         f"- trend status: {review.trend_status}\n"
         f"- momentum status: {review.momentum_status}\n"
@@ -404,9 +433,9 @@ def build_position_review_message(existing: pd.Series, review: PositionReview, n
         f"- opposite signal risk: {'YES' if review.opposite_signal_risk else 'NO'}\n\n"
         f"Recommendation:\n{review.recommendation}\n\n"
         f"Suggested actions:\n{actions}\n\n"
-        f"Confidence: {review.confidence}%\n"
+        f"Recommendation Confidence: {review.confidence}%\n"
         f"Reason: {review.reason}\n\n"
-        "Advisory only. No auto-close. No auto-trade. Not financial advice."
+        "Educational analysis only. No auto-close. No auto-trade. Not financial advice."
     )
 
 
@@ -422,9 +451,11 @@ def build_hold_message(existing: pd.Series, signal: Any, now: pd.Timestamp | Non
         f"Current signal direction: {signal_value(signal, 'direction')}\n"
         f"Open duration: {duration}\n"
         f"Current R: {review.current_r:+.2f}R\n"
+        f"Unrealized profit: {review.unrealized_profit_pct:+.2f}%\n"
         f"Recommendation: {review.recommendation}\n\n"
+        f"Recommendation Confidence: {review.confidence}%\n\n"
         f"Suggested actions:\n{actions}\n\n"
-        "Advisory only. No auto-close. No auto-trade. Not financial advice."
+        "Educational analysis only. No auto-close. No auto-trade. Not financial advice."
     )
 
 
@@ -442,8 +473,9 @@ def build_opposite_message(existing: pd.Series, signal: Any, now: pd.Timestamp |
         f"Current PnL: {estimate_current_pnl(existing, current_price)}\n"
         f"Current R: {review.current_r:+.2f}R\n"
         f"Recommendation: {review.recommendation}\n\n"
+        f"Recommendation Confidence: {review.confidence}%\n\n"
         f"Suggested actions:\n{actions}\n\n"
-        "Advisory only. No auto-close. No auto-trade. Not financial advice."
+        "Educational analysis only. No auto-close. No auto-trade. Not financial advice."
     )
 
 

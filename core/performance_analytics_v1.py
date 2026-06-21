@@ -46,6 +46,10 @@ DAILY_PERFORMANCE_COLUMNS = [
     "opposite_signal_count",
     "exit_recommendation_count",
     "stale_position_count",
+    "tier_c_report_count",
+    "tier_c_report_wins",
+    "tier_c_report_losses",
+    "tier_c_report_win_rate",
 ]
 
 
@@ -595,6 +599,12 @@ def build_complete_report(
     report_date = latest_report_date(scanner_all, date)
     scanner_day = filter_report_day(scanner_all, report_date)
     sent_day = sent_signals(scanner_day)
+    tier_c_report = scanner_day[
+        scanner_day["signal_status"].fillna("").astype(str).str.lower().eq("tier_c_report_only")
+    ].copy() if not scanner_day.empty else scanner_day
+    tier_c_report_closed = closed_trades(tier_c_report)
+    tier_c_report_wins = winning_trades(tier_c_report)
+    tier_c_report_losses = losing_trades(tier_c_report)
     closed = closed_trades(sent_day)
     wins = winning_trades(sent_day)
     losses = losing_trades(sent_day)
@@ -634,6 +644,10 @@ def build_complete_report(
         "scanner_win_rate": safe_percent(len(wins), len(closed)),
         "external_win_rate": None,
         "small_sample_warning": len(closed) < SMALL_SAMPLE_CLOSED_TRADES,
+        "tier_c_report_count": int(len(tier_c_report)),
+        "tier_c_report_wins": int(len(tier_c_report_wins)),
+        "tier_c_report_losses": int(len(tier_c_report_losses)),
+        "tier_c_report_win_rate": safe_percent(len(tier_c_report_wins), len(tier_c_report_closed)),
         **pos_counts,
         **ext_counts,
     }

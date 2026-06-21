@@ -169,6 +169,35 @@ def test_internal_signal_channel_routing() -> None:
     assert calls == [("reports", "reports")]
 
 
+def test_tier_c_report_only_routing() -> None:
+    cfg = scanner.ScannerConfig.from_env()
+    cfg.dry_run = False
+    cfg.send_telegram = True
+    cfg.telegram_bot_token = "token"
+    cfg.telegram_signals_chat_id = "signals"
+    cfg.telegram_cornix_chat_id = "cornix"
+    cfg.telegram_reports_chat_id = "reports"
+    cfg.enable_tier_c_report_only = True
+    signal = sample_signal()
+    signal.watchlist_tier = "C"
+    notifier = scanner.TelegramNotifier(cfg)
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_message(message: str, chat_id: str, channel_name: str = "telegram") -> bool:
+        calls.append((chat_id, channel_name, message))
+        return True
+
+    notifier._send_message = fake_message  # type: ignore[method-assign]
+    notifier._send_photo = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
+
+    assert notifier.send_tier_c_report_signal(signal) is True
+    assert len(calls) == 1
+    assert calls[0][0] == "reports"
+    assert calls[0][1] == "reports"
+    assert "TIER C EXPERIMENTAL REPORT ONLY" in calls[0][2]
+    assert "Not sent to Signals channel" in calls[0][2]
+
+
 def test_missing_telegram_channel_ids_do_not_crash() -> None:
     cfg = scanner.ScannerConfig.from_env()
     cfg.dry_run = False
@@ -1330,6 +1359,36 @@ def test_complete_performance_analytics_v1_outputs() -> None:
                 "signal_status": "skipped_position_management",
                 "skip_reason": "position_review_open_over_6h exit_review",
             },
+            {
+                "timestamp": "2026-05-30T06:00:00+00:00",
+                "closed_at": "2026-05-30T07:00:00+00:00",
+                "symbol": "PEPEUSDT",
+                "side": "LONG",
+                "watchlist_tier": "C",
+                "entry": 100,
+                "tp1": 102,
+                "tp2": 104,
+                "stop_loss": 98,
+                "risk_reward": 2.0,
+                "result": "WIN",
+                "hit_target": "TP1",
+                "signal_status": "tier_c_report_only",
+            },
+            {
+                "timestamp": "2026-05-30T08:00:00+00:00",
+                "closed_at": "2026-05-30T09:00:00+00:00",
+                "symbol": "BONKUSDT",
+                "side": "SHORT",
+                "watchlist_tier": "C",
+                "entry": 100,
+                "tp1": 98,
+                "tp2": 96,
+                "stop_loss": 102,
+                "risk_reward": 2.0,
+                "result": "LOSS",
+                "hit_target": "SL",
+                "signal_status": "tier_c_report_only",
+            },
         ]
     )
     external = pd.DataFrame(
@@ -1405,6 +1464,10 @@ def test_complete_performance_analytics_v1_outputs() -> None:
     assert report["external_open"] == 1
     assert report["external_win_rate"] == 100.0
     assert report["external_net_r_estimate"] == 1.8
+    assert report["tier_c_report_count"] == 2
+    assert report["tier_c_report_wins"] == 1
+    assert report["tier_c_report_losses"] == 1
+    assert report["tier_c_report_win_rate"] == 50.0
     assert "missing stop loss" in report["external_top_reject_reasons"]
     assert "NEARUSDT" in report["external_top_approved_symbols"]
     assert "XRPUSDT" in report["external_top_rejected_symbols"]
@@ -1702,6 +1765,10 @@ def test_position_manager_advice() -> None:
         assert "Recommendation:" in advice.message
         assert "Suggested actions:" in advice.message
         assert "Current R:" in advice.message
+        assert "Distance to TP2:" in advice.message
+        assert "Unrealized profit:" in advice.message
+        assert "ATR multiple from entry:" in advice.message
+        assert "Recommendation Confidence:" in advice.message
         assert "AI/System Analysis:" in advice.message
 
         fresh = {"symbol": "SOLUSDT", "direction": "LONG", "entry": 100}
@@ -1817,6 +1884,7 @@ def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
     test_internal_signal_channel_routing()
+    test_tier_c_report_only_routing()
     test_missing_telegram_channel_ids_do_not_crash()
     test_external_inbox_logging_and_debug_format()
     test_external_signal_parse_long_short_and_symbols()

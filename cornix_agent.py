@@ -190,6 +190,7 @@ class ScannerConfig:
     telegram_cornix_chat_id: str
     telegram_reports_chat_id: str
     telegram_external_inbox_chat_id: str
+    enable_tier_c_report_only: bool
 
     @classmethod
     def from_env(cls) -> "ScannerConfig":
@@ -303,6 +304,7 @@ class ScannerConfig:
             telegram_cornix_chat_id=os.getenv("TELEGRAM_CORNIX_CHAT_ID", "").strip(),
             telegram_reports_chat_id=os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip(),
             telegram_external_inbox_chat_id=os.getenv("TELEGRAM_EXTERNAL_INBOX_CHAT_ID", "").strip(),
+            enable_tier_c_report_only=env_bool("ENABLE_TIER_C_REPORT_ONLY", True),
         )
 
 
@@ -1462,6 +1464,26 @@ class TelegramNotifier:
             delivered = self._send_message(self.build_cornix_message(signal), cornix_chat_id, "cornix") or delivered
         return delivered
 
+    def send_tier_c_report_signal(self, signal: TradeSignal) -> bool:
+        message = (
+            "TIER C EXPERIMENTAL REPORT ONLY\n"
+            "Not sent to Signals channel. Not sent to Cornix channel.\n\n"
+            f"{self.build_message(signal)}"
+        )
+        if self.config.dry_run:
+            LOGGER.info("DRY_RUN Tier C report-only signal for %s:\n%s", signal.symbol, message)
+            return True
+        if not self.config.send_telegram:
+            LOGGER.info("SEND_TELEGRAM=0, skipped Tier C report-only signal for %s", signal.symbol)
+            return True
+        if not self.config.telegram_bot_token:
+            LOGGER.warning("Telegram credentials are missing; skipped Tier C report-only signal for %s", signal.symbol)
+            return False
+        reports_chat_id = self._channel_chat_id("reports")
+        if signal.chart_path and signal.chart_path.exists():
+            return self._send_photo(signal.chart_path, message, reports_chat_id, "reports")
+        return self._send_message(message, reports_chat_id, "reports")
+
     def send_daily_summary(self, summary: dict[str, Any]) -> bool:
         message = self.build_daily_summary_message(summary)
         if self.config.dry_run:
@@ -1743,11 +1765,17 @@ class AgentRunner:
                 continue
             if self.ai_commentary.can_summarize(signal, self.config):
                 signal.ai_commentary = self.ai_commentary.summarize(signal)
-            self.journal.log_signal(signal, "sent", "")
             try:
                 self.chart_exporter.export(signal.symbol, self.indicators.add_indicators(self.data_client.fetch_closed_klines(signal.symbol, "1h", 120)), signal)
             except Exception as exc:
                 LOGGER.warning("Chart export failed for %s: %s", signal.symbol, exc)
+            if signal.watchlist_tier == "C" and self.config.enable_tier_c_report_only:
+                self.journal.log_signal(signal, "tier_c_report_only", "tier_c_experimental_report_only")
+                if self.notifier.send_tier_c_report_signal(signal) and not self.config.dry_run:
+                    self.mark_sent(signal)
+                LOGGER.info("%s routed to reports only: Tier C experimental mode", signal.symbol)
+                continue
+            self.journal.log_signal(signal, "sent", "")
             if self.notifier.send_signal(signal) and not self.config.dry_run:
                 self.mark_sent(signal)
 

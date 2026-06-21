@@ -280,7 +280,17 @@ Run:
 python position_manager.py
 ```
 
-The advisor reads open signals from `logs/signals.csv` and flags duplicate, opposite, or stale positions. V2 adds action guidance such as KEEP POSITION, HOLD WITH CAUTION, REDUCE RISK, EARLY EXIT, or WAIT / NO ACTION. It is Telegram advisory only and never places orders.
+The advisor reads open signals from `logs/signals.csv` and flags duplicate, opposite, or stale positions. V2 adds action guidance such as HOLD, HOLD WITH CAUTION, TAKE PARTIAL PROFIT, MOVE SL TO BREAKEVEN, REDUCE EXPOSURE, or CLOSE POSITION. It is Telegram advisory only and never places orders.
+
+## Tier C Experimental Mode
+
+Set this in `.env`:
+
+```text
+ENABLE_TIER_C_REPORT_ONLY=true
+```
+
+When enabled, Tier A and Tier B signals keep normal routing. Tier C signals that pass existing quality rules are logged and sent to the Reports channel only. They are not sent to the Signals channel or Cornix channel. Performance reports track Tier C report-only outcomes separately so Tier C can be evaluated without mixing it into production signal delivery.
 
 ## Data-Driven Validation
 
