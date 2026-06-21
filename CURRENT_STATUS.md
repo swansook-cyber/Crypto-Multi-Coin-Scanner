@@ -28,7 +28,7 @@
 - Daily summary reporting
 - Daily Performance Report via `performance_report.py`
 - Complete Performance Analytics V1 via `core/performance_analytics_v1.py`
-- Dashboard V2 as read-only Streamlit analytics app via `dashboard.py`
+- Dashboard V3 as read-only Streamlit analytics app via `dashboard.py`
 - Position Management Advisor V2 via `position_manager.py`
 - Tier C Experimental Report-Only Mode via `ENABLE_TIER_C_REPORT_ONLY`
 - External Signal Refine V2 via `external_signal_analyzer.py`
@@ -72,7 +72,7 @@ Performance reports are routed to `TELEGRAM_REPORTS_CHAT_ID` only. They do not f
   - `logs/source_performance.csv`
   - `logs/position_management.csv`
 
-Tracked metrics include win/loss, win rate, TP1/TP2/TP3/SL hits, average profit/drawdown/max profit, time to TP/SL, best/worst symbol, long/short win rate, tier/session/BTC regime/market regime performance, scanner vs external signal performance, and position manager HOLD/OPPOSITE/EXIT/stale counts.
+Tracked metrics include win/loss, win rate, TP1/TP2/TP3/SL hits, cumulative Net R equity curve, daily PnL histogram, drawdown curve, max drawdown R, monthly performance, account growth simulation, average profit/drawdown/max profit, time to TP/SL, best/worst symbol, long/short win rate, tier/session/BTC regime/market regime performance, scanner vs external signal performance, and position manager HOLD/OPPOSITE/EXIT/stale counts.
 
 ## Watchlist Architecture
 

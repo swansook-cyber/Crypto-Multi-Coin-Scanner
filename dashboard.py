@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Streamlit Dashboard V2 for Crypto Multi-Coin Scanner performance.
+"""Streamlit Dashboard V3 for Crypto Multi-Coin Scanner performance.
 
 The dashboard is read-only: it reads local CSV logs and never sends Telegram,
 places trades, calls exchange APIs, or mutates log files.
@@ -242,14 +242,31 @@ def ensure_score_buckets(df: pd.DataFrame) -> pd.DataFrame:
 def equity_curve(df: pd.DataFrame) -> pd.DataFrame:
     closed = _closed(df)
     if closed.empty:
-        return pd.DataFrame(columns=["closed_at", "cumulative_r"])
+        return pd.DataFrame(columns=["closed_at", "r", "cumulative_r"])
     data = closed.copy()
     sort_column = "closed_at" if "closed_at" in data.columns else "timestamp"
     data[sort_column] = pd.to_datetime(data[sort_column], utc=True, errors="coerce")
     data = data.dropna(subset=[sort_column]).sort_values(sort_column)
     data["r"] = data.apply(estimate_r, axis=1)
     data["cumulative_r"] = data["r"].cumsum()
-    return data[[sort_column, "cumulative_r"]].rename(columns={sort_column: "closed_at"})
+    return data[[sort_column, "r", "cumulative_r"]].rename(columns={sort_column: "closed_at"})
+
+
+def drawdown_curve(df: pd.DataFrame) -> pd.DataFrame:
+    curve = equity_curve(df)
+    if curve.empty:
+        return pd.DataFrame(columns=["closed_at", "cumulative_r", "equity_peak", "drawdown_r"])
+    data = curve.copy()
+    data["equity_peak"] = data["cumulative_r"].cummax()
+    data["drawdown_r"] = data["cumulative_r"] - data["equity_peak"]
+    return data[["closed_at", "cumulative_r", "equity_peak", "drawdown_r"]]
+
+
+def max_drawdown_r(df: pd.DataFrame) -> float:
+    drawdown = drawdown_curve(df)
+    if drawdown.empty:
+        return 0.0
+    return float(drawdown["drawdown_r"].min())
 
 
 def daily_net_r(df: pd.DataFrame) -> pd.DataFrame:
@@ -260,6 +277,70 @@ def daily_net_r(df: pd.DataFrame) -> pd.DataFrame:
     data["date"] = pd.to_datetime(data["closed_at"] if "closed_at" in data.columns else data["timestamp"], utc=True, errors="coerce").dt.date
     data["r"] = data.apply(estimate_r, axis=1)
     return data.dropna(subset=["date"]).groupby("date", as_index=False)["r"].sum().rename(columns={"r": "net_r"})
+
+
+def monthly_performance(df: pd.DataFrame) -> pd.DataFrame:
+    closed = _closed(df)
+    if closed.empty:
+        return pd.DataFrame(columns=["month", "closed", "wins", "losses", "win_rate", "net_r", "max_drawdown_r"])
+    data = closed.copy()
+    date_source = data["closed_at"] if "closed_at" in data.columns else data["timestamp"]
+    data["month"] = pd.to_datetime(date_source, utc=True, errors="coerce").dt.strftime("%Y-%m")
+    data = data[data["month"].notna() & (data["month"] != "NaT")].copy()
+    if data.empty:
+        return pd.DataFrame(columns=["month", "closed", "wins", "losses", "win_rate", "net_r", "max_drawdown_r"])
+    rows = []
+    for month, group in data.groupby("month"):
+        wins = int((group["result"] == "WIN").sum())
+        losses = int((group["result"] == "LOSS").sum())
+        net_r = float(group.apply(estimate_r, axis=1).sum())
+        rows.append(
+            {
+                "month": month,
+                "closed": int(len(group)),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": wins / len(group) * 100 if len(group) else 0.0,
+                "net_r": net_r,
+                "max_drawdown_r": max_drawdown_r(group),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("month")
+
+
+def account_growth_simulator(df: pd.DataFrame, balances: list[float] | None = None, risk_pct: float = 1.0) -> pd.DataFrame:
+    curve = equity_curve(df)
+    balances = balances or [100.0, 500.0, 1000.0]
+    columns = ["account_usdt", "risk_pct", "start_balance", "ending_balance", "profit_usdt", "max_drawdown_usdt", "closed_trades"]
+    if curve.empty:
+        return pd.DataFrame([{column: 0 for column in columns} for _ in []], columns=columns)
+    max_dd_r = abs(max_drawdown_r(df))
+    total_r = float(curve["r"].sum())
+    rows = []
+    for balance in balances:
+        risk_amount = balance * risk_pct / 100
+        profit = total_r * risk_amount
+        rows.append(
+            {
+                "account_usdt": balance,
+                "risk_pct": risk_pct,
+                "start_balance": balance,
+                "ending_balance": balance + profit,
+                "profit_usdt": profit,
+                "max_drawdown_usdt": max_dd_r * risk_amount,
+                "closed_trades": int(len(curve)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def daily_pnl_bars(df: pd.DataFrame) -> pd.DataFrame:
+    daily = daily_net_r(df)
+    if daily.empty:
+        return pd.DataFrame(columns=["date", "net_r", "color"])
+    data = daily.copy()
+    data["color"] = data["net_r"].map(lambda value: "#16a34a" if value >= 0 else "#dc2626")
+    return data
 
 
 def win_loss_by_day(df: pd.DataFrame) -> pd.DataFrame:
@@ -454,11 +535,11 @@ def _streamlit_app() -> None:
     except ModuleNotFoundError as exc:
         raise SystemExit("Streamlit is not installed. Run: pip install -r requirements.txt") from exc
 
-    st.set_page_config(page_title="Crypto Scanner Dashboard V2", layout="wide")
+    st.set_page_config(page_title="Crypto Scanner Dashboard V3", layout="wide")
     data = load_dashboard_data()
     sent = data["sent"]
 
-    st.title("Crypto Multi-Coin Scanner Dashboard V2")
+    st.title("Crypto Multi-Coin Scanner Dashboard V3")
     st.caption("Read-only analytics dashboard. No Telegram sends, no API calls, no log writes, no auto trading.")
 
     with st.sidebar:
@@ -532,6 +613,10 @@ def _streamlit_app() -> None:
     distribution = tp_sl_distribution(filtered)
     quality = quality_views(filtered)
     v2 = build_performance_v2(filtered)
+    curve = equity_curve(filtered)
+    drawdown = drawdown_curve(filtered)
+    monthly = monthly_performance(filtered)
+    simulator = account_growth_simulator(filtered)
 
     with st.expander("Executive Summary", expanded=True):
         col1, col2, col3 = st.columns(3)
@@ -544,6 +629,43 @@ def _streamlit_app() -> None:
         st.info("Analytics suggestion only. These observations do not auto-change config or strategy.")
         for suggestion in analytics_suggestions(filtered):
             st.write(f"- {suggestion}")
+
+    with st.expander("Dashboard V3: Equity, PnL, Drawdown, Monthly", expanded=True):
+        cols = st.columns(4)
+        cols[0].metric("Cumulative Net R", _format_metric(kpis["Net R"]))
+        cols[1].metric("Max Drawdown R", f"{max_drawdown_r(filtered):.2f}R")
+        cols[2].metric("Closed Months", int(len(monthly)))
+        cols[3].metric("Simulator Risk", "1.0% / trade")
+
+        chart_left, chart_right = st.columns(2)
+        chart_left.write("Equity Curve: cumulative Net R over time")
+        chart_left.line_chart(curve.set_index("closed_at")["cumulative_r"] if not curve.empty else curve)
+
+        chart_right.write("Drawdown: R below previous equity peak")
+        chart_right.line_chart(drawdown.set_index("closed_at")["drawdown_r"] if not drawdown.empty else drawdown)
+
+        st.write("Daily PnL histogram")
+        bars = daily_pnl_bars(filtered)
+        if bars.empty:
+            st.dataframe(bars, use_container_width=True)
+        else:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(10, 3.5))
+            ax.bar(bars["date"].astype(str), bars["net_r"], color=bars["color"])
+            ax.axhline(0, color="#475569", linewidth=1)
+            ax.set_ylabel("Net R")
+            ax.set_xlabel("Date")
+            ax.tick_params(axis="x", rotation=45)
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+        st.write("Monthly Performance Summary")
+        st.dataframe(monthly, use_container_width=True)
+        st.write("Account Growth Simulator")
+        st.caption("Educational estimate using realized Net R and fixed 1% risk per trade. It does not account for fees, slippage, leverage liquidation, or compounding changes.")
+        st.dataframe(simulator, use_container_width=True)
 
     with st.expander("Top Performers", expanded=True):
         st.write("Top 10 symbols ranked by Net R, win rate, and trades.")
@@ -669,6 +791,11 @@ def render_dashboard(df: pd.DataFrame, output: Path = DASHBOARD_HTML) -> Path:
     direction_perf = performance_table(sent, "side")
     kpis = dashboard_kpis(sent)
     v2 = build_performance_v2(sent)
+    curve = equity_curve(sent)
+    drawdown = drawdown_curve(sent)
+    monthly = monthly_performance(sent)
+    simulator = account_growth_simulator(sent)
+    daily = daily_pnl_bars(sent)
     warnings_html = "<br><br>".join(str(item).replace("\n", "<br>") for item in v2["warnings"]) if v2["warnings"] else "No warnings."
 
     html = f"""<!doctype html>
@@ -701,9 +828,16 @@ def render_dashboard(df: pd.DataFrame, output: Path = DASHBOARD_HTML) -> Path:
     <div class="card"><div class="label">Wins</div><div class="value">{report['wins']}</div></div>
     <div class="card"><div class="label">Losses</div><div class="value">{report['losses']}</div></div>
     <div class="card"><div class="label">Win Rate</div><div class="value">{report['win_rate']:.1f}%</div></div>
+    <div class="card"><div class="label">Cumulative Net R</div><div class="value">{kpis['Net R']:.2f}R</div></div>
+    <div class="card"><div class="label">Max Drawdown R</div><div class="value">{max_drawdown_r(sent):.2f}R</div></div>
     <div class="card"><div class="label">Best Symbol</div><div class="value">{kpis['Best symbol']}</div></div>
   </section>
 
+  <section><h2>Dashboard V3 Equity Curve</h2>{_table_html(curve.tail(50))}</section>
+  <section><h2>Daily PnL Histogram Data</h2>{_table_html(daily.tail(50))}</section>
+  <section><h2>Drawdown Curve</h2>{_table_html(drawdown.tail(50))}</section>
+  <section><h2>Monthly Performance Summary</h2>{_table_html(monthly)}</section>
+  <section><h2>Account Growth Simulator</h2>{_table_html(simulator)}</section>
   <section><h2>Recent Sent Signals</h2>{_table_html(latest_signals(sent))}</section>
   <section><h2>Top Performers</h2>{_table_html(v2["top_symbols"])}</section>
   <section><h2>Worst Performers</h2>{_table_html(v2["bottom_symbols"])}</section>

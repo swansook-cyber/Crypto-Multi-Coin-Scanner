@@ -245,7 +245,7 @@ python performance_report.py --send
 
 This reads `logs/signals.csv` and focuses on closed outcomes, not just signal activity. It reports sent signals, closed/open counts, wins/losses, win rate, TP/SL hits, net R estimate, average win/loss percent, and best/worst symbol, tier, session, and direction performance.
 
-## Dashboard V2
+## Dashboard V3
 
 Run:
 
@@ -253,11 +253,11 @@ Run:
 streamlit run dashboard.py
 ```
 
-Dashboard V2 is a read-only Streamlit dashboard for optimization decisions. It reads existing CSV logs only and never sends Telegram messages, calls Binance, modifies logs, changes scanner strategy, or places trades.
+Dashboard V3 is a read-only Streamlit dashboard for optimization decisions. It reads existing CSV logs only and never sends Telegram messages, calls Binance, modifies logs, changes scanner strategy, or places trades.
 
-Sections include Executive Summary, Win/Loss Analytics, Drawdown Analytics, Symbol/Tier/Session Analytics, Long vs Short Analytics, Score/Confidence Analytics, TP/SL Analytics, External VIP Signal Analytics, Position Manager Analytics, and Risk-Quality Views.
+Sections include Executive Summary, Equity/PnL/Drawdown/Monthly Analytics, Win/Loss Analytics, Drawdown Analytics, Symbol/Tier/Session Analytics, Long vs Short Analytics, Score/Confidence Analytics, TP/SL Analytics, External VIP Signal Analytics, Position Manager Analytics, and Risk-Quality Views.
 
-It shows KPI cards, equity curve/cumulative R, daily wins/losses, daily net R, win rate and net R by symbol/tier/session/direction, score and confidence bucket performance, TP/SL distribution, external VIP approval/rejection summary, high-score losses, low-score wins, high-drawdown winners, fast SL trades, slow TP trades, repeated losses, Tier C risk review, recent signals, closed trades, open positions, and position manager history.
+It shows KPI cards, equity curve/cumulative Net R, green/red daily PnL histogram, drawdown curve, max drawdown R, monthly performance summary, account growth simulator for 100/500/1000 USDT examples, daily wins/losses, daily net R, win rate and net R by symbol/tier/session/direction, score and confidence bucket performance, TP/SL distribution, external VIP approval/rejection summary, high-score losses, low-score wins, high-drawdown winners, fast SL trades, slow TP trades, repeated losses, Tier C risk review, recent signals, closed trades, open positions, and position manager history.
 
 The recommendation panel is rule-based and labeled as analytics suggestion only. It does not auto-change `.env`, filters, watchlists, or strategy settings.
 

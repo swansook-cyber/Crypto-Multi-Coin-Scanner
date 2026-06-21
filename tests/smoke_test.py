@@ -1696,6 +1696,60 @@ def test_dashboard_v2_handles_missing_and_empty_data() -> None:
     assert dashboard.analytics_suggestions(pd.DataFrame())
 
 
+def test_dashboard_v3_equity_drawdown_monthly_simulator() -> None:
+    df = performance_report.normalize(
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-05-30T00:00:00+00:00",
+                    "closed_at": "2026-05-30T01:00:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "watchlist_tier": "A",
+                    "market_session": "London",
+                    "entry": 100,
+                    "tp1": 102,
+                    "tp2": 104,
+                    "stop_loss": 98,
+                    "risk_reward": 2.0,
+                    "result": "WIN",
+                    "hit_target": "TP2",
+                    "signal_status": "sent",
+                },
+                {
+                    "timestamp": "2026-05-31T00:00:00+00:00",
+                    "closed_at": "2026-05-31T01:00:00+00:00",
+                    "symbol": "ETHUSDT",
+                    "side": "SHORT",
+                    "watchlist_tier": "B",
+                    "market_session": "NewYork",
+                    "entry": 100,
+                    "tp1": 98,
+                    "tp2": 96,
+                    "stop_loss": 102,
+                    "risk_reward": 2.0,
+                    "result": "LOSS",
+                    "hit_target": "SL",
+                    "signal_status": "sent",
+                },
+            ]
+        )
+    )
+    curve = dashboard.equity_curve(df)
+    assert list(curve.columns) == ["closed_at", "r", "cumulative_r"]
+    assert round(float(curve["cumulative_r"].iloc[-1]), 2) == 1.0
+    drawdown = dashboard.drawdown_curve(df)
+    assert "drawdown_r" in drawdown.columns
+    assert dashboard.max_drawdown_r(df) == -1.0
+    daily = dashboard.daily_pnl_bars(df)
+    assert set(daily["color"]) == {"#16a34a", "#dc2626"}
+    monthly = dashboard.monthly_performance(df)
+    assert int(monthly.loc[0, "closed"]) == 2
+    simulator = dashboard.account_growth_simulator(df)
+    assert simulator["account_usdt"].tolist() == [100.0, 500.0, 1000.0]
+    assert round(float(simulator.loc[0, "ending_balance"]), 2) == 101.0
+
+
 def test_position_manager_advice() -> None:
     now = pd.Timestamp("2026-05-30T12:00:00Z")
     path = Path(tempfile.gettempdir()) / "position_manager_smoke.csv"
@@ -1913,6 +1967,7 @@ def main() -> int:
     test_performance_analytics_v2_tables_and_warnings()
     test_dashboard_renders_html()
     test_dashboard_v2_handles_missing_and_empty_data()
+    test_dashboard_v3_equity_drawdown_monthly_simulator()
     test_position_manager_advice()
     test_velahub_watchdog_threshold_recovery_and_report()
     print("smoke tests passed")
