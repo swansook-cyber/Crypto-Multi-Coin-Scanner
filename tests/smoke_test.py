@@ -826,9 +826,13 @@ def test_review_old_journal_columns() -> None:
             "htf_conflict",
             "market_session",
             "tp1_alert_sent",
+            "tp1_alert_at",
+            "tp1_alert_source",
             "tp2_alert_sent",
             "sl_alert_sent",
             "outcome_alert_sent_at",
+            "breakeven_recommended",
+            "position_management_stage",
         ]:
             assert column in df.columns
 
@@ -865,6 +869,10 @@ def test_external_approved_outcome_tracking_updates_csv() -> None:
     path = Path(tempfile.gettempdir()) / "external_outcome_tracking_smoke.csv"
     old_external = review_signals.EXTERNAL_SIGNALS
     old_fetch = review_signals.fetch_klines
+    old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    old_reports = os.environ.get("TELEGRAM_REPORTS_CHAT_ID")
+    old_send = os.environ.get("SEND_TELEGRAM")
+    old_outcomes = os.environ.get("SEND_OUTCOME_ALERTS")
 
     def fake_fetch(_session, _symbol, _start_ms, _end_ms):
         return pd.DataFrame(
@@ -975,6 +983,213 @@ def test_outcome_message_and_dedupe() -> None:
     assert "❌ SL HIT" in loss_message
     assert "📉 Result: -1R" in loss_message
     assert "Risk managed correctly" in loss_message
+
+
+def test_tp1_watcher_outcome_review_dedupe_sync() -> None:
+    path = Path(tempfile.gettempdir()) / "tp1_watcher_review_sync.csv"
+    history_path = Path(tempfile.gettempdir()) / "tp1_watcher_review_history.csv"
+    external_path = Path(tempfile.gettempdir()) / "tp1_watcher_review_external.csv"
+    old_journal = review_signals.JOURNAL
+    old_history = review_signals.HISTORY
+    old_external = review_signals.EXTERNAL_SIGNALS
+    old_fetch = review_signals.fetch_klines
+    old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    old_reports = os.environ.get("TELEGRAM_REPORTS_CHAT_ID")
+    old_send = os.environ.get("SEND_TELEGRAM")
+    old_outcomes = os.environ.get("SEND_OUTCOME_ALERTS")
+
+    def fake_fetch(_session, _symbol, _start_ms, _end_ms):
+        return pd.DataFrame(
+            [
+                {
+                    "open_time": pd.Timestamp("2026-05-28T00:00:00Z"),
+                    "close_time": pd.Timestamp("2026-05-28T00:15:00Z"),
+                    "open": 100.0,
+                    "high": 102.2,
+                    "low": 99.4,
+                    "close": 101.5,
+                }
+            ]
+        )
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.posts: list[str] = []
+
+        def post(self, _url, data=None, timeout=None):
+            self.posts.append(data["text"])
+
+            class Response:
+                status_code = 200
+                text = "ok"
+
+            return Response()
+
+    try:
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-05-28T00:00:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "stop_loss": 98,
+                    "tp1": 102,
+                    "tp2": 104,
+                    "risk_reward": 2.0,
+                    "result": "OPEN",
+                    "signal_status": "sent",
+                    "tp1_alert_sent": 1,
+                    "tp1_alert_at": "2026-05-28T00:10:00+00:00",
+                    "tp1_alert_source": "watcher",
+                    "breakeven_recommended": 1,
+                    "position_management_stage": "TP1_REACHED_BE_RECOMMENDED",
+                }
+            ]
+        ).to_csv(path, index=False)
+        review_signals.JOURNAL = path
+        review_signals.HISTORY = history_path
+        review_signals.EXTERNAL_SIGNALS = external_path
+        review_signals.fetch_klines = fake_fetch
+        review_signals.PROCESSED_OUTCOMES.clear()
+        os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+        os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports"
+        os.environ["SEND_TELEGRAM"] = "1"
+        os.environ["SEND_OUTCOME_ALERTS"] = "1"
+
+        session = FakeSession()
+        stats = review_signals.run_review_cycle(True, session, 24, print_report=False)
+        saved = pd.read_csv(path)
+        assert stats.tp_hits == 1
+        assert stats.skipped_alerts >= 1
+        assert session.posts == []
+        assert saved.loc[0, "result"] == "WIN"
+        assert saved.loc[0, "hit_target"] == "TP1"
+        assert saved.loc[0, "tp1_alert_source"] == "watcher"
+        assert saved.loc[0, "tp1_alert_at"] == "2026-05-28T00:10:00+00:00"
+        assert float(saved.loc[0, "holding_minutes"]) == 15.0
+        assert float(saved.loc[0, "net_r_estimate"]) == 1.0
+    finally:
+        review_signals.JOURNAL = old_journal
+        review_signals.HISTORY = old_history
+        review_signals.EXTERNAL_SIGNALS = old_external
+        review_signals.fetch_klines = old_fetch
+        for key, value in {
+            "TELEGRAM_BOT_TOKEN": old_token,
+            "TELEGRAM_REPORTS_CHAT_ID": old_reports,
+            "SEND_TELEGRAM": old_send,
+            "SEND_OUTCOME_ALERTS": old_outcomes,
+        }.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        review_signals.PROCESSED_OUTCOMES.clear()
+        for temp_path in [path, history_path, history_path.with_name("rejected_signals_smoke.csv"), external_path]:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def test_tp1_outcome_review_sets_source_when_first() -> None:
+    path = Path(tempfile.gettempdir()) / "tp1_outcome_review_first.csv"
+    history_path = Path(tempfile.gettempdir()) / "tp1_outcome_review_history.csv"
+    external_path = Path(tempfile.gettempdir()) / "tp1_outcome_review_external.csv"
+    old_journal = review_signals.JOURNAL
+    old_history = review_signals.HISTORY
+    old_external = review_signals.EXTERNAL_SIGNALS
+    old_fetch = review_signals.fetch_klines
+    old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    old_reports = os.environ.get("TELEGRAM_REPORTS_CHAT_ID")
+    old_send = os.environ.get("SEND_TELEGRAM")
+    old_outcomes = os.environ.get("SEND_OUTCOME_ALERTS")
+
+    def fake_fetch(_session, _symbol, _start_ms, _end_ms):
+        return pd.DataFrame(
+            [
+                {
+                    "open_time": pd.Timestamp("2026-05-28T00:00:00Z"),
+                    "close_time": pd.Timestamp("2026-05-28T00:15:00Z"),
+                    "open": 100.0,
+                    "high": 102.2,
+                    "low": 99.4,
+                    "close": 101.5,
+                }
+            ]
+        )
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.posts: list[str] = []
+
+        def post(self, _url, data=None, timeout=None):
+            self.posts.append(data["text"])
+
+            class Response:
+                status_code = 200
+                text = "ok"
+
+            return Response()
+
+    try:
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-05-28T00:00:00+00:00",
+                    "symbol": "ETHUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "stop_loss": 98,
+                    "tp1": 102,
+                    "tp2": 104,
+                    "risk_reward": 2.0,
+                    "result": "OPEN",
+                    "signal_status": "sent",
+                }
+            ]
+        ).to_csv(path, index=False)
+        review_signals.JOURNAL = path
+        review_signals.HISTORY = history_path
+        review_signals.EXTERNAL_SIGNALS = external_path
+        review_signals.fetch_klines = fake_fetch
+        review_signals.PROCESSED_OUTCOMES.clear()
+        os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+        os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports"
+        os.environ["SEND_TELEGRAM"] = "1"
+        os.environ["SEND_OUTCOME_ALERTS"] = "1"
+
+        session = FakeSession()
+        stats = review_signals.run_review_cycle(True, session, 24, print_report=False)
+        saved = pd.read_csv(path)
+        assert stats.sent_alerts == 1
+        assert len(session.posts) == 1
+        assert saved.loc[0, "result"] == "WIN"
+        assert saved.loc[0, "hit_target"] == "TP1"
+        assert int(saved.loc[0, "tp1_alert_sent"]) == 1
+        assert saved.loc[0, "tp1_alert_source"] == "outcome_review"
+        assert saved.loc[0, "position_management_stage"] == "TP1_REACHED_REVIEW_CONFIRMED"
+    finally:
+        review_signals.JOURNAL = old_journal
+        review_signals.HISTORY = old_history
+        review_signals.EXTERNAL_SIGNALS = old_external
+        review_signals.fetch_klines = old_fetch
+        for key, value in {
+            "TELEGRAM_BOT_TOKEN": old_token,
+            "TELEGRAM_REPORTS_CHAT_ID": old_reports,
+            "SEND_TELEGRAM": old_send,
+            "SEND_OUTCOME_ALERTS": old_outcomes,
+        }.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        review_signals.PROCESSED_OUTCOMES.clear()
+        for temp_path in [path, history_path, history_path.with_name("rejected_signals_smoke.csv"), external_path]:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def test_daily_summary_and_missing_telegram_env() -> None:
@@ -1904,7 +2119,9 @@ def test_position_watcher_tp1_breakeven_alert_and_dedupe() -> None:
         assert "MOVE SL TO BREAKEVEN" in session.posts[0][1]
         saved = pd.read_csv(path)
         assert int(saved.loc[0, "tp1_alert_sent"]) == 1
+        assert saved.loc[0, "tp1_alert_source"] == "watcher"
         assert int(saved.loc[0, "breakeven_recommended"]) == 1
+        assert saved.loc[0, "position_management_stage"] == "TP1_REACHED_BE_RECOMMENDED"
         assert float(saved.loc[0, "breakeven_price"]) == 70.744
 
         stats = position_watcher.process_once(path, session, config)
@@ -2159,6 +2376,8 @@ def main() -> int:
     test_external_approved_outcome_tracking_updates_csv()
     test_stats_old_and_new_fields()
     test_outcome_message_and_dedupe()
+    test_tp1_watcher_outcome_review_dedupe_sync()
+    test_tp1_outcome_review_sets_source_when_first()
     test_daily_summary_and_missing_telegram_env()
     test_analytics_report_and_journal_exports()
     test_daily_performance_report_metrics()

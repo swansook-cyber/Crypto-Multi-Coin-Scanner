@@ -50,6 +50,10 @@ DAILY_PERFORMANCE_COLUMNS = [
     "tier_c_report_wins",
     "tier_c_report_losses",
     "tier_c_report_win_rate",
+    "tp1_alerts_watcher",
+    "tp1_alerts_outcome_review",
+    "breakeven_recommendations",
+    "open_tp1_be_recommended",
 ]
 
 
@@ -130,6 +134,9 @@ def normalize_scanner_data(df: pd.DataFrame, source: str = "scanner") -> pd.Data
         "max_drawdown_pct": "",
         "signal_status": "sent",
         "skip_reason": "",
+        "tp1_alert_source": "",
+        "breakeven_recommended": 0,
+        "position_management_stage": "",
     }
     data = _ensure(df, defaults)
     normalized = pd.DataFrame(index=data.index)
@@ -179,6 +186,9 @@ def normalize_scanner_data(df: pd.DataFrame, source: str = "scanner") -> pd.Data
     inferred_skipped = normalized["result"].eq("SKIPPED") & raw_status.eq("sent")
     normalized.loc[inferred_skipped, "signal_status"] = "skipped"
     normalized["skip_reason"] = data["skip_reason"].fillna("").astype(str)
+    normalized["tp1_alert_source"] = data["tp1_alert_source"].fillna("").astype(str).str.lower()
+    normalized["breakeven_recommended"] = data["breakeven_recommended"].fillna(0).astype(str).str.lower().isin(["1", "true", "yes"])
+    normalized["position_management_stage"] = data["position_management_stage"].fillna("").astype(str)
     normalized["source"] = source
     return normalized
 
@@ -609,6 +619,9 @@ def build_complete_report(
     wins = winning_trades(sent_day)
     losses = losing_trades(sent_day)
     open_signals = sent_day[sent_day["result"] == "OPEN"].copy() if not sent_day.empty else sent_day
+    tp1_sources = scanner_day["tp1_alert_source"].fillna("").astype(str).str.lower() if "tp1_alert_source" in scanner_day else pd.Series(dtype=str)
+    stages = scanner_day["position_management_stage"].fillna("").astype(str).str.upper() if "position_management_stage" in scanner_day else pd.Series(dtype=str)
+    breakeven = scanner_day["breakeven_recommended"] if "breakeven_recommended" in scanner_day else pd.Series(dtype=bool)
     pnl_values = closed.apply(calculate_pnl, axis=1) if not closed.empty else pd.Series(dtype=float)
     net_r = closed.apply(estimated_r, axis=1).sum() if not closed.empty else 0.0
     pos_counts = position_management_counts(journal, report_date)
@@ -648,6 +661,10 @@ def build_complete_report(
         "tier_c_report_wins": int(len(tier_c_report_wins)),
         "tier_c_report_losses": int(len(tier_c_report_losses)),
         "tier_c_report_win_rate": safe_percent(len(tier_c_report_wins), len(tier_c_report_closed)),
+        "tp1_alerts_watcher": int(tp1_sources.eq("watcher").sum()) if not tp1_sources.empty else 0,
+        "tp1_alerts_outcome_review": int(tp1_sources.eq("outcome_review").sum()) if not tp1_sources.empty else 0,
+        "breakeven_recommendations": int(breakeven.sum()) if not breakeven.empty else 0,
+        "open_tp1_be_recommended": int(((scanner_day["result"] == "OPEN") & stages.eq("TP1_REACHED_BE_RECOMMENDED")).sum()) if not scanner_day.empty and not stages.empty else 0,
         **pos_counts,
         **ext_counts,
     }

@@ -60,9 +60,16 @@ OUTCOME_COLUMNS = {
     "outcome_alert_at": "",
     "outcome_id": "",
     "tp1_alert_sent": 0,
+    "tp1_alert_at": "",
+    "tp1_alert_source": "",
     "tp2_alert_sent": 0,
     "sl_alert_sent": 0,
     "outcome_alert_sent_at": "",
+    "breakeven_recommended": 0,
+    "breakeven_price": "",
+    "position_management_stage": "",
+    "holding_minutes": "",
+    "net_r_estimate": "",
 }
 
 EXTERNAL_OUTCOME_COLUMNS = {
@@ -359,6 +366,21 @@ def holding_minutes(row: pd.Series) -> float:
     return max(0.0, float((end - start).total_seconds() / 60))
 
 
+def net_r_from_journal(row: pd.Series) -> float:
+    result = str(row.get("result", "OPEN")).upper()
+    hit_target = str(row.get("hit_target", "")).upper()
+    if result == "LOSS":
+        return -1.0
+    if result != "WIN":
+        return 0.0
+    rr = safe_float(row.get("risk_reward", row.get("rr")))
+    if hit_target == "TP2":
+        return rr if rr > 0 else 2.0
+    if hit_target == "TP1":
+        return 1.0
+    return rr if rr > 0 else 1.0
+
+
 def journal_to_history(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=HISTORY_COLUMNS)
@@ -436,6 +458,25 @@ def target_alert_already_sent(row: pd.Series) -> bool:
     if alert_already_sent(row.get("outcome_alert_sent", 0)):
         return True
     return alert_already_sent(row.get(outcome_alert_column(row.get("hit_target", "SL")), 0))
+
+
+def is_tp1_alert_already_sent(row: pd.Series) -> bool:
+    return alert_already_sent(row.get("tp1_alert_sent", 0))
+
+
+def mark_tp1_review_confirmed(df: pd.DataFrame, index: Any, row: pd.Series) -> None:
+    if is_tp1_alert_already_sent(row):
+        LOGGER.info(
+            "Outcome review skipped duplicate TP1 alert: symbol=%s source=%s",
+            row.get("symbol", ""),
+            row.get("tp1_alert_source", ""),
+        )
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    df.at[index, "tp1_alert_sent"] = 1
+    df.at[index, "tp1_alert_at"] = now
+    df.at[index, "tp1_alert_source"] = "outcome_review"
+    df.at[index, "position_management_stage"] = "TP1_REACHED_REVIEW_CONFIRMED"
 
 
 def build_outcome_alert(row: pd.Series) -> str:
@@ -821,10 +862,6 @@ def run_review_cycle(
     for index, row in df.iterrows():
         previous_result = str(row.get("result", "OPEN")).upper()
         if previous_result == "OPEN":
-            if target_alert_already_sent(row) or has_outcome_id(row.get("outcome_id", "")):
-                stats.skipped_alerts += 1
-                LOGGER.info("Outcome duplicate skipped before review: %s", row.get("outcome_id", ""))
-                continue
             try:
                 outcome = review_signal(session, row, lookahead_hours)
             except (requests.RequestException, ValueError, KeyError) as exc:
@@ -837,6 +874,16 @@ def run_review_cycle(
             df.at[index, "closed_at"] = outcome.closed_at
             df.at[index, "max_profit_pct"] = f"{outcome.max_profit_pct:.2f}"
             df.at[index, "max_drawdown_pct"] = f"{outcome.max_drawdown_pct:.2f}"
+            updated_for_metrics = df.loc[index]
+            df.at[index, "holding_minutes"] = f"{holding_minutes(updated_for_metrics):.1f}"
+            df.at[index, "net_r_estimate"] = f"{net_r_from_journal(updated_for_metrics):.4f}"
+            if is_tp1_alert_already_sent(row) and outcome.result in {"WIN", "LOSS"}:
+                LOGGER.info(
+                    "Outcome review confirmed final result after watcher alert: symbol=%s result=%s hit_target=%s",
+                    row.get("symbol", ""),
+                    outcome.result,
+                    outcome.hit_target,
+                )
             if outcome.result == "WIN":
                 stats.tp_hits += 1
             elif outcome.result == "LOSS":
@@ -851,6 +898,15 @@ def run_review_cycle(
             continue
 
         outcome_id = build_outcome_id(updated_row)
+        if updated_result == "WIN" and str(updated_row.get("hit_target", "")).upper() == "TP1" and is_tp1_alert_already_sent(updated_row):
+            stats.skipped_alerts += 1
+            LOGGER.info(
+                "Outcome review skipped duplicate TP1 alert: symbol=%s source=%s",
+                updated_row.get("symbol", ""),
+                updated_row.get("tp1_alert_source", ""),
+            )
+            time.sleep(0.2)
+            continue
         if should_skip_outcome_alert(updated_row, outcome_id, resend_unsent, force_resend):
             stats.skipped_alerts += 1
             LOGGER.info("Outcome duplicate skipped: %s", updated_row.get("outcome_id", outcome_id))
@@ -882,6 +938,13 @@ def run_review_cycle(
             df.at[index, "outcome_alert_sent"] = 1
             df.at[index, "outcome_alert_at"] = datetime.now(timezone.utc).isoformat()
             df.at[index, outcome_alert_column(updated_row.get("hit_target", "SL"))] = 1
+            if updated_result == "WIN" and str(updated_row.get("hit_target", "")).upper() == "TP1":
+                if not str(df.at[index, "tp1_alert_at"]).strip():
+                    df.at[index, "tp1_alert_at"] = df.at[index, "outcome_alert_at"]
+                if not str(df.at[index, "tp1_alert_source"]).strip():
+                    df.at[index, "tp1_alert_source"] = "outcome_review"
+                if not str(df.at[index, "position_management_stage"]).strip():
+                    df.at[index, "position_management_stage"] = "TP1_REACHED_REVIEW_CONFIRMED"
             df.at[index, "outcome_alert_sent_at"] = df.at[index, "outcome_alert_at"]
             df.at[index, "outcome_id"] = outcome_id
             persist_journal(df)

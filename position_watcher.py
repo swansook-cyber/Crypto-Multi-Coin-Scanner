@@ -37,8 +37,10 @@ LOGGER = logging.getLogger("position_watcher")
 WATCHER_COLUMNS = {
     "tp1_alert_sent": 0,
     "tp1_alert_at": "",
+    "tp1_alert_source": "",
     "breakeven_recommended": 0,
     "breakeven_price": "",
+    "position_management_stage": "",
     "cornix_be_command_sent": 0,
     "cornix_be_command_at": "",
     "cornix_be_command_status": "",
@@ -390,7 +392,10 @@ def process_once(
                 df.at[index, "tp1_alert_sent"] = 1
                 df.at[index, "breakeven_recommended"] = 1
             df.at[index, "tp1_alert_at"] = datetime.now(timezone.utc).isoformat()
+            df.at[index, "tp1_alert_source"] = "watcher"
             df.at[index, "breakeven_price"] = row.get("entry")
+            df.at[index, "position_management_stage"] = "TP1_REACHED_BE_RECOMMENDED"
+            LOGGER.info("Watcher detected TP1 first: symbol=%s source=watcher", symbol)
             save_journal(df, journal_path)
         else:
             LOGGER.error("Position watcher alert not marked sent: %s", symbol)
