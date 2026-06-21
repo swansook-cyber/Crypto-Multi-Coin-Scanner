@@ -566,6 +566,30 @@ If `SEND_TELEGRAM=0` or `SEND_OUTCOME_ALERTS=0`, review still updates `logs/sign
 
 Outcome alerts are sent once only. After an alert is sent, `outcome_alert_sent=1`, the matching `tp1_alert_sent` / `tp2_alert_sent` / `sl_alert_sent` flag, and `outcome_alert_at` are recorded.
 
+## Real-Time Position Watcher
+
+Run one check:
+
+```bat
+python position_watcher.py --once
+```
+
+Run continuously:
+
+```bat
+python position_watcher.py
+```
+
+The watcher checks open rows in `logs/signals.csv` every `POSITION_WATCHER_INTERVAL_SECONDS` seconds. When TP1 is reached, it sends a Reports-channel advisory to move SL to breakeven and records `tp1_alert_sent`, `tp1_alert_at`, `breakeven_recommended`, and `breakeven_price` to prevent duplicate alerts. It does not place orders and does not change scanner entry logic.
+
+Config:
+
+```env
+POSITION_WATCHER_ENABLED=1
+POSITION_WATCHER_INTERVAL_SECONDS=60
+SEND_TP1_BREAKEVEN_ALERTS=1
+```
+
 ## Daily Summary
 
 Run a daily journal summary:
@@ -684,10 +708,31 @@ RestartSec=30
 WantedBy=multi-user.target
 ```
 
+Create `/etc/systemd/system/crypto-position-watcher.service`:
+
+```ini
+[Unit]
+Description=Crypto Multi-Coin Scanner Position Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+EnvironmentFile=/opt/Crypto-Multi-Coin-Scanner/.env
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python position_watcher.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
 The same unit template is also available at:
 
 ```text
 deploy/systemd/crypto-external-inbox.service
+deploy/systemd/crypto-position-watcher.service
 ```
 
 Enable:
@@ -698,6 +743,7 @@ sudo systemctl enable --now crypto-scanner.service
 sudo systemctl enable --now crypto-outcome-checker.timer
 sudo systemctl enable --now crypto-daily-summary.timer
 sudo systemctl enable --now crypto-external-inbox.service
+sudo systemctl enable --now crypto-position-watcher.service
 ```
 
 The daily timer example runs at 23:55 server time. Keep `PROMO_ENABLED=false`; this project is internal lab signal tracking only.

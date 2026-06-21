@@ -21,6 +21,7 @@ import daily_summary
 import external_signal_analyzer
 import performance_report
 import position_manager
+import position_watcher
 import review_signals
 import stats_dashboard
 import telegram_external_inbox
@@ -1836,6 +1837,82 @@ def test_position_manager_advice() -> None:
             pass
 
 
+def test_position_watcher_tp1_breakeven_alert_and_dedupe() -> None:
+    path = Path(tempfile.gettempdir()) / "position_watcher_smoke.csv"
+    pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-06-01T00:00:00+00:00",
+                "symbol": "HYPEUSDT",
+                "side": "LONG",
+                "entry": 70.744,
+                "tp1": 72.468,
+                "tp2": 74.0,
+                "stop_loss": 69.0,
+                "result": "OPEN",
+                "signal_status": "sent",
+            }
+        ]
+    ).to_csv(path, index=False)
+
+    class Response:
+        def __init__(self, status_code: int, payload: dict | None = None, text: str = "ok") -> None:
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise RuntimeError(self.text)
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.posts: list[tuple[str, str]] = []
+
+        def get(self, _url, params=None, timeout=None):
+            assert params["symbol"] == "HYPEUSDT"
+            return Response(200, {"price": "72.500"})
+
+        def post(self, _url, data=None, timeout=None):
+            self.posts.append((data["chat_id"], data["text"]))
+            return Response(200)
+
+    config = position_watcher.WatcherConfig(
+        enabled=True,
+        interval_seconds=60,
+        send_alerts=True,
+        send_telegram=True,
+        token="token",
+        reports_chat_id="reports",
+    )
+    session = FakeSession()
+    try:
+        stats = position_watcher.process_once(path, session, config)
+        assert stats.checked == 1
+        assert stats.tp1_reached == 1
+        assert stats.alerts_sent == 1
+        assert len(session.posts) == 1
+        assert session.posts[0][0] == "reports"
+        assert "POSITION WATCHER ALERT" in session.posts[0][1]
+        assert "MOVE SL TO BREAKEVEN" in session.posts[0][1]
+        saved = pd.read_csv(path)
+        assert int(saved.loc[0, "tp1_alert_sent"]) == 1
+        assert int(saved.loc[0, "breakeven_recommended"]) == 1
+        assert float(saved.loc[0, "breakeven_price"]) == 70.744
+
+        stats = position_watcher.process_once(path, session, config)
+        assert stats.skipped_duplicates == 1
+        assert len(session.posts) == 1
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def test_velahub_watchdog_threshold_recovery_and_report() -> None:
     services_path = Path(tempfile.gettempdir()) / "velahub_services_smoke.json"
     state_path = Path(tempfile.gettempdir()) / "velahub_state_smoke.json"
@@ -1969,6 +2046,7 @@ def main() -> int:
     test_dashboard_v2_handles_missing_and_empty_data()
     test_dashboard_v3_equity_drawdown_monthly_simulator()
     test_position_manager_advice()
+    test_position_watcher_tp1_breakeven_alert_and_dedupe()
     test_velahub_watchdog_threshold_recovery_and_report()
     print("smoke tests passed")
     return 0

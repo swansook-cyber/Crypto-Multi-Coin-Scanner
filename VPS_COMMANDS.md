@@ -24,6 +24,7 @@ Current systemd units:
 - `crypto-daily-summary.service`
 - `crypto-daily-summary.timer`
 - `crypto-external-inbox.service`
+- `crypto-position-watcher.service`
 
 ## VPS Login
 
@@ -120,6 +121,22 @@ If the service has not been installed yet:
 sudo cp /opt/Crypto-Multi-Coin-Scanner/deploy/systemd/crypto-external-inbox.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now crypto-external-inbox.service
+```
+
+Position watcher:
+
+```bash
+systemctl status crypto-position-watcher.service --no-pager
+systemctl is-active crypto-position-watcher.service
+journalctl -u crypto-position-watcher.service -n 140 --no-pager
+```
+
+If the service has not been installed yet:
+
+```bash
+sudo cp /opt/Crypto-Multi-Coin-Scanner/deploy/systemd/crypto-position-watcher.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now crypto-position-watcher.service
 ```
 
 ## Restart Services

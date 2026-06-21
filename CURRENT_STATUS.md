@@ -9,6 +9,7 @@
 - Outcome checker: `crypto-outcome-checker.service` run by `crypto-outcome-checker.timer`
 - Daily summary: `crypto-daily-summary.service` run by `crypto-daily-summary.timer`
 - External inbox listener: `crypto-external-inbox.service`
+- Position watcher: `crypto-position-watcher.service`
 - Execution model: Telegram signal assistant only
 - Auto trading: not implemented
 - Manual execution: required
@@ -30,6 +31,7 @@
 - Complete Performance Analytics V1 via `core/performance_analytics_v1.py`
 - Dashboard V3 as read-only Streamlit analytics app via `dashboard.py`
 - Position Management Advisor V2 via `position_manager.py`
+- Real-Time Position Watcher V1 via `position_watcher.py`
 - Tier C Experimental Report-Only Mode via `ENABLE_TIER_C_REPORT_ONLY`
 - External Signal Refine V2 via `external_signal_analyzer.py`
 - External Signal Inbox polling via `telegram_external_inbox.py`

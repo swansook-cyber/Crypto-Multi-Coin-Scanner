@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Multi-Coin Scanner Position Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+EnvironmentFile=/opt/Crypto-Multi-Coin-Scanner/.env
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python position_watcher.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
