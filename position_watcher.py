@@ -60,6 +60,7 @@ class WatcherConfig:
     command_mode: str
     send_report_copy: bool
     dry_run: bool
+    cornix_test_mode: bool = False
 
 
 @dataclass
@@ -114,6 +115,7 @@ def load_config() -> WatcherConfig:
         command_mode=command_mode,
         send_report_copy=env_bool("POSITION_WATCHER_SEND_REPORT_COPY", True),
         dry_run=env_bool("POSITION_WATCHER_DRY_RUN", False),
+        cornix_test_mode=env_bool("CORNIX_TEST_MODE", False),
     )
 
 
@@ -252,6 +254,11 @@ def build_alert_message(row: pd.Series, current_price: float) -> str:
 
 
 def format_cornix_breakeven_command(row: pd.Series) -> str:
+    """Format the Cornix breakeven command.
+
+    Keep Cornix command syntax isolated here so alternative formats can be
+    tested without touching TP1 detection or journal state handling.
+    """
     return (
         "MOVE SL TO BREAKEVEN\n\n"
         f"Symbol: {row.get('symbol')}\n"
@@ -304,14 +311,58 @@ def send_cornix_breakeven_command(
     symbol: str,
 ) -> tuple[bool, str]:
     LOGGER.info("Position watcher Cornix command attempt: symbol=%s dry_run=%s", symbol, config.dry_run)
+    LOGGER.info("CORNIX COMMAND TEXT symbol=%s\n%s", symbol, message)
     if config.dry_run:
         LOGGER.info("DRY_RUN Cornix breakeven command for %s:\n%s", symbol, message)
         return True, "DRY_RUN"
     if not config.send_telegram or not config.send_alerts:
         return False, "telegram disabled"
-    routes = TelegramRoutes(token=config.token, cornix_chat_id=config.cornix_chat_id)
-    sent = send_text(session, routes, "cornix", message, "position watcher cornix")
-    return sent, "SENT" if sent else "FAILED"
+    if not config.token or not config.cornix_chat_id:
+        LOGGER.error("Cornix command skipped: TELEGRAM_BOT_TOKEN or Cornix chat id missing")
+        return False, "missing telegram config"
+    payload = {"chat_id": config.cornix_chat_id, "text": message}
+    LOGGER.info("CORNIX COMMAND ROUTE chat_id=%s symbol=%s", config.cornix_chat_id, symbol)
+    LOGGER.info("CORNIX COMMAND PAYLOAD chat_id=%s text=%r", config.cornix_chat_id, message)
+    try:
+        response = session.post(
+            f"https://api.telegram.org/bot{config.token}/sendMessage",
+            data=payload,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        LOGGER.error("Cornix command Telegram request failed: %s", exc)
+        return False, f"request failed: {exc}"
+    response_text = getattr(response, "text", "")
+    message_id = "-"
+    try:
+        response_json = response.json()
+        message_id = str(response_json.get("result", {}).get("message_id", "-"))
+    except (ValueError, AttributeError, TypeError):
+        response_json = {}
+    LOGGER.info(
+        "CORNIX COMMAND RESPONSE status=%s message_id=%s body=%s",
+        getattr(response, "status_code", "-"),
+        message_id,
+        response_text,
+    )
+    if getattr(response, "status_code", 0) != 200:
+        return False, f"telegram failed: {response_text}"
+    return True, f"SENT message_id={message_id}"
+
+
+def send_cornix_test_command(session: requests.Session, config: WatcherConfig) -> bool:
+    test_row = pd.Series(
+        {
+            "symbol": "HYPEUSDT",
+            "side": "LONG",
+            "entry": 70.744,
+        }
+    )
+    message = format_cornix_breakeven_command(test_row)
+    LOGGER.info("CORNIX_TEST_MODE enabled; sending Cornix command test")
+    sent, status = send_cornix_breakeven_command(session, config, message, str(test_row["symbol"]))
+    LOGGER.info("CORNIX_TEST_MODE result sent=%s status=%s", sent, status)
+    return sent
 
 
 def process_once(
@@ -333,6 +384,7 @@ def process_once(
             command_mode=config.command_mode,
             send_report_copy=config.send_report_copy,
             dry_run=True,
+            cornix_test_mode=config.cornix_test_mode,
         )
     session = session or build_session()
     stats = WatcherStats()
@@ -434,6 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--journal", type=Path, default=JOURNAL)
     parser.add_argument("--once", action="store_true", help="Run one check and exit.")
     parser.add_argument("--dry-run", action="store_true", help="Print alerts and mark CSV in test mode without Telegram.")
+    parser.add_argument("--test-cornix", action="store_true", help="Send one Cornix breakeven test command and exit.")
     return parser.parse_args()
 
 
@@ -441,6 +494,9 @@ def main() -> int:
     setup_logging()
     config = load_config()
     args = parse_args()
+    if args.test_cornix or config.cornix_test_mode:
+        success = send_cornix_test_command(build_session(), config)
+        return 0 if success else 1
     if args.once:
         stats = process_once(args.journal, config=config, dry_run=args.dry_run)
         print(

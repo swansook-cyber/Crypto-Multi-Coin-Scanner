@@ -2207,7 +2207,7 @@ def test_position_watcher_cornix_command_long_short_and_dedupe() -> None:
             saved = pd.read_csv(path)
             assert int(saved.loc[0, "tp1_alert_sent"]) == 1
             assert int(saved.loc[0, "cornix_be_command_sent"]) == 1
-            assert saved.loc[0, "cornix_be_command_status"] == "SENT"
+            assert str(saved.loc[0, "cornix_be_command_status"]).startswith("SENT")
 
             stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
             assert stats.skipped_duplicates == 1
@@ -2252,6 +2252,16 @@ def test_position_watcher_command_safety_modes() -> None:
                 path.unlink()
             except OSError:
                 pass
+
+
+def test_position_watcher_cornix_test_command() -> None:
+    session = WatcherFakeSession("72.500")
+    config = _watcher_config("cornix_command")
+    assert position_watcher.send_cornix_test_command(session, config) is True
+    assert len(session.posts) == 1
+    assert session.posts[0][0] == "cornix"
+    assert "MOVE SL TO BREAKEVEN" in session.posts[0][1]
+    assert "Symbol: HYPEUSDT" in session.posts[0][1]
 
 
 def test_velahub_watchdog_threshold_recovery_and_report() -> None:
@@ -2392,6 +2402,7 @@ def main() -> int:
     test_position_watcher_tp1_breakeven_alert_and_dedupe()
     test_position_watcher_cornix_command_long_short_and_dedupe()
     test_position_watcher_command_safety_modes()
+    test_position_watcher_cornix_test_command()
     test_velahub_watchdog_threshold_recovery_and_report()
     print("smoke tests passed")
     return 0
