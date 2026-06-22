@@ -77,7 +77,7 @@ Legacy `SYMBOLS` remains supported as a fallback.
 ## Telegram Architecture
 
 - Signals channel: full scanner signal and chart
-- Cornix channel: Cornix-format dry-run text
+- Cornix channel: production-ready Cornix-format signal text
 - Reports channel: daily summaries, performance reports, and position advisories
 - External Inbox: receives outside messages for approved-only analysis
 

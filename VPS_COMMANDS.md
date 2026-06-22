@@ -261,7 +261,7 @@ External Signal Refine V2 is approved-only:
 
 - APPROVED external signals may route to Signals and Cornix
 - WAIT / SKIP / RISKY / FAILED signals are stored in `logs/external_signals.csv` only and appear in summaries
-- Cornix output remains dry-run text only
+- Cornix output is production-ready signal text
 
 ## Telegram Multi-Channel Config
 
@@ -283,12 +283,13 @@ POSITION_WATCHER_COMMAND_MODE=report_only
 POSITION_WATCHER_CORNIX_CHAT_ID=
 POSITION_WATCHER_SEND_REPORT_COPY=1
 POSITION_WATCHER_DRY_RUN=0
+CORNIX_BREAKEVEN_FORMAT=v1
 ```
 
 Routing:
 
 - Signals: full scanner signal and chart
-- Cornix: Cornix-format dry-run text
+- Cornix: production-ready Cornix-format text
 - Reports: daily summaries, performance reports, and position advisories
 - External Inbox: incoming external messages are parsed by External Signal Refine V2
 - External Signal Refine V2: only APPROVED forwarded VIP signals with scanner agreement can route to Signals/Cornix

@@ -61,6 +61,7 @@ class WatcherConfig:
     send_report_copy: bool
     dry_run: bool
     cornix_test_mode: bool = False
+    cornix_breakeven_format: str = "v1"
 
 
 @dataclass
@@ -104,6 +105,10 @@ def load_config() -> WatcherConfig:
     if command_mode not in {"report_only", "cornix_command"}:
         LOGGER.warning("Invalid POSITION_WATCHER_COMMAND_MODE=%s; using report_only", command_mode)
         command_mode = "report_only"
+    breakeven_format = os.getenv("CORNIX_BREAKEVEN_FORMAT", "v1").strip().lower()
+    if breakeven_format not in {"v1", "v2", "v3", "v4"}:
+        LOGGER.warning("Invalid CORNIX_BREAKEVEN_FORMAT=%s; using v1", breakeven_format)
+        breakeven_format = "v1"
     return WatcherConfig(
         enabled=env_bool("POSITION_WATCHER_ENABLED", True),
         interval_seconds=max(10, env_int("POSITION_WATCHER_INTERVAL_SECONDS", 60)),
@@ -116,6 +121,7 @@ def load_config() -> WatcherConfig:
         send_report_copy=env_bool("POSITION_WATCHER_SEND_REPORT_COPY", True),
         dry_run=env_bool("POSITION_WATCHER_DRY_RUN", False),
         cornix_test_mode=env_bool("CORNIX_TEST_MODE", False),
+        cornix_breakeven_format=breakeven_format,
     )
 
 
@@ -253,20 +259,30 @@ def build_alert_message(row: pd.Series, current_price: float) -> str:
     )
 
 
-def format_cornix_breakeven_command(row: pd.Series) -> str:
+def format_cornix_symbol_slash(symbol: str) -> str:
+    symbol = str(symbol).strip().upper()
+    if symbol.endswith("USDT"):
+        return f"#{symbol[:-4]}/USDT"
+    return f"#{symbol}"
+
+
+def format_cornix_breakeven_command(row: pd.Series, version: str = "v1") -> str:
     """Format the Cornix breakeven command.
 
     Keep Cornix command syntax isolated here so alternative formats can be
     tested without touching TP1 detection or journal state handling.
     """
-    return (
-        "MOVE SL TO BREAKEVEN\n\n"
-        f"Symbol: {row.get('symbol')}\n"
-        f"Direction: {row.get('side')}\n"
-        f"New Stop: {format_price(row.get('entry'))}\n\n"
-        "Reason:\n"
-        "TP1 reached."
-    )
+    selected = str(version or "v1").strip().lower()
+    symbol = str(row.get("symbol", "")).strip().upper()
+    direction = str(row.get("side", "")).strip().upper()
+    stop = format_price(row.get("entry"))
+    if selected == "v2":
+        return f"{direction} {symbol}\n\nMOVE STOP LOSS\n\n{stop}"
+    if selected == "v3":
+        return f"UPDATE {symbol}\n\nSTOP LOSS:\n{stop}"
+    if selected == "v4":
+        return f"{format_cornix_symbol_slash(symbol)}\n\nMOVE SL TO ENTRY\n\n{stop}"
+    return f"{direction} {symbol}\n\nNEW STOP:\n{stop}"
 
 
 def build_report_copy(row: pd.Series, current_price: float, cornix_message: str, dry_run: bool) -> str:
@@ -309,8 +325,15 @@ def send_cornix_breakeven_command(
     config: WatcherConfig,
     message: str,
     symbol: str,
+    direction: str = "",
 ) -> tuple[bool, str]:
     LOGGER.info("Position watcher Cornix command attempt: symbol=%s dry_run=%s", symbol, config.dry_run)
+    LOGGER.info(
+        "Cornix BE format=%s symbol=%s direction=%s",
+        config.cornix_breakeven_format,
+        symbol,
+        direction or "-",
+    )
     LOGGER.info("CORNIX COMMAND TEXT symbol=%s\n%s", symbol, message)
     if config.dry_run:
         LOGGER.info("DRY_RUN Cornix breakeven command for %s:\n%s", symbol, message)
@@ -358,9 +381,15 @@ def send_cornix_test_command(session: requests.Session, config: WatcherConfig) -
             "entry": 70.744,
         }
     )
-    message = format_cornix_breakeven_command(test_row)
     LOGGER.info("CORNIX_TEST_MODE enabled; sending Cornix command test")
-    sent, status = send_cornix_breakeven_command(session, config, message, str(test_row["symbol"]))
+    message = format_cornix_breakeven_command(test_row, config.cornix_breakeven_format)
+    sent, status = send_cornix_breakeven_command(
+        session,
+        config,
+        message,
+        str(test_row["symbol"]),
+        str(test_row["side"]),
+    )
     LOGGER.info("CORNIX_TEST_MODE result sent=%s status=%s", sent, status)
     return sent
 
@@ -385,6 +414,7 @@ def process_once(
             send_report_copy=config.send_report_copy,
             dry_run=True,
             cornix_test_mode=config.cornix_test_mode,
+            cornix_breakeven_format=config.cornix_breakeven_format,
         )
     session = session or build_session()
     stats = WatcherStats()
@@ -418,8 +448,14 @@ def process_once(
         command_status = ""
         command_error = ""
         if config.command_mode == "cornix_command":
-            command = format_cornix_breakeven_command(row)
-            sent_command, command_status = send_cornix_breakeven_command(session, config, command, symbol)
+            command = format_cornix_breakeven_command(row, config.cornix_breakeven_format)
+            sent_command, command_status = send_cornix_breakeven_command(
+                session,
+                config,
+                command,
+                symbol,
+                str(row.get("side", "")).upper(),
+            )
             if sent_command:
                 sent_any = True
                 stats.cornix_commands_sent += 1

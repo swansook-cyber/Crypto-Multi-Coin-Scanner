@@ -635,10 +635,8 @@ def build_signals_message(analysis: ExternalSignalAnalysis) -> str:
 def build_cornix_message(analysis: ExternalSignalAnalysis) -> str:
     parsed = analysis.parsed
     targets = "\n".join(format_price(target) for target in parsed.targets[:3])
-    leverage = parsed.leverage or "10x"
+    leverage = parsed.leverage or "20x"
     return (
-        "🧪 DRY RUN - EXTERNAL SIGNAL CORNIX FORMAT\n"
-        "DO NOT AUTO TRADE\n\n"
         f"{parsed.side} {parsed.symbol}\n\n"
         "Entry:\n"
         f"{format_price(parsed.entry_low)}-{format_price(parsed.entry_high)}\n\n"

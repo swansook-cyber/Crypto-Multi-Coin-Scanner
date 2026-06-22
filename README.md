@@ -77,7 +77,7 @@ SEND_TELEGRAM=1
 Optional multi-channel routing:
 
 - `TELEGRAM_SIGNALS_CHAT_ID`: full scanner signal and chart
-- `TELEGRAM_CORNIX_CHAT_ID`: Cornix-format dry-run signal text
+- `TELEGRAM_CORNIX_CHAT_ID`: production-ready Cornix-format signal text
 - `TELEGRAM_REPORTS_CHAT_ID`: daily summaries, reports, and position advisor messages
 - `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`: external message intake for approved-only analysis
 
@@ -594,6 +594,7 @@ POSITION_WATCHER_COMMAND_MODE=report_only
 POSITION_WATCHER_CORNIX_CHAT_ID=
 POSITION_WATCHER_SEND_REPORT_COPY=1
 POSITION_WATCHER_DRY_RUN=0
+CORNIX_BREAKEVEN_FORMAT=v1
 ```
 
 Allowed command modes:
@@ -601,7 +602,7 @@ Allowed command modes:
 - `report_only`: send advisory message to Reports only.
 - `cornix_command`: send a simple Cornix-compatible breakeven command to `POSITION_WATCHER_CORNIX_CHAT_ID`; send a Reports copy when `POSITION_WATCHER_SEND_REPORT_COPY=1`.
 
-Cornix breakeven command format is isolated in `format_cornix_breakeven_command()` inside `position_watcher.py`. Keep `POSITION_WATCHER_DRY_RUN=1` while validating a Cornix channel.
+Cornix breakeven command format is isolated in `format_cornix_breakeven_command()` inside `position_watcher.py`. Set `CORNIX_BREAKEVEN_FORMAT=v1`, `v2`, `v3`, or `v4` to test a format without changing TP1 detection. Keep `POSITION_WATCHER_DRY_RUN=1` while validating a Cornix channel.
 
 ## Daily Summary
 

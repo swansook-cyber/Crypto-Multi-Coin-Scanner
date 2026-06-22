@@ -40,7 +40,7 @@ Do not forward External Inbox messages into scanner-generated signals.
 
 Only APPROVED external analyzer results may be sent to Signals or Cornix. WAIT, SKIP, RISKY, and FAILED results are CSV-only and summary-report only; do not send immediate Telegram messages for them.
 
-Cornix output is dry-run format unless the user explicitly changes production mode.
+Cornix output is production-ready text. Do not add dry-run banners unless the user explicitly requests test output.
 
 Daily Performance Report output belongs in `TELEGRAM_REPORTS_CHAT_ID` only.
 

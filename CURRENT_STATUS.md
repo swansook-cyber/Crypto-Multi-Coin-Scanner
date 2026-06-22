@@ -42,7 +42,7 @@
 - Signals: `TELEGRAM_SIGNALS_CHAT_ID`
   - Full LONG/SHORT signal message and chart image only
 - Cornix: `TELEGRAM_CORNIX_CHAT_ID`
-  - Cornix-format LONG/SHORT dry-run execution text only
+  - Production-ready Cornix-format LONG/SHORT text
 - Reports: `TELEGRAM_REPORTS_CHAT_ID`
   - TP/SL outcomes, position management advisories, daily summaries, performance reports, and analytics
 - External Inbox: `TELEGRAM_EXTERNAL_INBOX_CHAT_ID`
@@ -104,4 +104,4 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 - `.env` and real API/chat IDs must not be committed
 - External inbox messages must not affect scanner-generated signals
 - External analyzer approval must be explicit before routing to Signals/Cornix
-- Cornix channel is dry-run format only until explicitly connected
+- Cornix channel receives clean production-ready signal text; breakeven command formats are selectable with `CORNIX_BREAKEVEN_FORMAT`

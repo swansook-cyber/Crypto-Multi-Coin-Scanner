@@ -116,13 +116,15 @@ def test_cornix_dry_run_format_and_signal_immutability() -> None:
     }
     notifier = scanner.TelegramNotifier(cfg)
     message = notifier.build_cornix_message(signal)
-    assert "🧪 DRY RUN - CORNIX FORMAT TEST" in message
-    assert "DO NOT AUTO TRADE" in message
+    assert "DRY RUN" not in message
+    assert "DO NOT AUTO TRADE" not in message
     assert "SHORT BTCUSDT" in message
     assert "Entry:" in message
     assert "Targets:" in message
     assert "Stop:" in message
     assert "Leverage:" in message
+    assert "20x" in message
+    assert "10x" not in message
     target_block = message.split("Targets:\n", 1)[1].split("\n\nStop:", 1)[0].splitlines()
     assert 1 <= len([line for line in target_block if line.strip()]) <= 3
     assert {
@@ -406,7 +408,9 @@ def test_external_signal_approved_routes_to_signals_and_cornix_and_logs() -> Non
         assert any(call[0] == "signals" and call[1] == "external signals" for call in calls)
         assert any(call[0] == "cornix" and call[1] == "external cornix" for call in calls)
         assert not any(call[0] == "reports" for call in calls)
-        assert "DRY RUN - EXTERNAL SIGNAL CORNIX FORMAT" in [call[2] for call in calls if call[0] == "cornix"][0]
+        cornix_message = [call[2] for call in calls if call[0] == "cornix"][0]
+        assert "DRY RUN" not in cornix_message
+        assert "DO NOT AUTO TRADE" not in cornix_message
         logged = pd.read_csv(path)
         assert logged.loc[0, "recommendation"] == "APPROVED"
         assert logged.loc[0, "sent_to_signals"] == "YES"
@@ -2201,8 +2205,8 @@ def test_position_watcher_cornix_command_long_short_and_dedupe() -> None:
             assert stats.cornix_commands_sent == 1
             assert len(session.posts) == 2
             assert session.posts[0][0] == "cornix"
-            assert "MOVE SL TO BREAKEVEN" in session.posts[0][1]
-            assert f"Direction: {side}" in session.posts[0][1]
+            assert f"{side} HYPEUSDT" in session.posts[0][1]
+            assert "NEW STOP:" in session.posts[0][1]
             assert session.posts[1][0] == "reports"
             saved = pd.read_csv(path)
             assert int(saved.loc[0, "tp1_alert_sent"]) == 1
@@ -2254,14 +2258,22 @@ def test_position_watcher_command_safety_modes() -> None:
                 pass
 
 
+def test_position_watcher_cornix_breakeven_formats() -> None:
+    row = pd.Series({"symbol": "LTCUSDT", "side": "LONG", "entry": 44.960})
+    assert position_watcher.format_cornix_breakeven_command(row, "v1") == "LONG LTCUSDT\n\nNEW STOP:\n44.960"
+    assert position_watcher.format_cornix_breakeven_command(row, "v2") == "LONG LTCUSDT\n\nMOVE STOP LOSS\n\n44.960"
+    assert position_watcher.format_cornix_breakeven_command(row, "v3") == "UPDATE LTCUSDT\n\nSTOP LOSS:\n44.960"
+    assert position_watcher.format_cornix_breakeven_command(row, "v4") == "#LTC/USDT\n\nMOVE SL TO ENTRY\n\n44.960"
+
+
 def test_position_watcher_cornix_test_command() -> None:
     session = WatcherFakeSession("72.500")
     config = _watcher_config("cornix_command")
     assert position_watcher.send_cornix_test_command(session, config) is True
     assert len(session.posts) == 1
     assert session.posts[0][0] == "cornix"
-    assert "MOVE SL TO BREAKEVEN" in session.posts[0][1]
-    assert "Symbol: HYPEUSDT" in session.posts[0][1]
+    assert "LONG HYPEUSDT" in session.posts[0][1]
+    assert "NEW STOP:" in session.posts[0][1]
 
 
 def test_velahub_watchdog_threshold_recovery_and_report() -> None:
@@ -2402,6 +2414,7 @@ def main() -> int:
     test_position_watcher_tp1_breakeven_alert_and_dedupe()
     test_position_watcher_cornix_command_long_short_and_dedupe()
     test_position_watcher_command_safety_modes()
+    test_position_watcher_cornix_breakeven_formats()
     test_position_watcher_cornix_test_command()
     test_velahub_watchdog_threshold_recovery_and_report()
     print("smoke tests passed")

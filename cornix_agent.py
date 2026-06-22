@@ -1389,8 +1389,6 @@ class TelegramNotifier:
         entry_low = min(signal.entry, signal.entry * 0.995)
         entry_high = max(signal.entry, signal.entry * 1.005)
         return (
-            "🧪 DRY RUN - CORNIX FORMAT TEST\n"
-            "DO NOT AUTO TRADE\n\n"
             f"{signal.direction} {SymbolFormatter.to_binance_symbol(signal.symbol)}\n\n"
             "Entry:\n"
             f"{format_price(entry_low)}-{format_price(entry_high)}\n\n"
@@ -1400,7 +1398,7 @@ class TelegramNotifier:
             "Stop:\n"
             f"{format_price(signal.sl)}\n\n"
             "Leverage:\n"
-            f"{self.config.max_leverage}x"
+            "20x"
         )
 
     def build_daily_summary_message(self, summary: dict[str, Any]) -> str:
@@ -1459,7 +1457,7 @@ class TelegramNotifier:
 
         cornix_chat_id = self._channel_chat_id("cornix")
         if not cornix_chat_id:
-            LOGGER.info("Telegram Cornix chat id missing; skipped Cornix dry-run for %s", signal.symbol)
+            LOGGER.info("Telegram Cornix chat id missing; skipped Cornix message for %s", signal.symbol)
         else:
             delivered = self._send_message(self.build_cornix_message(signal), cornix_chat_id, "cornix") or delivered
         return delivered

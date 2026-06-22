@@ -16,6 +16,7 @@ Set:
 CORNIX_TEST_MODE=1
 POSITION_WATCHER_COMMAND_MODE=cornix_command
 POSITION_WATCHER_CORNIX_CHAT_ID=<cornix_chat_id>
+CORNIX_BREAKEVEN_FORMAT=v1
 ```
 
 Run:
@@ -38,50 +39,81 @@ Logs include:
 - Telegram API status/body.
 - Telegram `message_id` when available.
 
-## Active Format
+## Supported Breakeven Formats
 
-Implemented in `format_cornix_breakeven_command()`:
+Implemented in `format_cornix_breakeven_command(row, version)`.
+Change only `CORNIX_BREAKEVEN_FORMAT` in `.env` to test a different format.
 
-```text
-MOVE SL TO BREAKEVEN
-
-Symbol: HYPEUSDT
-Direction: LONG
-New Stop: 70.744
-
-Reason:
-TP1 reached.
-```
-
-## Alternative Formats To Test
-
-These are not active. Test one at a time by changing only
-`format_cornix_breakeven_command()`.
-
-### Format A: Compact
-
-```text
-HYPEUSDT
-Move SL to breakeven
-Stop: 70.744
-```
-
-### Format B: Stop Update
-
-```text
-UPDATE STOP
-HYPEUSDT LONG
-SL: 70.744
-```
-
-### Format C: Cornix-Like Command
+### v1 Default
 
 ```text
 LONG HYPEUSDT
 
-Move Stop:
+NEW STOP:
 70.744
 ```
+
+### v2
+
+```text
+LONG HYPEUSDT
+
+MOVE STOP LOSS
+
+70.744
+```
+
+### v3
+
+```text
+UPDATE HYPEUSDT
+
+STOP LOSS:
+70.744
+```
+
+### v4
+
+```text
+#HYPE/USDT
+
+MOVE SL TO ENTRY
+
+70.744
+```
+
+## Production Cornix Signal Format
+
+```text
+LONG LTCUSDT
+
+Entry:
+44.735-45.185
+
+Targets:
+45.252
+45.447
+
+Stop:
+44.717
+
+Leverage:
+20x
+```
+
+Production Cornix signal messages do not include a dry-run banner.
+
+## Diagnostics
+
+Breakeven command logs include:
+- selected format version
+- symbol
+- direction
+- final command text
+- Telegram chat id
+- Telegram payload
+- Telegram response status/body
+- Telegram `message_id` when available
 
 ## Validation Checklist
 
