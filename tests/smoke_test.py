@@ -2211,6 +2211,7 @@ def test_position_watcher_cornix_command_long_short_and_dedupe() -> None:
             saved = pd.read_csv(path)
             assert int(saved.loc[0, "tp1_alert_sent"]) == 1
             assert int(saved.loc[0, "cornix_be_command_sent"]) == 1
+            assert float(saved.loc[0, "cornix_be_stop_price"]) == 70.744
             assert str(saved.loc[0, "cornix_be_command_status"]).startswith("SENT")
 
             stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
@@ -2221,6 +2222,30 @@ def test_position_watcher_cornix_command_long_short_and_dedupe() -> None:
                 path.unlink()
             except OSError:
                 pass
+
+
+def test_position_watcher_cornix_stop_price_duplicate_prevention() -> None:
+    path = Path(tempfile.gettempdir()) / "position_watcher_stop_dedupe_smoke.csv"
+    pd.DataFrame(
+        [
+            {
+                **_watcher_row(),
+                "cornix_be_command_sent": 1,
+                "cornix_be_stop_price": 70.744,
+            }
+        ]
+    ).to_csv(path, index=False)
+    session = WatcherFakeSession("72.500")
+    try:
+        stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
+        assert stats.skipped_duplicates == 1
+        assert stats.cornix_commands_sent == 0
+        assert len(session.posts) == 0
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def test_position_watcher_command_safety_modes() -> None:
@@ -2413,6 +2438,7 @@ def main() -> int:
     test_position_manager_advice()
     test_position_watcher_tp1_breakeven_alert_and_dedupe()
     test_position_watcher_cornix_command_long_short_and_dedupe()
+    test_position_watcher_cornix_stop_price_duplicate_prevention()
     test_position_watcher_command_safety_modes()
     test_position_watcher_cornix_breakeven_formats()
     test_position_watcher_cornix_test_command()

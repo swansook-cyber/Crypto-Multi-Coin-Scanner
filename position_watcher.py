@@ -43,6 +43,7 @@ WATCHER_COLUMNS = {
     "position_management_stage": "",
     "cornix_be_command_sent": 0,
     "cornix_be_command_at": "",
+    "cornix_be_stop_price": "",
     "cornix_be_command_status": "",
     "cornix_be_command_error": "",
 }
@@ -167,9 +168,15 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     data.loc[blank_side, "side"] = data.loc[blank_side, "direction"].astype(str).str.upper()
     data["result"] = data["result"].fillna("OPEN").replace("", "OPEN").astype(str).str.upper()
     data["signal_status"] = data["signal_status"].fillna("sent").replace("", "sent").astype(str).str.lower()
-    for column in ["entry", "tp1", "tp2", "stop_loss", "sl", "breakeven_price"]:
+    for column in ["entry", "tp1", "tp2", "stop_loss", "sl", "breakeven_price", "cornix_be_stop_price"]:
         data[column] = pd.to_numeric(data[column], errors="coerce")
     return data
+
+
+def final_outcome_reached(row: pd.Series) -> bool:
+    result = str(row.get("result", "OPEN")).strip().upper()
+    hit_target = str(row.get("hit_target", "")).strip().upper()
+    return result != "OPEN" or hit_target in {"SL", "TP2", "TP3", "2", "3"}
 
 
 def open_positions(df: pd.DataFrame) -> pd.DataFrame:
@@ -177,11 +184,46 @@ def open_positions(df: pd.DataFrame) -> pd.DataFrame:
     if data.empty:
         return data
     active_statuses = {"sent", "tier_c_report_only"}
-    return data[(data["result"] == "OPEN") & (data["signal_status"].isin(active_statuses))].copy()
+    final_mask = data.apply(final_outcome_reached, axis=1)
+    return data[(~final_mask) & (data["signal_status"].isin(active_statuses))].copy()
 
 
 def alert_already_sent(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "sent"}
+
+
+def numeric_value(value: Any) -> float | None:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return None
+    return float(numeric)
+
+
+def breakeven_stop_price(row: pd.Series) -> float | None:
+    return numeric_value(row.get("entry"))
+
+
+def same_price(left: Any, right: Any, tolerance: float = 1e-9) -> bool:
+    left_value = numeric_value(left)
+    right_value = numeric_value(right)
+    if left_value is None or right_value is None:
+        return False
+    return abs(left_value - right_value) <= tolerance
+
+
+def cornix_breakeven_already_sent_for_stop(row: pd.Series, stop_price: float | None) -> bool:
+    if not alert_already_sent(row.get("cornix_be_command_sent")):
+        return False
+    if stop_price is None:
+        return True
+    stored_stop = row.get("cornix_be_stop_price")
+    if same_price(stored_stop, stop_price):
+        return True
+    if numeric_value(stored_stop) is None and (
+        same_price(row.get("breakeven_price"), stop_price) or alert_already_sent(row.get("breakeven_recommended"))
+    ):
+        return True
+    return False
 
 
 def position_is_valid_for_command(row: pd.Series) -> tuple[bool, str]:
@@ -419,6 +461,11 @@ def process_once(
     session = session or build_session()
     stats = WatcherStats()
     df = ensure_columns(load_csv_safely(journal_path))
+    active_statuses = {"sent", "tier_c_report_only"}
+    final_mask = df.apply(final_outcome_reached, axis=1) if not df.empty else pd.Series(dtype=bool)
+    closed_candidates = df[(final_mask) & (df["signal_status"].isin(active_statuses))]
+    if not closed_candidates.empty:
+        LOGGER.info("skipped_closed_signal_breakeven_command count=%s", len(closed_candidates))
     positions = open_positions(df)
     stats.checked = int(len(positions))
     if positions.empty:
@@ -432,8 +479,22 @@ def process_once(
             LOGGER.warning("Position watcher skipped row: %s", invalid_reason)
             stats.errors += 1
             continue
-        if alert_already_sent(row.get("tp1_alert_sent")) or alert_already_sent(row.get("breakeven_recommended")) or alert_already_sent(row.get("cornix_be_command_sent")):
+        new_stop_price = breakeven_stop_price(row)
+        if config.command_mode == "cornix_command":
+            if cornix_breakeven_already_sent_for_stop(row, new_stop_price):
+                stats.skipped_duplicates += 1
+                LOGGER.info(
+                    "skipped_duplicate_breakeven_command symbol=%s stop=%s",
+                    symbol,
+                    format_price(new_stop_price),
+                )
+                if numeric_value(row.get("cornix_be_stop_price")) is None and new_stop_price is not None and not config.dry_run:
+                    df.at[index, "cornix_be_stop_price"] = new_stop_price
+                    save_journal(df, journal_path)
+                continue
+        elif alert_already_sent(row.get("tp1_alert_sent")) or alert_already_sent(row.get("breakeven_recommended")):
             stats.skipped_duplicates += 1
+            LOGGER.info("skipped_duplicate_breakeven_command symbol=%s report_only=1", symbol)
             continue
         try:
             current_price = fetch_current_price(session, symbol)
@@ -461,6 +522,7 @@ def process_once(
                 stats.cornix_commands_sent += 1
                 if not config.dry_run:
                     df.at[index, "cornix_be_command_sent"] = 1
+                    df.at[index, "cornix_be_stop_price"] = new_stop_price if new_stop_price is not None else ""
                 df.at[index, "cornix_be_command_at"] = datetime.now(timezone.utc).isoformat()
             else:
                 command_error = command_status or "Cornix send failed"
