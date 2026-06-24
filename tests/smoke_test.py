@@ -2343,6 +2343,8 @@ def test_position_watcher_tp1_breakeven_alert_and_dedupe() -> None:
         assert int(saved.loc[0, "breakeven_recommended"]) == 1
         assert saved.loc[0, "position_management_stage"] == "TP1_REACHED_BE_RECOMMENDED"
         assert float(saved.loc[0, "breakeven_price"]) == 70.744
+        assert int(saved.loc[0, "new_stop_notification_sent"]) == 1
+        assert saved.loc[0, "new_stop_notification_key"] == "HYPEUSDT|LONG|70.744"
 
         stats = position_watcher.process_once(path, session, config)
         assert stats.skipped_duplicates == 1
@@ -2428,6 +2430,8 @@ def test_position_watcher_cornix_command_long_short_and_dedupe() -> None:
             assert int(saved.loc[0, "tp1_alert_sent"]) == 1
             assert int(saved.loc[0, "cornix_be_command_sent"]) == 1
             assert float(saved.loc[0, "cornix_be_stop_price"]) == 70.744
+            assert int(saved.loc[0, "new_stop_notification_sent"]) == 1
+            assert saved.loc[0, "new_stop_notification_key"] == f"HYPEUSDT|{side}|70.744"
             assert str(saved.loc[0, "cornix_be_command_status"]).startswith("SENT")
 
             stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
@@ -2462,6 +2466,40 @@ def test_position_watcher_cornix_stop_price_duplicate_prevention() -> None:
             path.unlink()
         except OSError:
             pass
+
+
+def test_position_watcher_new_stop_notification_key_dedupe_and_closed_skip() -> None:
+    duplicate_path = Path(tempfile.gettempdir()) / "position_watcher_new_stop_key_dedupe_smoke.csv"
+    closed_path = Path(tempfile.gettempdir()) / "position_watcher_closed_new_stop_smoke.csv"
+    try:
+        pd.DataFrame(
+            [
+                {
+                    **_watcher_row(side="SHORT", tp1=68.500),
+                    "new_stop_notification_sent": 1,
+                    "new_stop_notification_key": "HYPEUSDT|SHORT|70.744",
+                    "new_stop_notification_stop_price": 70.744,
+                }
+            ]
+        ).to_csv(duplicate_path, index=False)
+        session = WatcherFakeSession("68.000")
+        stats = position_watcher.process_once(duplicate_path, session, _watcher_config("cornix_command"))
+        assert stats.skipped_duplicates == 1
+        assert stats.cornix_commands_sent == 0
+        assert len(session.posts) == 0
+
+        pd.DataFrame([{**_watcher_row(), "result": "WIN", "hit_target": "TP2"}]).to_csv(closed_path, index=False)
+        session = WatcherFakeSession("72.500")
+        stats = position_watcher.process_once(closed_path, session, _watcher_config("cornix_command"))
+        assert stats.checked == 0
+        assert stats.cornix_commands_sent == 0
+        assert len(session.posts) == 0
+    finally:
+        for path in [duplicate_path, closed_path]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 def test_position_watcher_command_safety_modes() -> None:
@@ -2669,6 +2707,7 @@ def main() -> int:
     test_position_watcher_tp1_breakeven_alert_and_dedupe()
     test_position_watcher_cornix_command_long_short_and_dedupe()
     test_position_watcher_cornix_stop_price_duplicate_prevention()
+    test_position_watcher_new_stop_notification_key_dedupe_and_closed_skip()
     test_position_watcher_command_safety_modes()
     test_position_watcher_cornix_breakeven_formats()
     test_position_watcher_cornix_test_command()

@@ -46,6 +46,10 @@ WATCHER_COLUMNS = {
     "cornix_be_stop_price": "",
     "cornix_be_command_status": "",
     "cornix_be_command_error": "",
+    "new_stop_notification_sent": 0,
+    "new_stop_notification_at": "",
+    "new_stop_notification_key": "",
+    "new_stop_notification_stop_price": "",
 }
 
 
@@ -222,6 +226,30 @@ def cornix_breakeven_already_sent_for_stop(row: pd.Series, stop_price: float | N
     if numeric_value(stored_stop) is None and (
         same_price(row.get("breakeven_price"), stop_price) or alert_already_sent(row.get("breakeven_recommended"))
     ):
+        return True
+    return False
+
+
+def new_stop_notification_key(row: pd.Series, stop_price: float | None) -> str:
+    symbol = str(row.get("symbol", "")).strip().upper()
+    direction = str(row.get("side", "")).strip().upper()
+    stop = format_price(stop_price) if stop_price is not None else ""
+    return f"{symbol}|{direction}|{stop}"
+
+
+def new_stop_notification_already_sent(row: pd.Series, stop_price: float | None) -> bool:
+    key = new_stop_notification_key(row, stop_price)
+    stored_key = str(row.get("new_stop_notification_key", "")).strip().upper()
+    if key and stored_key == key:
+        return True
+    if not alert_already_sent(row.get("new_stop_notification_sent")):
+        return False
+    if stop_price is None:
+        return True
+    stored_stop = row.get("new_stop_notification_stop_price")
+    if same_price(stored_stop, stop_price):
+        return True
+    if numeric_value(stored_stop) is None and same_price(row.get("breakeven_price"), stop_price):
         return True
     return False
 
@@ -482,6 +510,21 @@ def process_once(
         new_stop_price = breakeven_stop_price(row)
         signal_status = str(row.get("signal_status", "")).strip().lower()
         report_only_status = signal_status in {"tier_c_report_only", "weak_symbol_report_only"}
+        stop_notification_key = new_stop_notification_key(row, new_stop_price)
+        if new_stop_notification_already_sent(row, new_stop_price):
+            stats.skipped_duplicates += 1
+            LOGGER.info(
+                "SKIP_DUPLICATE_NEW_STOP_NOTIFICATION symbol=%s direction=%s stop=%s key=%s",
+                symbol,
+                str(row.get("side", "")).strip().upper(),
+                format_price(new_stop_price),
+                stop_notification_key,
+            )
+            if numeric_value(row.get("new_stop_notification_stop_price")) is None and new_stop_price is not None and not config.dry_run:
+                df.at[index, "new_stop_notification_stop_price"] = format_price(new_stop_price)
+                df.at[index, "new_stop_notification_key"] = stop_notification_key
+                save_journal(df, journal_path)
+            continue
         if config.command_mode == "cornix_command" and not report_only_status:
             if cornix_breakeven_already_sent_for_stop(row, new_stop_price):
                 stats.skipped_duplicates += 1
@@ -548,6 +591,10 @@ def process_once(
             df.at[index, "tp1_alert_at"] = datetime.now(timezone.utc).isoformat()
             df.at[index, "tp1_alert_source"] = "watcher"
             df.at[index, "breakeven_price"] = row.get("entry")
+            df.at[index, "new_stop_notification_sent"] = 1
+            df.at[index, "new_stop_notification_at"] = datetime.now(timezone.utc).isoformat()
+            df.at[index, "new_stop_notification_key"] = stop_notification_key
+            df.at[index, "new_stop_notification_stop_price"] = format_price(new_stop_price) if new_stop_price is not None else ""
             df.at[index, "position_management_stage"] = "TP1_REACHED_BE_RECOMMENDED"
             LOGGER.info("Watcher detected TP1 first: symbol=%s source=watcher", symbol)
             save_journal(df, journal_path)
