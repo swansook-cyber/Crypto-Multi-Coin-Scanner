@@ -449,6 +449,13 @@ def format_minutes(value: Any) -> str:
     return f"{minutes}m"
 
 
+def classification_symbols(table: pd.DataFrame, classification: str) -> str:
+    if table.empty or "Classification" not in table.columns or "Symbol" not in table.columns:
+        return NA
+    symbols = table.loc[table["Classification"].astype(str).eq(classification), "Symbol"].astype(str).tolist()
+    return ", ".join(symbols) if symbols else NA
+
+
 def win_rate_by_label(df: pd.DataFrame, column: str, best: bool) -> str:
     table = performance_by(df, column)
     if table.empty:
@@ -731,6 +738,11 @@ def build_complete_report(
     report["score_direction_audit"] = format_v3_table(v3["score_direction_audit"], limit=12)
     report["score_symbol_audit"] = format_v3_table(v3["score_symbol_audit"], limit=12)
     report["score_efficiency_audit"] = format_v3_table(v3["score_efficiency_audit"], limit=10)
+    report["production_universe_ranking"] = format_v3_table(v3["production_universe_ranking"], limit=20)
+    report["production_universe_tier_s"] = classification_symbols(v3["production_universe_ranking"], "Tier S")
+    report["production_universe_tier_a"] = classification_symbols(v3["production_universe_ranking"], "Tier A")
+    report["production_universe_watch"] = classification_symbols(v3["production_universe_ranking"], "Watch")
+    report["production_universe_report_only"] = classification_symbols(v3["production_universe_ranking"], "Report Only")
     report["shadow_filter_backtest"] = format_v3_table(v3["shadow_filter_backtest"], limit=12)
     report["recommended_actions"] = format_v3_table(v3["recommended_actions"], limit=12)
 
@@ -761,6 +773,7 @@ def build_complete_report(
         "score_direction_audit": v3["score_direction_audit"],
         "score_symbol_audit": v3["score_symbol_audit"],
         "score_efficiency_audit": v3["score_efficiency_audit"],
+        "production_universe_ranking": v3["production_universe_ranking"],
         "shadow_filter_backtest": v3["shadow_filter_backtest"],
         "recommended_actions": v3["recommended_actions"],
     }
@@ -790,6 +803,7 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
         "score_direction_audit": logs_dir / "score_direction_audit.csv",
         "score_symbol_audit": logs_dir / "score_symbol_audit.csv",
         "score_efficiency_audit": logs_dir / "score_efficiency_audit.csv",
+        "production_universe_ranking": logs_dir / "production_universe_ranking.csv",
         "shadow_filter_backtest": logs_dir / "shadow_filter_backtest.csv",
         "recommended_actions": logs_dir / "recommended_actions.csv",
     }
@@ -822,6 +836,7 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
     tables.get("score_direction_audit", pd.DataFrame()).to_csv(paths["score_direction_audit"], index=False)
     tables.get("score_symbol_audit", pd.DataFrame()).to_csv(paths["score_symbol_audit"], index=False)
     tables.get("score_efficiency_audit", pd.DataFrame()).to_csv(paths["score_efficiency_audit"], index=False)
+    tables.get("production_universe_ranking", pd.DataFrame()).to_csv(paths["production_universe_ranking"], index=False)
     tables.get("shadow_filter_backtest", pd.DataFrame()).to_csv(paths["shadow_filter_backtest"], index=False)
     tables.get("recommended_actions", pd.DataFrame()).to_csv(paths["recommended_actions"], index=False)
     position_row = tables.get("position_management", pd.DataFrame())

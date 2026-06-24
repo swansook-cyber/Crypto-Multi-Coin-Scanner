@@ -1596,6 +1596,8 @@ def test_daily_performance_report_metrics() -> None:
     assert "Short win rate:" in message
     assert "Score Performance Analytics" in message
     assert "Score Deep Audit" in message
+    assert "Production Universe Ranking" in message
+    assert "Recommended Production Universe" in message
     assert "Session Risk Experimental Performance" in message
 
 
@@ -1924,6 +1926,7 @@ def test_complete_performance_analytics_v1_outputs() -> None:
         assert paths["score_direction_audit"].exists()
         assert paths["score_symbol_audit"].exists()
         assert paths["score_efficiency_audit"].exists()
+        assert paths["production_universe_ranking"].exists()
     finally:
         for path in export_dir.glob("*.csv"):
             try:
@@ -2139,6 +2142,15 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
     assert not v3["score_direction_audit"].empty
     assert not v3["score_symbol_audit"].empty
     assert not v3["score_efficiency_audit"].empty
+    ranking = v3["production_universe_ranking"]
+    assert not ranking.empty
+    good_rank = ranking[ranking["Symbol"] == "GOODUSDT"].iloc[0]
+    weak_rank = ranking[ranking["Symbol"] == "WEAKUSDT"].iloc[0]
+    assert good_rank["Classification"] == "Tier A"
+    assert weak_rank["Classification"] == "Report Only"
+    assert float(good_rank["Confidence Score"]) > float(weak_rank["Confidence Score"])
+    assert int(good_rank["Closed Trades"]) == 6
+    assert int(weak_rank["Closed Trades"]) == 5
     score_symbol = v3["score_symbol_audit"]
     assert "GOODUSDT" in score_symbol["Symbol"].tolist()
     assert "WEAKUSDT" in score_symbol["Symbol"].tolist()
@@ -2168,6 +2180,7 @@ def test_performance_analytics_v3_missing_fields_safe() -> None:
     assert "Current" in shadow["Scenario"].tolist()
     assert "symbol_performance_v3" in v3
     assert "recommended_actions" in v3
+    assert "production_universe_ranking" in v3
 
 
 def test_dashboard_renders_html() -> None:

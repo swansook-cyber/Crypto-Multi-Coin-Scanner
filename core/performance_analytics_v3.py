@@ -16,6 +16,7 @@ from core.performance_analytics_v2 import canonical_session
 
 MIN_WEAK_SYMBOL_TRADES = 5
 WEAK_SYMBOL_WIN_RATE = 40.0
+PRODUCTION_UNIVERSE_MIN_TRADES = 5
 
 
 def _num(value: Any) -> float | None:
@@ -334,6 +335,99 @@ def score_efficiency_audit(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
+def _classification(trades: int, win_rate: float, net_r: float) -> str:
+    if trades >= 10 and win_rate >= 60.0 and net_r > 0:
+        return "Tier S"
+    if trades >= 5 and win_rate >= 55.0 and net_r >= 0:
+        return "Tier A"
+    if trades >= 5 and 40.0 <= win_rate < 55.0:
+        return "Watch"
+    if trades >= 5 and win_rate < 40.0:
+        return "Report Only"
+    return "Watch"
+
+
+def _confidence_score(trades: int, win_rate: float, net_r: float, tp1_rate: float, avg_drawdown: float) -> float:
+    net_r_per_trade = net_r / trades if trades else 0.0
+    net_r_component = max(0.0, min(100.0, 50.0 + net_r_per_trade * 20.0))
+    trade_count_component = min(100.0, trades / 20.0 * 100.0)
+    drawdown_stability = max(0.0, min(100.0, 100.0 - abs(avg_drawdown) * 10.0))
+    score = (
+        win_rate * 0.35
+        + net_r_component * 0.25
+        + trade_count_component * 0.15
+        + tp1_rate * 0.15
+        + drawdown_stability * 0.10
+    )
+    return round(score, 1)
+
+
+def production_universe_ranking(df: pd.DataFrame, min_trades: int = PRODUCTION_UNIVERSE_MIN_TRADES) -> pd.DataFrame:
+    columns = [
+        "Symbol",
+        "Closed Trades",
+        "Wins",
+        "Losses",
+        "Win Rate",
+        "Net R",
+        "Avg Max Profit %",
+        "Avg Drawdown %",
+        "TP1 Rate",
+        "TP2 Rate",
+        "Avg Time To TP",
+        "Avg Time To SL",
+        "Confidence Score",
+        "Classification",
+    ]
+    closed = _closed_trades(_sent_signals(df))
+    if closed.empty or "symbol" not in closed.columns:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    for symbol, group in closed.groupby(closed["symbol"].fillna("").replace("", "-").astype(str), dropna=False):
+        trades = int(len(group))
+        if trades < min_trades or not symbol or symbol == "-":
+            continue
+        wins = group[group["result"] == "WIN"].copy()
+        losses = group[group["result"] == "LOSS"].copy()
+        win_count = int(len(wins))
+        loss_count = int(len(losses))
+        win_rate = round(win_count / trades * 100.0, 1) if trades else 0.0
+        net_r = round(float(pd.to_numeric(group["estimated_r"], errors="coerce").fillna(0).sum()), 2)
+        hit_levels = group["hit_target"].map(_hit_level)
+        tp1_rate = round(float(hit_levels.ge(1).sum()) / trades * 100.0, 1) if trades else 0.0
+        tp2_rate = round(float(hit_levels.ge(2).sum()) / trades * 100.0, 1) if trades else 0.0
+        avg_profit = round(float(group["max_profit_pct"].mean()), 2) if group["max_profit_pct"].notna().any() else 0.0
+        avg_drawdown = round(float(group["max_drawdown_pct"].mean()), 2) if group["max_drawdown_pct"].notna().any() else 0.0
+        avg_time_to_tp = round(float(wins["holding_minutes"].mean()), 1) if not wins.empty and wins["holding_minutes"].notna().any() else 0.0
+        avg_time_to_sl = round(float(losses["holding_minutes"].mean()), 1) if not losses.empty and losses["holding_minutes"].notna().any() else 0.0
+        classification = _classification(trades, win_rate, net_r)
+        rows.append(
+            {
+                "Symbol": symbol,
+                "Closed Trades": trades,
+                "Wins": win_count,
+                "Losses": loss_count,
+                "Win Rate": win_rate,
+                "Net R": net_r,
+                "Avg Max Profit %": avg_profit,
+                "Avg Drawdown %": avg_drawdown,
+                "TP1 Rate": tp1_rate,
+                "TP2 Rate": tp2_rate,
+                "Avg Time To TP": avg_time_to_tp,
+                "Avg Time To SL": avg_time_to_sl,
+                "Confidence Score": _confidence_score(trades, win_rate, net_r, tp1_rate, avg_drawdown),
+                "Classification": classification,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["Confidence Score", "Net R", "Win Rate", "Closed Trades"],
+        ascending=[False, False, False, False],
+    )
+
+
 def weak_symbols(df: pd.DataFrame, min_trades: int = MIN_WEAK_SYMBOL_TRADES, max_win_rate: float = WEAK_SYMBOL_WIN_RATE) -> set[str]:
     table = group_performance(df, "symbol", "Symbol")
     if table.empty:
@@ -439,6 +533,7 @@ def build_performance_v3(df: pd.DataFrame) -> dict[str, Any]:
         "score_direction_audit": score_cross_audit(data, "side", "Direction"),
         "score_symbol_audit": score_cross_audit(data, "symbol", "Symbol", min_trades=5),
         "score_efficiency_audit": score_efficiency_audit(data),
+        "production_universe_ranking": production_universe_ranking(data),
         "shadow_filter_backtest": shadow_filter_backtest(data),
         "recommended_actions": recommendations(data),
     }
