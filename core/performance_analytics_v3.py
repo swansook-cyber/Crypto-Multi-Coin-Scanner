@@ -472,6 +472,145 @@ def score_calibration_recommendations(table: pd.DataFrame) -> list[str]:
     return recommendations
 
 
+def _strategy_summary(df: pd.DataFrame, scenario: str, current_win_rate: float, current_net_r: float) -> dict[str, Any]:
+    closed = _closed_trades(df)
+    wins = closed[closed["result"] == "WIN"]
+    losses = closed[closed["result"] == "LOSS"]
+    hit_levels = closed["hit_target"].map(_hit_level) if "hit_target" in closed else pd.Series(dtype=int)
+    pnl = pd.to_numeric(closed.get("pnl_percent", pd.Series(dtype=float)), errors="coerce")
+    profits = pnl[pnl > 0]
+    loss_values = pnl[pnl < 0]
+    win_rate = round(len(wins) / len(closed) * 100.0, 1) if len(closed) else 0.0
+    net_r = round(float(pd.to_numeric(closed.get("estimated_r", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()), 2)
+    return {
+        "Rank": "",
+        "Scenario": scenario,
+        "Closed Trades": int(len(closed)),
+        "Wins": int(len(wins)),
+        "Losses": int(len(losses)),
+        "Win Rate": win_rate,
+        "Net R": net_r,
+        "TP1 Rate": round(float(hit_levels.ge(1).sum()) / len(closed) * 100.0, 1) if len(closed) else 0.0,
+        "TP2 Rate": round(float(hit_levels.ge(2).sum()) / len(closed) * 100.0, 1) if len(closed) else 0.0,
+        "Avg Profit %": round(float(profits.mean()), 2) if not profits.empty else 0.0,
+        "Avg Loss %": round(float(loss_values.mean()), 2) if not loss_values.empty else 0.0,
+        "Avg Drawdown %": round(float(closed["max_drawdown_pct"].mean()), 2) if "max_drawdown_pct" in closed and closed["max_drawdown_pct"].notna().any() else 0.0,
+        "Avg Max Profit %": round(float(closed["max_profit_pct"].mean()), 2) if "max_profit_pct" in closed and closed["max_profit_pct"].notna().any() else 0.0,
+        "Diff vs Current Win Rate": round(win_rate - current_win_rate, 1),
+        "Diff vs Current Net R": round(net_r - current_net_r, 2),
+    }
+
+
+def strategy_filter_simulator(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Rank",
+        "Scenario",
+        "Closed Trades",
+        "Wins",
+        "Losses",
+        "Win Rate",
+        "Net R",
+        "TP1 Rate",
+        "TP2 Rate",
+        "Avg Profit %",
+        "Avg Loss %",
+        "Avg Drawdown %",
+        "Avg Max Profit %",
+        "Diff vs Current Win Rate",
+        "Diff vs Current Net R",
+    ]
+    data = normalize_for_v3(df)
+    base = _closed_trades(_sent_signals(data))
+    if base.empty:
+        return pd.DataFrame(columns=columns)
+
+    ranking = production_universe_ranking(data)
+    if ranking.empty:
+        production_symbols: set[str] = set()
+    else:
+        production_symbols = set(ranking.loc[~ranking["Classification"].eq("Report Only"), "Symbol"].astype(str))
+
+    current = _strategy_summary(base, "Current", 0.0, 0.0)
+    current_win_rate = float(current["Win Rate"])
+    current_net_r = float(current["Net R"])
+    score = pd.to_numeric(base["score"], errors="coerce")
+    tier = base["tier"].fillna("").astype(str).str.upper()
+    session = base["session"].fillna("").astype(str)
+    symbol = base["symbol"].fillna("").astype(str)
+    production_mask = symbol.isin(production_symbols)
+
+    scenarios: list[tuple[str, pd.Series]] = [
+        ("Current", pd.Series([True] * len(base), index=base.index)),
+        ("Score >= 75", score.ge(75)),
+        ("Score >= 80", score.ge(80)),
+        ("Score >= 85", score.ge(85)),
+        ("Score 75-89", score.ge(75) & score.le(89)),
+        ("Score 80-89", score.ge(80) & score.le(89)),
+        ("Score 75-94", score.ge(75) & score.le(94)),
+        ("Tier A/B only", tier.isin(["A", "B"])),
+        ("Tier A/B + Score >=80", tier.isin(["A", "B"]) & score.ge(80)),
+        ("Tier A/B + Score 75-89", tier.isin(["A", "B"]) & score.ge(75) & score.le(89)),
+        ("Production Universe only", production_mask),
+        ("Production Universe + Score >=80", production_mask & score.ge(80)),
+        ("Production Universe + Score 75-89", production_mask & score.ge(75) & score.le(89)),
+        ("Production Universe + No NewYork", production_mask & session.ne("NewYork")),
+        ("Production Universe + No London+NewYork", production_mask & session.ne("London+NewYork")),
+        ("Production Universe + Score 75-89 + No NewYork", production_mask & score.ge(75) & score.le(89) & session.ne("NewYork")),
+    ]
+    rows = [_strategy_summary(base[mask.fillna(False)].copy(), name, current_win_rate, current_net_r) for name, mask in scenarios]
+    table = pd.DataFrame(rows, columns=columns)
+    candidates = table[table["Scenario"].ne("Current") & table["Closed Trades"].gt(0)].copy()
+    if not candidates.empty:
+        candidates = candidates.sort_values(["Net R", "Win Rate", "Closed Trades"], ascending=[False, False, False])
+        for rank, index in enumerate(candidates.index, start=1):
+            table.loc[index, "Rank"] = str(rank)
+    return table
+
+
+def top_strategy_candidates(table: pd.DataFrame, limit: int = 5) -> pd.DataFrame:
+    columns = ["Rank", "Scenario", "Trades", "Win Rate", "Net R"]
+    if table.empty or "Rank" not in table.columns:
+        return pd.DataFrame(columns=columns)
+    ranked = table[table["Rank"].astype(str).str.strip().ne("")].copy()
+    if ranked.empty:
+        return pd.DataFrame(columns=columns)
+    ranked["Rank"] = pd.to_numeric(ranked["Rank"], errors="coerce")
+    ranked = ranked.sort_values("Rank").head(limit)
+    return pd.DataFrame(
+        {
+            "Rank": ranked["Rank"].astype(int),
+            "Scenario": ranked["Scenario"],
+            "Trades": ranked["Closed Trades"].astype(int),
+            "Win Rate": ranked["Win Rate"],
+            "Net R": ranked["Net R"],
+        },
+        columns=columns,
+    )
+
+
+def strategy_filter_recommendations(table: pd.DataFrame) -> list[str]:
+    if table.empty:
+        return ["N/A"]
+    candidates = table[table["Scenario"].ne("Current") & table["Closed Trades"].gt(0)].copy()
+    if candidates.empty:
+        return ["Not enough sample warning"]
+    recommendations = []
+    best_net_r = candidates.sort_values(["Net R", "Win Rate", "Closed Trades"], ascending=[False, False, False]).iloc[0]
+    best_wr = candidates.sort_values(["Win Rate", "Net R", "Closed Trades"], ascending=[False, False, False]).iloc[0]
+    balanced = candidates[candidates["Closed Trades"] >= max(5, int(candidates["Closed Trades"].max() * 0.25))].copy()
+    if balanced.empty:
+        balanced = candidates
+    best_balanced = balanced.sort_values(["Net R", "Win Rate", "Closed Trades"], ascending=[False, False, False]).iloc[0]
+    recommendations.append(f"Best Net R candidate: {best_net_r['Scenario']} ({best_net_r['Net R']}R)")
+    recommendations.append(f"Best Win Rate candidate: {best_wr['Scenario']} ({best_wr['Win Rate']}%)")
+    recommendations.append(f"Best balanced candidate: {best_balanced['Scenario']} ({int(best_balanced['Closed Trades'])} trades)")
+    if int(best_net_r["Closed Trades"]) < 5 or int(best_wr["Closed Trades"]) < 5:
+        recommendations.append("Too few trades warning")
+    if int(candidates["Closed Trades"].max()) < 10:
+        recommendations.append("Not enough sample warning")
+    return recommendations
+
+
 def _classification(trades: int, win_rate: float, net_r: float) -> str:
     if trades >= 10 and win_rate >= 60.0 and net_r > 0:
         return "Tier S"
@@ -738,6 +877,7 @@ def format_table(table: pd.DataFrame, limit: int = 8) -> str:
 def build_performance_v3(df: pd.DataFrame) -> dict[str, Any]:
     data = normalize_for_v3(df)
     calibration = score_calibration_report(data)
+    simulator = strategy_filter_simulator(data)
     return {
         "symbol_performance_v3": group_performance(data, "symbol", "Symbol"),
         "session_performance_v3": group_performance(data, "session", "Session"),
@@ -752,6 +892,9 @@ def build_performance_v3(df: pd.DataFrame) -> dict[str, Any]:
         "score_efficiency_audit": score_efficiency_audit(data),
         "score_calibration_report": calibration,
         "score_calibration_recommendations": score_calibration_recommendations(calibration),
+        "strategy_filter_simulator": simulator,
+        "top_strategy_candidates": top_strategy_candidates(simulator),
+        "strategy_filter_recommendations": strategy_filter_recommendations(simulator),
         "production_universe_ranking": production_universe_ranking(data),
         "post_filter_live_performance": post_filter_live_performance(data),
         "production_universe_performance": production_universe_performance(data),

@@ -1598,6 +1598,9 @@ def test_daily_performance_report_metrics() -> None:
     assert "Score Deep Audit" in message
     assert "Score Calibration Report" in message
     assert "Score Calibration Recommendations" in message
+    assert "Strategy Filter Simulator" in message
+    assert "Top Strategy Candidates" in message
+    assert "Strategy Filter Recommendations" in message
     assert "Production Universe Ranking" in message
     assert "Recommended Production Universe" in message
     assert "Post-Filter Live Performance" in message
@@ -1931,6 +1934,8 @@ def test_complete_performance_analytics_v1_outputs() -> None:
         assert paths["score_symbol_audit"].exists()
         assert paths["score_efficiency_audit"].exists()
         assert paths["score_calibration_report"].exists()
+        assert paths["strategy_filter_simulator"].exists()
+        assert paths["top_strategy_candidates"].exists()
         assert paths["production_universe_ranking"].exists()
         assert paths["post_filter_live_performance"].exists()
         assert paths["production_universe_performance"].exists()
@@ -2173,6 +2178,17 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
     assert "Calibration" in calibration.columns
     assert "Diagnostics" in calibration.columns
     assert v3["score_calibration_recommendations"]
+    simulator = v3["strategy_filter_simulator"]
+    assert not simulator.empty
+    assert "Production Universe + Score 75-89 + No NewYork" in simulator["Scenario"].tolist()
+    assert "Diff vs Current Win Rate" in simulator.columns
+    assert "Diff vs Current Net R" in simulator.columns
+    current_strategy = simulator[simulator["Scenario"] == "Current"].iloc[0]
+    assert int(current_strategy["Closed Trades"]) == 11
+    top_candidates = v3["top_strategy_candidates"]
+    assert not top_candidates.empty
+    assert int(top_candidates.iloc[0]["Rank"]) == 1
+    assert v3["strategy_filter_recommendations"]
     ranking = v3["production_universe_ranking"]
     assert not ranking.empty
     good_rank = ranking[ranking["Symbol"] == "GOODUSDT"].iloc[0]
@@ -2272,6 +2288,7 @@ def test_performance_analytics_v3_missing_fields_safe() -> None:
     assert "recommended_actions" in v3
     assert "production_universe_ranking" in v3
     assert "score_calibration_report" in v3
+    assert "strategy_filter_simulator" in v3
 
 
 def test_dashboard_renders_html() -> None:
