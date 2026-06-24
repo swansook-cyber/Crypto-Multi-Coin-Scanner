@@ -738,6 +738,8 @@ def build_complete_report(
     report["score_direction_audit"] = format_v3_table(v3["score_direction_audit"], limit=12)
     report["score_symbol_audit"] = format_v3_table(v3["score_symbol_audit"], limit=12)
     report["score_efficiency_audit"] = format_v3_table(v3["score_efficiency_audit"], limit=10)
+    report["score_calibration_report"] = format_v3_table(v3["score_calibration_report"], limit=10)
+    report["score_calibration_recommendations"] = "\n".join(v3["score_calibration_recommendations"]) if v3["score_calibration_recommendations"] else NA
     report["production_universe_ranking"] = format_v3_table(v3["production_universe_ranking"], limit=20)
     report["production_universe_tier_s"] = classification_symbols(v3["production_universe_ranking"], "Tier S")
     report["production_universe_tier_a"] = classification_symbols(v3["production_universe_ranking"], "Tier A")
@@ -775,6 +777,7 @@ def build_complete_report(
         "score_direction_audit": v3["score_direction_audit"],
         "score_symbol_audit": v3["score_symbol_audit"],
         "score_efficiency_audit": v3["score_efficiency_audit"],
+        "score_calibration_report": v3["score_calibration_report"],
         "production_universe_ranking": v3["production_universe_ranking"],
         "post_filter_live_performance": v3["post_filter_live_performance"],
         "production_universe_performance": v3["production_universe_performance"],
@@ -807,6 +810,7 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
         "score_direction_audit": logs_dir / "score_direction_audit.csv",
         "score_symbol_audit": logs_dir / "score_symbol_audit.csv",
         "score_efficiency_audit": logs_dir / "score_efficiency_audit.csv",
+        "score_calibration_report": logs_dir / "score_calibration_report.csv",
         "production_universe_ranking": logs_dir / "production_universe_ranking.csv",
         "post_filter_live_performance": logs_dir / "post_filter_live_performance.csv",
         "production_universe_performance": logs_dir / "production_universe_performance.csv",
@@ -842,6 +846,7 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
     tables.get("score_direction_audit", pd.DataFrame()).to_csv(paths["score_direction_audit"], index=False)
     tables.get("score_symbol_audit", pd.DataFrame()).to_csv(paths["score_symbol_audit"], index=False)
     tables.get("score_efficiency_audit", pd.DataFrame()).to_csv(paths["score_efficiency_audit"], index=False)
+    tables.get("score_calibration_report", pd.DataFrame()).to_csv(paths["score_calibration_report"], index=False)
     tables.get("production_universe_ranking", pd.DataFrame()).to_csv(paths["production_universe_ranking"], index=False)
     tables.get("post_filter_live_performance", pd.DataFrame()).to_csv(paths["post_filter_live_performance"], index=False)
     tables.get("production_universe_performance", pd.DataFrame()).to_csv(paths["production_universe_performance"], index=False)

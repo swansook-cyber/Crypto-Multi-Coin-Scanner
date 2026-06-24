@@ -1596,6 +1596,8 @@ def test_daily_performance_report_metrics() -> None:
     assert "Short win rate:" in message
     assert "Score Performance Analytics" in message
     assert "Score Deep Audit" in message
+    assert "Score Calibration Report" in message
+    assert "Score Calibration Recommendations" in message
     assert "Production Universe Ranking" in message
     assert "Recommended Production Universe" in message
     assert "Post-Filter Live Performance" in message
@@ -1928,6 +1930,7 @@ def test_complete_performance_analytics_v1_outputs() -> None:
         assert paths["score_direction_audit"].exists()
         assert paths["score_symbol_audit"].exists()
         assert paths["score_efficiency_audit"].exists()
+        assert paths["score_calibration_report"].exists()
         assert paths["production_universe_ranking"].exists()
         assert paths["post_filter_live_performance"].exists()
         assert paths["production_universe_performance"].exists()
@@ -2165,6 +2168,11 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
     assert not v3["score_direction_audit"].empty
     assert not v3["score_symbol_audit"].empty
     assert not v3["score_efficiency_audit"].empty
+    calibration = v3["score_calibration_report"]
+    assert not calibration.empty
+    assert "Calibration" in calibration.columns
+    assert "Diagnostics" in calibration.columns
+    assert v3["score_calibration_recommendations"]
     ranking = v3["production_universe_ranking"]
     assert not ranking.empty
     good_rank = ranking[ranking["Symbol"] == "GOODUSDT"].iloc[0]
@@ -2203,6 +2211,52 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
     pd.testing.assert_frame_equal(df, before)
 
 
+def test_score_calibration_report_detects_inversion() -> None:
+    rows = []
+    for index in range(5):
+        rows.append(
+            {
+                "timestamp": f"2026-06-04T0{index}:00:00+00:00",
+                "symbol": "LOWGOOD",
+                "side": "LONG",
+                "signal_status": "sent",
+                "result": "WIN",
+                "hit_target": "TP2",
+                "risk_reward": 2.0,
+                "pnl_percent": 1.5,
+                "score": 78,
+                "max_profit_pct": 2.0,
+                "max_drawdown_pct": -0.3,
+            }
+        )
+    for index in range(5):
+        rows.append(
+            {
+                "timestamp": f"2026-06-04T1{index}:00:00+00:00",
+                "symbol": "HIGHBAD",
+                "side": "SHORT",
+                "signal_status": "sent",
+                "result": "LOSS",
+                "hit_target": "SL",
+                "risk_reward": 2.0,
+                "pnl_percent": -1.0,
+                "score": 100,
+                "max_profit_pct": 0.2,
+                "max_drawdown_pct": -1.4,
+            }
+        )
+    v3 = build_performance_v3(pd.DataFrame(rows))
+    calibration = v3["score_calibration_report"]
+    low = calibration[calibration["Score Bucket"] == "75-79"].iloc[0]
+    high = calibration[calibration["Score Bucket"] == "100+"].iloc[0]
+    assert low["Calibration"] == "UNDERVALUED"
+    assert high["Calibration"] == "OVERVALUED"
+    assert "HIGH SCORE UNDERPERFORMING" in high["Diagnostics"]
+    assert "SCORE INVERSION" in high["Diagnostics"]
+    assert "Score inversion detected" in v3["score_calibration_recommendations"]
+    assert "High-score signals underperform lower-score signals" in v3["score_calibration_recommendations"]
+
+
 def test_performance_analytics_v3_missing_fields_safe() -> None:
     df = pd.DataFrame(
         [
@@ -2217,6 +2271,7 @@ def test_performance_analytics_v3_missing_fields_safe() -> None:
     assert "symbol_performance_v3" in v3
     assert "recommended_actions" in v3
     assert "production_universe_ranking" in v3
+    assert "score_calibration_report" in v3
 
 
 def test_dashboard_renders_html() -> None:
@@ -2860,6 +2915,7 @@ def main() -> int:
     test_performance_analytics_production_mapping()
     test_performance_analytics_v2_tables_and_warnings()
     test_performance_analytics_v3_shadow_filters_and_recommendations()
+    test_score_calibration_report_detects_inversion()
     test_performance_analytics_v3_missing_fields_safe()
     test_dashboard_renders_html()
     test_dashboard_v2_handles_missing_and_empty_data()

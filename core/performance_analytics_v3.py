@@ -362,6 +362,116 @@ def score_efficiency_audit(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
+def score_calibration_report(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Score Bucket",
+        "Closed Trades",
+        "Wins",
+        "Losses",
+        "Win Rate",
+        "Net R",
+        "TP1 Rate",
+        "TP2 Rate",
+        "Avg Profit %",
+        "Avg Loss %",
+        "Avg Max Profit %",
+        "Avg Drawdown %",
+        "Win Rate Rank",
+        "Net R Rank",
+        "Score Rank",
+        "Calibration",
+        "Diagnostics",
+    ]
+    data = _closed_scored_trades(df)
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+
+    order = ["75-79", "80-84", "85-89", "90-94", "95-99", "100+"]
+    score_rank = {bucket: len(order) - index for index, bucket in enumerate(order)}
+    rows = []
+    pnl = pd.to_numeric(data.get("pnl_percent", pd.Series(dtype=float)), errors="coerce")
+    data = data.assign(pnl_percent=pnl)
+    for bucket in order:
+        group = data[data["score_bucket"] == bucket]
+        if group.empty:
+            continue
+        wins = group[group["result"] == "WIN"]
+        losses = group[group["result"] == "LOSS"]
+        hit_levels = group["hit_target"].map(_hit_level)
+        profits = group["pnl_percent"][group["pnl_percent"] > 0]
+        loss_values = group["pnl_percent"][group["pnl_percent"] < 0]
+        rows.append(
+            {
+                "Score Bucket": bucket,
+                "Closed Trades": int(len(group)),
+                "Wins": int(len(wins)),
+                "Losses": int(len(losses)),
+                "Win Rate": round(len(wins) / len(group) * 100.0, 1) if len(group) else 0.0,
+                "Net R": round(float(group["estimated_r"].fillna(0).sum()), 2),
+                "TP1 Rate": round(float(hit_levels.ge(1).sum()) / len(group) * 100.0, 1) if len(group) else 0.0,
+                "TP2 Rate": round(float(hit_levels.ge(2).sum()) / len(group) * 100.0, 1) if len(group) else 0.0,
+                "Avg Profit %": round(float(profits.mean()), 2) if not profits.empty else 0.0,
+                "Avg Loss %": round(float(loss_values.mean()), 2) if not loss_values.empty else 0.0,
+                "Avg Max Profit %": round(float(group["max_profit_pct"].mean()), 2) if group["max_profit_pct"].notna().any() else 0.0,
+                "Avg Drawdown %": round(float(group["max_drawdown_pct"].mean()), 2) if group["max_drawdown_pct"].notna().any() else 0.0,
+                "Score Rank": score_rank[bucket],
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=columns)
+
+    table = pd.DataFrame(rows)
+    table["Win Rate Rank"] = table["Win Rate"].rank(method="min", ascending=False).astype(int)
+    table["Net R Rank"] = table["Net R"].rank(method="min", ascending=False).astype(int)
+    calibrations = []
+    diagnostics_values = []
+    for _, row in table.iterrows():
+        bucket = str(row["Score Bucket"])
+        actual_rank = (int(row["Win Rate Rank"]) + int(row["Net R Rank"])) / 2.0
+        expected_rank = int(row["Score Rank"])
+        lower_buckets = table[table["Score Rank"] > expected_rank]
+        diagnostics = []
+        if actual_rank - expected_rank >= 1.0:
+            calibration = "OVERVALUED"
+            diagnostics.append("OVERCONFIDENT BUCKET")
+        elif expected_rank - actual_rank >= 1.0:
+            calibration = "UNDERVALUED"
+            diagnostics.append("UNDERVALUED BUCKET")
+        else:
+            calibration = "FAIR"
+        if not lower_buckets.empty:
+            if float(lower_buckets["Win Rate"].max()) > float(row["Win Rate"]) + 5.0:
+                diagnostics.append("HIGH SCORE UNDERPERFORMING" if bucket in {"95-99", "100+"} else "SCORE INVERSION")
+            if float(lower_buckets["Net R"].max()) > float(row["Net R"]) + 2.0:
+                diagnostics.append("SCORE INVERSION")
+        if not diagnostics:
+            diagnostics.append("OK")
+        calibrations.append(calibration)
+        diagnostics_values.append(", ".join(dict.fromkeys(diagnostics)))
+    table["Calibration"] = calibrations
+    table["Diagnostics"] = diagnostics_values
+    table = table[columns]
+    return table.sort_values("Score Rank", ascending=False)
+
+
+def score_calibration_recommendations(table: pd.DataFrame) -> list[str]:
+    if table.empty:
+        return ["N/A"]
+    recommendations = []
+    overvalued = table[table["Calibration"].eq("OVERVALUED")]
+    if not overvalued[overvalued["Score Bucket"].isin(["90-94", "95-99", "100+"])].empty:
+        recommendations.append("Score inflation detected above 90")
+    if not overvalued[overvalued["Score Bucket"].isin(["95-99", "100+"])].empty:
+        recommendations.append("Score inflation detected above 95")
+    if table["Diagnostics"].astype(str).str.contains("SCORE INVERSION", regex=False).any():
+        recommendations.append("Score inversion detected")
+    if table["Diagnostics"].astype(str).str.contains("HIGH SCORE UNDERPERFORMING", regex=False).any():
+        recommendations.append("High-score signals underperform lower-score signals")
+    if not recommendations:
+        recommendations.append("Score system appears calibrated")
+    return recommendations
+
+
 def _classification(trades: int, win_rate: float, net_r: float) -> str:
     if trades >= 10 and win_rate >= 60.0 and net_r > 0:
         return "Tier S"
@@ -627,6 +737,7 @@ def format_table(table: pd.DataFrame, limit: int = 8) -> str:
 
 def build_performance_v3(df: pd.DataFrame) -> dict[str, Any]:
     data = normalize_for_v3(df)
+    calibration = score_calibration_report(data)
     return {
         "symbol_performance_v3": group_performance(data, "symbol", "Symbol"),
         "session_performance_v3": group_performance(data, "session", "Session"),
@@ -639,6 +750,8 @@ def build_performance_v3(df: pd.DataFrame) -> dict[str, Any]:
         "score_direction_audit": score_cross_audit(data, "side", "Direction"),
         "score_symbol_audit": score_cross_audit(data, "symbol", "Symbol", min_trades=5),
         "score_efficiency_audit": score_efficiency_audit(data),
+        "score_calibration_report": calibration,
+        "score_calibration_recommendations": score_calibration_recommendations(calibration),
         "production_universe_ranking": production_universe_ranking(data),
         "post_filter_live_performance": post_filter_live_performance(data),
         "production_universe_performance": production_universe_performance(data),
