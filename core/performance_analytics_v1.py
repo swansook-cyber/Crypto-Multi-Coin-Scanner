@@ -55,6 +55,10 @@ DAILY_PERFORMANCE_COLUMNS = [
     "weak_symbol_report_wins",
     "weak_symbol_report_losses",
     "weak_symbol_report_win_rate",
+    "session_risk_report_count",
+    "session_risk_report_wins",
+    "session_risk_report_losses",
+    "session_risk_report_win_rate",
     "tp1_alerts_watcher",
     "tp1_alerts_outcome_review",
     "breakeven_recommendations",
@@ -626,6 +630,12 @@ def build_complete_report(
     weak_symbol_report_closed = closed_trades(weak_symbol_report)
     weak_symbol_report_wins = winning_trades(weak_symbol_report)
     weak_symbol_report_losses = losing_trades(weak_symbol_report)
+    session_risk_report = scanner_day[
+        scanner_day["signal_status"].fillna("").astype(str).str.lower().eq("session_risk_report_only")
+    ].copy() if not scanner_day.empty else scanner_day
+    session_risk_report_closed = closed_trades(session_risk_report)
+    session_risk_report_wins = winning_trades(session_risk_report)
+    session_risk_report_losses = losing_trades(session_risk_report)
     closed = closed_trades(sent_day)
     wins = winning_trades(sent_day)
     losses = losing_trades(sent_day)
@@ -676,6 +686,10 @@ def build_complete_report(
         "weak_symbol_report_wins": int(len(weak_symbol_report_wins)),
         "weak_symbol_report_losses": int(len(weak_symbol_report_losses)),
         "weak_symbol_report_win_rate": safe_percent(len(weak_symbol_report_wins), len(weak_symbol_report_closed)),
+        "session_risk_report_count": int(len(session_risk_report)),
+        "session_risk_report_wins": int(len(session_risk_report_wins)),
+        "session_risk_report_losses": int(len(session_risk_report_losses)),
+        "session_risk_report_win_rate": safe_percent(len(session_risk_report_wins), len(session_risk_report_closed)),
         "tp1_alerts_watcher": int(tp1_sources.eq("watcher").sum()) if not tp1_sources.empty else 0,
         "tp1_alerts_outcome_review": int(tp1_sources.eq("outcome_review").sum()) if not tp1_sources.empty else 0,
         "breakeven_recommendations": int(breakeven.sum()) if not breakeven.empty else 0,

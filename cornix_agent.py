@@ -192,6 +192,7 @@ class ScannerConfig:
     telegram_external_inbox_chat_id: str
     enable_tier_c_report_only: bool
     weak_symbol_report_only_symbols: list[str]
+    session_report_only_sessions: list[str]
 
     @classmethod
     def from_env(cls) -> "ScannerConfig":
@@ -309,6 +310,11 @@ class ScannerConfig:
             weak_symbol_report_only_symbols=parse_symbols(
                 os.getenv("WEAK_SYMBOL_REPORT_ONLY_SYMBOLS", "SEIUSDT,FILUSDT,WIFUSDT,BNBUSDT,OPUSDT,UNIUSDT,LINKUSDT")
             ),
+            session_report_only_sessions=[
+                item.strip()
+                for item in os.getenv("SESSION_REPORT_ONLY_SESSIONS", "NewYork,London+NewYork").split(",")
+                if item.strip()
+            ],
         )
 
 
@@ -1110,7 +1116,7 @@ class TradeJournalLogger:
             df.to_csv(self.path, index=False)
 
     def log_signal(self, signal: TradeSignal, signal_status: str = "sent", skip_reason: str = "") -> None:
-        active_report_statuses = {"sent", "tier_c_report_only", "weak_symbol_report_only"}
+        active_report_statuses = {"sent", "tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only"}
         result = "OPEN" if signal_status in active_report_statuses else "SKIPPED"
         with self.path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
@@ -1477,6 +1483,13 @@ class TelegramNotifier:
             "Weak symbol report-only",
         )
 
+    def send_session_risk_report_signal(self, signal: TradeSignal) -> bool:
+        return self.send_report_only_signal(
+            signal,
+            "SESSION RISK REPORT ONLY",
+            "Session risk report-only",
+        )
+
     def send_report_only_signal(self, signal: TradeSignal, header: str, log_label: str) -> bool:
         message = (
             f"{header}\n"
@@ -1782,6 +1795,12 @@ class AgentRunner:
                 self.chart_exporter.export(signal.symbol, self.indicators.add_indicators(self.data_client.fetch_closed_klines(signal.symbol, "1h", 120)), signal)
             except Exception as exc:
                 LOGGER.warning("Chart export failed for %s: %s", signal.symbol, exc)
+            if signal.market_session in self.config.session_report_only_sessions:
+                self.journal.log_signal(signal, "session_risk_report_only", "session_risk_experimental_report_only")
+                if self.notifier.send_session_risk_report_signal(signal) and not self.config.dry_run:
+                    self.mark_sent(signal)
+                LOGGER.info("%s routed to reports only: session risk mode %s", signal.symbol, signal.market_session)
+                continue
             if signal.symbol in self.config.weak_symbol_report_only_symbols:
                 self.journal.log_signal(signal, "weak_symbol_report_only", "weak_symbol_experimental_report_only")
                 if self.notifier.send_weak_symbol_report_signal(signal) and not self.config.dry_run:

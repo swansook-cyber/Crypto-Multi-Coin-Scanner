@@ -34,6 +34,7 @@
 - Real-Time Position Watcher V2 via `position_watcher.py`
 - Tier C Experimental Report-Only Mode via `ENABLE_TIER_C_REPORT_ONLY`
 - Weak Symbol Experimental Report-Only Mode via `WEAK_SYMBOL_REPORT_ONLY_SYMBOLS`
+- Session Risk Report-Only Mode via `SESSION_REPORT_ONLY_SESSIONS`
 - External Signal Refine V2 via `external_signal_analyzer.py`
 - External Signal Inbox polling via `telegram_external_inbox.py`
 - External inbox VPS listener loop via `telegram_external_inbox.py --loop`
@@ -84,6 +85,7 @@ Tracked metrics include win/loss, win rate, TP1/TP2/TP3/SL hits, cumulative Net 
 - Tier C: experimental/high-filter symbols
 - Optional `ENABLE_TIER_C_REPORT_ONLY=true` sends qualifying Tier C setups to Reports only and keeps them out of Signals/Cornix
 - `WEAK_SYMBOL_REPORT_ONLY_SYMBOLS` sends selected symbols to Reports only with the `WEAK SYMBOL EXPERIMENTAL REPORT ONLY` header; these symbols are kept out of Signals/Cornix while outcomes remain trackable in performance reports
+- `SESSION_REPORT_ONLY_SESSIONS` sends selected sessions to Reports only with the `SESSION RISK REPORT ONLY` header; these setups are kept out of Signals/Cornix while outcomes remain trackable in performance reports
 
 Tier mode uses:
 
