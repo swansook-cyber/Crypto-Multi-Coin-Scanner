@@ -50,6 +50,15 @@ def _hit_level(value: Any) -> int:
     return 0 if numeric is None else max(0, int(numeric))
 
 
+def _first_numeric(data: pd.DataFrame, columns: list[str]) -> pd.Series:
+    result = pd.Series([pd.NA] * len(data), index=data.index, dtype="Float64")
+    for column in columns:
+        if column in data.columns:
+            values = pd.to_numeric(data[column], errors="coerce")
+            result = result.where(result.notna(), values)
+    return result
+
+
 def estimated_r(row: pd.Series) -> float:
     real_rr = _num(row.get("real_rr"))
     if real_rr is not None:
@@ -104,6 +113,9 @@ def normalize_for_v3(df: pd.DataFrame) -> pd.DataFrame:
         "pnl_percent": "",
         "max_profit_pct": "",
         "max_drawdown_pct": "",
+        "score": "",
+        "raw_score": "",
+        "setup_strength": "",
     }
     for column, default in defaults.items():
         if column not in data.columns:
@@ -122,6 +134,9 @@ def normalize_for_v3(df: pd.DataFrame) -> pd.DataFrame:
     normalized["signal_status"] = data["signal_status"].fillna("sent").replace("", "sent").astype(str).str.lower()
     normalized["estimated_r"] = data.apply(estimated_r, axis=1)
     normalized["pnl_percent"] = data.apply(pnl_percent, axis=1)
+    normalized["score"] = _first_numeric(data, ["score", "raw_score", "setup_strength"])
+    normalized["max_profit_pct"] = pd.to_numeric(data["max_profit_pct"], errors="coerce")
+    normalized["max_drawdown_pct"] = pd.to_numeric(data["max_drawdown_pct"], errors="coerce")
     return normalized
 
 
@@ -165,6 +180,73 @@ def group_performance(df: pd.DataFrame, column: str, label: str) -> pd.DataFrame
             }
         )
     return pd.DataFrame(rows, columns=columns).sort_values(["Net R", "Win Rate", "Trades"], ascending=[False, False, False])
+
+
+def score_range_label(score: Any) -> str | None:
+    value = _num(score)
+    if value is None:
+        return None
+    if 75 <= value <= 79:
+        return "75-79"
+    if 80 <= value <= 84:
+        return "80-84"
+    if 85 <= value <= 89:
+        return "85-89"
+    if 90 <= value <= 94:
+        return "90-94"
+    if 95 <= value <= 99:
+        return "95-99"
+    if value >= 100:
+        return "100+"
+    return None
+
+
+def score_bucket_performance(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Score Range",
+        "Trades",
+        "Wins",
+        "Losses",
+        "Win Rate",
+        "Net R",
+        "TP1 Hits",
+        "TP2 Hits",
+        "Avg Max Profit %",
+        "Avg Drawdown %",
+    ]
+    closed = _closed_trades(_sent_signals(df))
+    if closed.empty or "score" not in closed.columns:
+        return pd.DataFrame(columns=columns)
+    data = closed.copy()
+    data["score_range"] = data["score"].map(score_range_label)
+    data = data[data["score_range"].notna()].copy()
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+
+    order = ["75-79", "80-84", "85-89", "90-94", "95-99", "100+"]
+    rows = []
+    for label in order:
+        group = data[data["score_range"] == label]
+        if group.empty:
+            continue
+        wins = int((group["result"] == "WIN").sum())
+        losses = int((group["result"] == "LOSS").sum())
+        hit_levels = group["hit_target"].map(_hit_level)
+        rows.append(
+            {
+                "Score Range": label,
+                "Trades": int(len(group)),
+                "Wins": wins,
+                "Losses": losses,
+                "Win Rate": round(wins / len(group) * 100, 1) if len(group) else 0.0,
+                "Net R": round(float(group["estimated_r"].fillna(0).sum()), 2),
+                "TP1 Hits": int(hit_levels.ge(1).sum()),
+                "TP2 Hits": int(hit_levels.ge(2).sum()),
+                "Avg Max Profit %": round(float(group["max_profit_pct"].mean()), 2) if group["max_profit_pct"].notna().any() else 0.0,
+                "Avg Drawdown %": round(float(group["max_drawdown_pct"].mean()), 2) if group["max_drawdown_pct"].notna().any() else 0.0,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
 
 
 def weak_symbols(df: pd.DataFrame, min_trades: int = MIN_WEAK_SYMBOL_TRADES, max_win_rate: float = WEAK_SYMBOL_WIN_RATE) -> set[str]:
@@ -266,6 +348,7 @@ def build_performance_v3(df: pd.DataFrame) -> dict[str, Any]:
         "tier_performance_v3": group_performance(data, "tier", "Tier"),
         "direction_performance_v3": group_performance(data, "side", "Direction"),
         "hour_performance_v3": group_performance(data.dropna(subset=["hour"]).assign(hour=lambda x: x["hour"].astype(int).astype(str)), "hour", "Hour"),
+        "score_performance_v3": score_bucket_performance(data),
         "shadow_filter_backtest": shadow_filter_backtest(data),
         "recommended_actions": recommendations(data),
     }

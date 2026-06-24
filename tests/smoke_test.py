@@ -1565,6 +1565,7 @@ def test_daily_performance_report_metrics() -> None:
     assert "Sample size is still small. Use for monitoring only." in message
     assert "Long win rate:" in message
     assert "Short win rate:" in message
+    assert "Score Performance Analytics" in message
 
 
 def test_performance_report_routes_to_reports_only() -> None:
@@ -2015,6 +2016,9 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
                 "hit_target": "SL",
                 "risk_reward": 2.0,
                 "pnl_percent": -1.0,
+                "score": 78,
+                "max_profit_pct": 0.5,
+                "max_drawdown_pct": -1.2,
             }
         )
     for index in range(6):
@@ -2030,6 +2034,9 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
                 "hit_target": "TP1",
                 "risk_reward": 2.0,
                 "pnl_percent": 1.2,
+                "score": 100 + index,
+                "max_profit_pct": 2.5,
+                "max_drawdown_pct": -0.4,
             }
         )
     df = pd.DataFrame(rows)
@@ -2042,6 +2049,17 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
     assert not v3["tier_performance_v3"].empty
     assert not v3["direction_performance_v3"].empty
     assert not v3["hour_performance_v3"].empty
+    score_perf = v3["score_performance_v3"]
+    assert not score_perf.empty
+    bucket_75 = score_perf[score_perf["Score Range"] == "75-79"].iloc[0]
+    bucket_100 = score_perf[score_perf["Score Range"] == "100+"].iloc[0]
+    assert int(bucket_75["Trades"]) == 5
+    assert int(bucket_75["Losses"]) == 5
+    assert float(bucket_75["Net R"]) == -5.0
+    assert int(bucket_100["Trades"]) == 6
+    assert int(bucket_100["Wins"]) == 6
+    assert int(bucket_100["TP1 Hits"]) == 6
+    assert float(bucket_100["Avg Max Profit %"]) == 2.5
     assert "No Tier C" in shadow["Scenario"].tolist()
     assert "Exclude weak symbols <40% WR / >=5 trades" in shadow["Scenario"].tolist()
     no_tier_c = shadow[shadow["Scenario"] == "No Tier C"].iloc[0]

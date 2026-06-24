@@ -233,6 +233,8 @@ def format_report(report: dict[str, Any]) -> str:
         f"{report.get('performance_v3_direction') or NA}\n\n"
         "By Hour UTC:\n"
         f"{report.get('performance_v3_hour') or NA}\n\n"
+        "Score Performance Analytics\n"
+        f"{report.get('score_performance_v3') or NA}\n\n"
         "Shadow Filter Backtest\n"
         f"{report.get('shadow_filter_backtest') or NA}\n\n"
         "Recommended Actions\n"
