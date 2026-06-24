@@ -1566,6 +1566,7 @@ def test_daily_performance_report_metrics() -> None:
     assert "Long win rate:" in message
     assert "Short win rate:" in message
     assert "Score Performance Analytics" in message
+    assert "Score Deep Audit" in message
 
 
 def test_performance_report_routes_to_reports_only() -> None:
@@ -1852,6 +1853,11 @@ def test_complete_performance_analytics_v1_outputs() -> None:
         assert daily.loc[0, "tp3_hits"] == 1
         position = pd.read_csv(paths["position_management"])
         assert position.loc[0, "hold_count"] == 1
+        assert paths["score_tier_audit"].name == "score_tier_audit.csv"
+        assert paths["score_session_audit"].exists()
+        assert paths["score_direction_audit"].exists()
+        assert paths["score_symbol_audit"].exists()
+        assert paths["score_efficiency_audit"].exists()
     finally:
         for path in export_dir.glob("*.csv"):
             try:
@@ -2019,6 +2025,7 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
                 "score": 78,
                 "max_profit_pct": 0.5,
                 "max_drawdown_pct": -1.2,
+                "holding_minutes": 35,
             }
         )
     for index in range(6):
@@ -2037,6 +2044,7 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
                 "score": 100 + index,
                 "max_profit_pct": 2.5,
                 "max_drawdown_pct": -0.4,
+                "holding_minutes": 55,
             }
         )
     df = pd.DataFrame(rows)
@@ -2060,6 +2068,16 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
     assert int(bucket_100["Wins"]) == 6
     assert int(bucket_100["TP1 Hits"]) == 6
     assert float(bucket_100["Avg Max Profit %"]) == 2.5
+    assert not v3["score_tier_audit"].empty
+    assert not v3["score_session_audit"].empty
+    assert not v3["score_direction_audit"].empty
+    assert not v3["score_symbol_audit"].empty
+    assert not v3["score_efficiency_audit"].empty
+    score_symbol = v3["score_symbol_audit"]
+    assert "GOODUSDT" in score_symbol["Symbol"].tolist()
+    assert "WEAKUSDT" in score_symbol["Symbol"].tolist()
+    efficiency_100 = v3["score_efficiency_audit"][v3["score_efficiency_audit"]["Score Bucket"] == "100+"].iloc[0]
+    assert float(efficiency_100["Avg Time To TP"]) == 55.0
     assert "No Tier C" in shadow["Scenario"].tolist()
     assert "Exclude weak symbols <40% WR / >=5 trades" in shadow["Scenario"].tolist()
     no_tier_c = shadow[shadow["Scenario"] == "No Tier C"].iloc[0]

@@ -116,6 +116,7 @@ def normalize_for_v3(df: pd.DataFrame) -> pd.DataFrame:
         "score": "",
         "raw_score": "",
         "setup_strength": "",
+        "holding_minutes": "",
     }
     for column, default in defaults.items():
         if column not in data.columns:
@@ -137,6 +138,7 @@ def normalize_for_v3(df: pd.DataFrame) -> pd.DataFrame:
     normalized["score"] = _first_numeric(data, ["score", "raw_score", "setup_strength"])
     normalized["max_profit_pct"] = pd.to_numeric(data["max_profit_pct"], errors="coerce")
     normalized["max_drawdown_pct"] = pd.to_numeric(data["max_drawdown_pct"], errors="coerce")
+    normalized["holding_minutes"] = pd.to_numeric(data["holding_minutes"], errors="coerce")
     return normalized
 
 
@@ -249,6 +251,89 @@ def score_bucket_performance(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
+def _closed_scored_trades(df: pd.DataFrame) -> pd.DataFrame:
+    closed = _closed_trades(_sent_signals(df))
+    if closed.empty or "score" not in closed.columns:
+        return pd.DataFrame(columns=list(closed.columns) + ["score_bucket"])
+    data = closed.copy()
+    data["score_bucket"] = data["score"].map(score_range_label)
+    return data[data["score_bucket"].notna()].copy()
+
+
+def score_cross_audit(df: pd.DataFrame, column: str, label: str, min_trades: int = 1) -> pd.DataFrame:
+    columns = ["Score Bucket", label, "Trades", "Wins", "Losses", "Win Rate", "Net R"]
+    data = _closed_scored_trades(df)
+    if data.empty or column not in data.columns:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    order = ["75-79", "80-84", "85-89", "90-94", "95-99", "100+"]
+    data["score_bucket"] = pd.Categorical(data["score_bucket"], categories=order, ordered=True)
+    grouped = data.groupby(["score_bucket", data[column].fillna("-").replace("", "-").astype(str)], observed=True, dropna=False)
+    for (score_bucket, key), group in grouped:
+        if len(group) < min_trades:
+            continue
+        wins = int((group["result"] == "WIN").sum())
+        losses = int((group["result"] == "LOSS").sum())
+        rows.append(
+            {
+                "Score Bucket": str(score_bucket),
+                label: key,
+                "Trades": int(len(group)),
+                "Wins": wins,
+                "Losses": losses,
+                "Win Rate": round(wins / len(group) * 100, 1) if len(group) else 0.0,
+                "Net R": round(float(group["estimated_r"].fillna(0).sum()), 2),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).sort_values(["Score Bucket", "Net R", "Trades"], ascending=[True, False, False])
+
+
+def score_efficiency_audit(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Score Bucket",
+        "Trades",
+        "Win Rate",
+        "Net R",
+        "TP1 Hits",
+        "TP2 Hits",
+        "Avg Max Profit %",
+        "Avg Drawdown %",
+        "Avg Time To TP",
+        "Avg Time To SL",
+    ]
+    data = _closed_scored_trades(df)
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    order = ["75-79", "80-84", "85-89", "90-94", "95-99", "100+"]
+    rows = []
+    holding = pd.to_numeric(data.get("holding_minutes", pd.Series(dtype=float)), errors="coerce")
+    data = data.assign(holding_minutes=holding)
+    for bucket in order:
+        group = data[data["score_bucket"] == bucket]
+        if group.empty:
+            continue
+        wins = group[group["result"] == "WIN"]
+        losses = group[group["result"] == "LOSS"]
+        hit_levels = group["hit_target"].map(_hit_level)
+        rows.append(
+            {
+                "Score Bucket": bucket,
+                "Trades": int(len(group)),
+                "Win Rate": round(len(wins) / len(group) * 100, 1) if len(group) else 0.0,
+                "Net R": round(float(group["estimated_r"].fillna(0).sum()), 2),
+                "TP1 Hits": int(hit_levels.ge(1).sum()),
+                "TP2 Hits": int(hit_levels.ge(2).sum()),
+                "Avg Max Profit %": round(float(group["max_profit_pct"].mean()), 2) if group["max_profit_pct"].notna().any() else 0.0,
+                "Avg Drawdown %": round(float(group["max_drawdown_pct"].mean()), 2) if group["max_drawdown_pct"].notna().any() else 0.0,
+                "Avg Time To TP": round(float(wins["holding_minutes"].mean()), 1) if not wins.empty and wins["holding_minutes"].notna().any() else 0.0,
+                "Avg Time To SL": round(float(losses["holding_minutes"].mean()), 1) if not losses.empty and losses["holding_minutes"].notna().any() else 0.0,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
 def weak_symbols(df: pd.DataFrame, min_trades: int = MIN_WEAK_SYMBOL_TRADES, max_win_rate: float = WEAK_SYMBOL_WIN_RATE) -> set[str]:
     table = group_performance(df, "symbol", "Symbol")
     if table.empty:
@@ -349,6 +434,11 @@ def build_performance_v3(df: pd.DataFrame) -> dict[str, Any]:
         "direction_performance_v3": group_performance(data, "side", "Direction"),
         "hour_performance_v3": group_performance(data.dropna(subset=["hour"]).assign(hour=lambda x: x["hour"].astype(int).astype(str)), "hour", "Hour"),
         "score_performance_v3": score_bucket_performance(data),
+        "score_tier_audit": score_cross_audit(data, "tier", "Tier"),
+        "score_session_audit": score_cross_audit(data, "session", "Session"),
+        "score_direction_audit": score_cross_audit(data, "side", "Direction"),
+        "score_symbol_audit": score_cross_audit(data, "symbol", "Symbol", min_trades=5),
+        "score_efficiency_audit": score_efficiency_audit(data),
         "shadow_filter_backtest": shadow_filter_backtest(data),
         "recommended_actions": recommendations(data),
     }

@@ -712,6 +712,11 @@ def build_complete_report(
     report["performance_v3_direction"] = format_v3_table(v3["direction_performance_v3"])
     report["performance_v3_hour"] = format_v3_table(v3["hour_performance_v3"])
     report["score_performance_v3"] = format_v3_table(v3["score_performance_v3"], limit=10)
+    report["score_tier_audit"] = format_v3_table(v3["score_tier_audit"], limit=12)
+    report["score_session_audit"] = format_v3_table(v3["score_session_audit"], limit=12)
+    report["score_direction_audit"] = format_v3_table(v3["score_direction_audit"], limit=12)
+    report["score_symbol_audit"] = format_v3_table(v3["score_symbol_audit"], limit=12)
+    report["score_efficiency_audit"] = format_v3_table(v3["score_efficiency_audit"], limit=10)
     report["shadow_filter_backtest"] = format_v3_table(v3["shadow_filter_backtest"], limit=12)
     report["recommended_actions"] = format_v3_table(v3["recommended_actions"], limit=12)
 
@@ -737,6 +742,11 @@ def build_complete_report(
         "direction_performance_v3": v3["direction_performance_v3"],
         "hour_performance_v3": v3["hour_performance_v3"],
         "score_performance_v3": v3["score_performance_v3"],
+        "score_tier_audit": v3["score_tier_audit"],
+        "score_session_audit": v3["score_session_audit"],
+        "score_direction_audit": v3["score_direction_audit"],
+        "score_symbol_audit": v3["score_symbol_audit"],
+        "score_efficiency_audit": v3["score_efficiency_audit"],
         "shadow_filter_backtest": v3["shadow_filter_backtest"],
         "recommended_actions": v3["recommended_actions"],
     }
@@ -761,6 +771,11 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
         "direction_performance_v3": logs_dir / "direction_performance_v3.csv",
         "hour_performance_v3": logs_dir / "hour_performance_v3.csv",
         "score_performance_v3": logs_dir / "score_performance_v3.csv",
+        "score_tier_audit": logs_dir / "score_tier_audit.csv",
+        "score_session_audit": logs_dir / "score_session_audit.csv",
+        "score_direction_audit": logs_dir / "score_direction_audit.csv",
+        "score_symbol_audit": logs_dir / "score_symbol_audit.csv",
+        "score_efficiency_audit": logs_dir / "score_efficiency_audit.csv",
         "shadow_filter_backtest": logs_dir / "shadow_filter_backtest.csv",
         "recommended_actions": logs_dir / "recommended_actions.csv",
     }
@@ -788,6 +803,11 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
     tables.get("direction_performance_v3", pd.DataFrame()).to_csv(paths["direction_performance_v3"], index=False)
     tables.get("hour_performance_v3", pd.DataFrame()).to_csv(paths["hour_performance_v3"], index=False)
     tables.get("score_performance_v3", pd.DataFrame()).to_csv(paths["score_performance_v3"], index=False)
+    tables.get("score_tier_audit", pd.DataFrame()).to_csv(paths["score_tier_audit"], index=False)
+    tables.get("score_session_audit", pd.DataFrame()).to_csv(paths["score_session_audit"], index=False)
+    tables.get("score_direction_audit", pd.DataFrame()).to_csv(paths["score_direction_audit"], index=False)
+    tables.get("score_symbol_audit", pd.DataFrame()).to_csv(paths["score_symbol_audit"], index=False)
+    tables.get("score_efficiency_audit", pd.DataFrame()).to_csv(paths["score_efficiency_audit"], index=False)
     tables.get("shadow_filter_backtest", pd.DataFrame()).to_csv(paths["shadow_filter_backtest"], index=False)
     tables.get("recommended_actions", pd.DataFrame()).to_csv(paths["recommended_actions"], index=False)
     position_row = tables.get("position_management", pd.DataFrame())
