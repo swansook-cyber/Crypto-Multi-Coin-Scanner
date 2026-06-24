@@ -10,6 +10,7 @@ import json
 import tempfile
 import sys
 import os
+import shutil
 
 import pandas as pd
 
@@ -2495,8 +2496,17 @@ def test_position_manager_advice() -> None:
             pass
 
 
+def _reset_position_watcher_test_path(path: Path) -> None:
+    shutil.rmtree(path.parent / f"{path.stem}_position_watcher_locks", ignore_errors=True)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def test_position_watcher_tp1_breakeven_alert_and_dedupe() -> None:
     path = Path(tempfile.gettempdir()) / "position_watcher_smoke.csv"
+    _reset_position_watcher_test_path(path)
     pd.DataFrame(
         [
             {
@@ -2573,10 +2583,7 @@ def test_position_watcher_tp1_breakeven_alert_and_dedupe() -> None:
         assert stats.skipped_duplicates == 1
         assert len(session.posts) == 1
     finally:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        _reset_position_watcher_test_path(path)
 
 
 def _watcher_config(mode: str = "cornix_command", dry_run: bool = False) -> position_watcher.WatcherConfig:
@@ -2638,6 +2645,7 @@ class WatcherFakeSession:
 def test_position_watcher_cornix_command_long_short_and_dedupe() -> None:
     for side, price, tp1 in [("LONG", "72.500", 72.468), ("SHORT", "68.000", 68.500)]:
         path = Path(tempfile.gettempdir()) / f"position_watcher_{side.lower()}_command_smoke.csv"
+        _reset_position_watcher_test_path(path)
         pd.DataFrame([_watcher_row(side=side, tp1=tp1)]).to_csv(path, index=False)
         session = WatcherFakeSession(price)
         try:
@@ -2661,14 +2669,12 @@ def test_position_watcher_cornix_command_long_short_and_dedupe() -> None:
             assert stats.skipped_duplicates == 1
             assert len(session.posts) == 2
         finally:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+            _reset_position_watcher_test_path(path)
 
 
 def test_position_watcher_cornix_stop_price_duplicate_prevention() -> None:
     path = Path(tempfile.gettempdir()) / "position_watcher_stop_dedupe_smoke.csv"
+    _reset_position_watcher_test_path(path)
     pd.DataFrame(
         [
             {
@@ -2685,14 +2691,12 @@ def test_position_watcher_cornix_stop_price_duplicate_prevention() -> None:
         assert stats.cornix_commands_sent == 0
         assert len(session.posts) == 0
     finally:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        _reset_position_watcher_test_path(path)
 
 
 def test_position_watcher_float_flag_duplicate_prevention() -> None:
     path = Path(tempfile.gettempdir()) / "position_watcher_float_flag_dedupe_smoke.csv"
+    _reset_position_watcher_test_path(path)
     pd.DataFrame(
         [
             {
@@ -2711,14 +2715,12 @@ def test_position_watcher_float_flag_duplicate_prevention() -> None:
         assert stats.cornix_commands_sent == 0
         assert len(session.posts) == 0
     finally:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        _reset_position_watcher_test_path(path)
 
 
 def test_position_watcher_cross_row_new_stop_dedupe() -> None:
     path = Path(tempfile.gettempdir()) / "position_watcher_cross_row_dedupe_smoke.csv"
+    _reset_position_watcher_test_path(path)
     pd.DataFrame(
         [
             {**_watcher_row(side="SHORT", entry=0.696, tp1=0.680), "symbol": "SUIUSDT"},
@@ -2740,15 +2742,91 @@ def test_position_watcher_cross_row_new_stop_dedupe() -> None:
         assert stats.skipped_duplicates == 2
         assert len(session.posts) == 2
     finally:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        _reset_position_watcher_test_path(path)
+
+
+def test_position_watcher_persistent_lock_prevents_stale_csv_duplicate() -> None:
+    path = Path(tempfile.gettempdir()) / "position_watcher_persistent_lock_smoke.csv"
+    _reset_position_watcher_test_path(path)
+    pd.DataFrame([_watcher_row()]).to_csv(path, index=False)
+    session = WatcherFakeSession("72.500")
+    try:
+        stats = position_watcher.process_once(path, session, _watcher_config("report_only"))
+        assert stats.alerts_sent == 1
+        assert len(session.posts) == 1
+        saved = pd.read_csv(path)
+        assert int(saved.loc[0, "tp1_alert_sent"]) == 1
+        assert str(saved.loc[0, "position_watcher_alert_key"]).strip()
+        assert str(saved.loc[0, "position_watcher_lock_file"]).strip()
+
+        stale = saved.copy().astype(object)
+        for column in [
+            "tp1_alert_sent",
+            "breakeven_recommended",
+            "new_stop_notification_sent",
+            "cornix_be_command_sent",
+        ]:
+            stale.loc[0, column] = 0
+        for column in [
+            "tp1_alert_at",
+            "tp1_alert_source",
+            "new_stop_notification_at",
+            "new_stop_notification_key",
+            "new_stop_notification_stop_price",
+            "position_watcher_alert_key",
+            "position_watcher_lock_file",
+        ]:
+            stale.loc[0, column] = ""
+        stale.to_csv(path, index=False)
+
+        stats = position_watcher.process_once(path, session, _watcher_config("report_only"))
+        assert stats.skipped_duplicates == 1
+        assert len(session.posts) == 1
+        saved = pd.read_csv(path)
+        assert int(saved.loc[0, "tp1_alert_sent"]) == 1
+        assert str(saved.loc[0, "position_watcher_alert_key"]).strip()
+    finally:
+        _reset_position_watcher_test_path(path)
+
+
+def test_position_watcher_releases_lock_when_report_send_fails() -> None:
+    class FailingWatcherSession(WatcherFakeSession):
+        def __init__(self, price: str) -> None:
+            super().__init__(price)
+            self.fail_posts = True
+
+        def post(self, _url, data=None, timeout=None):
+            self.posts.append((data["chat_id"], data["text"]))
+            if self.fail_posts:
+                return WatcherResponse(500, text="telegram down")
+            return WatcherResponse(200)
+
+    path = Path(tempfile.gettempdir()) / "position_watcher_failed_send_lock_smoke.csv"
+    _reset_position_watcher_test_path(path)
+    pd.DataFrame([_watcher_row()]).to_csv(path, index=False)
+    session = FailingWatcherSession("72.500")
+    try:
+        stats = position_watcher.process_once(path, session, _watcher_config("report_only"))
+        assert stats.alerts_sent == 0
+        assert len(session.posts) == 1
+        saved = pd.read_csv(path)
+        assert int(saved.loc[0].get("tp1_alert_sent", 0)) == 0
+
+        session.fail_posts = False
+        stats = position_watcher.process_once(path, session, _watcher_config("report_only"))
+        assert stats.alerts_sent == 1
+        assert len(session.posts) == 2
+        saved = pd.read_csv(path)
+        assert int(saved.loc[0, "tp1_alert_sent"]) == 1
+    finally:
+        _reset_position_watcher_test_path(path)
 
 
 def test_position_watcher_new_stop_notification_key_dedupe_and_closed_skip() -> None:
     duplicate_path = Path(tempfile.gettempdir()) / "position_watcher_new_stop_key_dedupe_smoke.csv"
     closed_path = Path(tempfile.gettempdir()) / "position_watcher_closed_new_stop_smoke.csv"
+    _reset_position_watcher_test_path(duplicate_path)
+    _reset_position_watcher_test_path(closed_path)
     try:
         pd.DataFrame(
             [
@@ -2774,10 +2852,7 @@ def test_position_watcher_new_stop_notification_key_dedupe_and_closed_skip() -> 
         assert len(session.posts) == 0
     finally:
         for path in [duplicate_path, closed_path]:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+            _reset_position_watcher_test_path(path)
 
 
 def test_position_watcher_command_safety_modes() -> None:
@@ -2786,6 +2861,8 @@ def test_position_watcher_command_safety_modes() -> None:
     weak_report_only = Path(tempfile.gettempdir()) / "position_watcher_weak_report_only_smoke.csv"
     session_report_only = Path(tempfile.gettempdir()) / "position_watcher_session_report_only_smoke.csv"
     dry_run = Path(tempfile.gettempdir()) / "position_watcher_dry_run_smoke.csv"
+    for path in [missing_entry, report_only, weak_report_only, session_report_only, dry_run]:
+        _reset_position_watcher_test_path(path)
     try:
         pd.DataFrame([_watcher_row(entry="")]).to_csv(missing_entry, index=False)
         session = WatcherFakeSession("72.500")
@@ -2827,10 +2904,7 @@ def test_position_watcher_command_safety_modes() -> None:
         assert int(saved.loc[0].get("cornix_be_command_sent", 0)) == 0
     finally:
         for path in [missing_entry, report_only, weak_report_only, session_report_only, dry_run]:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+            _reset_position_watcher_test_path(path)
 
 
 def test_position_watcher_cornix_breakeven_formats() -> None:
@@ -2998,6 +3072,8 @@ def main() -> int:
     test_position_watcher_cornix_stop_price_duplicate_prevention()
     test_position_watcher_float_flag_duplicate_prevention()
     test_position_watcher_cross_row_new_stop_dedupe()
+    test_position_watcher_persistent_lock_prevents_stale_csv_duplicate()
+    test_position_watcher_releases_lock_when_report_send_fails()
     test_position_watcher_new_stop_notification_key_dedupe_and_closed_skip()
     test_position_watcher_command_safety_modes()
     test_position_watcher_cornix_breakeven_formats()

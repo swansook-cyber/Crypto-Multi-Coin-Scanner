@@ -9,6 +9,7 @@ Binance Futures prices, and sends advisory Telegram messages to Reports.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import sys
@@ -50,6 +51,8 @@ WATCHER_COLUMNS = {
     "new_stop_notification_at": "",
     "new_stop_notification_key": "",
     "new_stop_notification_stop_price": "",
+    "position_watcher_alert_key": "",
+    "position_watcher_lock_file": "",
 }
 
 
@@ -174,6 +177,21 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     data["signal_status"] = data["signal_status"].fillna("sent").replace("", "sent").astype(str).str.lower()
     for column in ["entry", "tp1", "tp2", "stop_loss", "sl", "breakeven_price", "cornix_be_stop_price"]:
         data[column] = pd.to_numeric(data[column], errors="coerce")
+    string_columns = [
+        "tp1_alert_at",
+        "tp1_alert_source",
+        "position_management_stage",
+        "cornix_be_command_at",
+        "cornix_be_command_status",
+        "cornix_be_command_error",
+        "new_stop_notification_at",
+        "new_stop_notification_key",
+        "new_stop_notification_stop_price",
+        "position_watcher_alert_key",
+        "position_watcher_lock_file",
+    ]
+    for column in string_columns:
+        data[column] = data[column].fillna("").astype(str)
     return data
 
 
@@ -236,6 +254,42 @@ def new_stop_notification_key(row: pd.Series, stop_price: float | None) -> str:
     direction = str(row.get("side", "")).strip().upper()
     stop = format_price(stop_price) if stop_price is not None else ""
     return f"{symbol}|{direction}|{stop}"
+
+
+def position_watcher_alert_key(row: pd.Series, stop_price: float | None) -> str:
+    symbol = str(row.get("symbol", "")).strip().upper()
+    direction = str(row.get("side", "")).strip().upper()
+    timestamp = str(row.get("timestamp", "")).strip()
+    entry = format_price(row.get("entry"))
+    tp1 = format_price(row.get("tp1"))
+    stop = format_price(stop_price) if stop_price is not None else ""
+    return f"{symbol}|{direction}|{timestamp}|{entry}|{tp1}|{stop}"
+
+
+def alert_lock_path(key: str, lock_dir: Path) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return lock_dir / f"{digest}.lock"
+
+
+def claim_alert_lock(key: str, lock_dir: Path) -> tuple[bool, Path]:
+    path = alert_lock_path(key, lock_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False, path
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f"{datetime.now(timezone.utc).isoformat()}\n{key}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return True, path
+
+
+def release_alert_lock(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def new_stop_notification_already_sent(row: pd.Series, stop_price: float | None) -> bool:
@@ -511,6 +565,12 @@ def process_once(
         if alert_already_sent(existing_row.get("cornix_be_command_sent"))
     )
     sent_new_stop_keys = {key for key in sent_new_stop_keys if key and not key.endswith("|-") and not key.endswith("|")}
+    sent_alert_keys = {
+        str(existing_row.get("position_watcher_alert_key", "")).strip().upper()
+        for _, existing_row in df.iterrows()
+        if str(existing_row.get("position_watcher_alert_key", "")).strip()
+    }
+    lock_dir = journal_path.parent / f"{journal_path.stem}_position_watcher_locks"
 
     for index, row in positions.iterrows():
         symbol = str(row.get("symbol", "")).upper()
@@ -523,8 +583,9 @@ def process_once(
         signal_status = str(row.get("signal_status", "")).strip().lower()
         report_only_status = signal_status in {"tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only"}
         stop_notification_key = new_stop_notification_key(row, new_stop_price)
+        alert_key = position_watcher_alert_key(row, new_stop_price)
         row_already_marked = new_stop_notification_already_sent(row, new_stop_price) or cornix_breakeven_already_sent_for_stop(row, new_stop_price)
-        cross_row_duplicate = stop_notification_key in sent_new_stop_keys
+        cross_row_duplicate = stop_notification_key in sent_new_stop_keys or alert_key.upper() in sent_alert_keys
         if row_already_marked or cross_row_duplicate:
             stats.skipped_duplicates += 1
             LOGGER.info(
@@ -542,6 +603,8 @@ def process_once(
                     df.at[index, "new_stop_notification_at"] = datetime.now(timezone.utc).isoformat()
                 if numeric_value(row.get("cornix_be_stop_price")) is None and alert_already_sent(row.get("cornix_be_command_sent")):
                     df.at[index, "cornix_be_stop_price"] = new_stop_price
+                if alert_key.upper() in sent_alert_keys and not str(row.get("position_watcher_alert_key", "")).strip():
+                    df.at[index, "position_watcher_alert_key"] = alert_key
                 save_journal(df, journal_path)
             continue
         if config.command_mode == "cornix_command" and not report_only_status:
@@ -569,6 +632,37 @@ def process_once(
         if not tp1_reached(row, current_price):
             continue
         stats.tp1_reached += 1
+        lock_claimed = False
+        lock_path: Path | None = None
+        if not config.dry_run:
+            lock_claimed, lock_path = claim_alert_lock(alert_key, lock_dir)
+            if not lock_claimed:
+                stats.skipped_duplicates += 1
+                LOGGER.info(
+                    "SKIP_DUPLICATE_POSITION_WATCHER_ALERT symbol=%s direction=%s stop=%s key=%s lock=%s",
+                    symbol,
+                    str(row.get("side", "")).strip().upper(),
+                    format_price(new_stop_price),
+                    alert_key,
+                    lock_path,
+                )
+                df.at[index, "tp1_alert_sent"] = 1
+                df.at[index, "breakeven_recommended"] = 1
+                if not str(row.get("tp1_alert_at", "")).strip():
+                    df.at[index, "tp1_alert_at"] = datetime.now(timezone.utc).isoformat()
+                if not str(row.get("tp1_alert_source", "")).strip():
+                    df.at[index, "tp1_alert_source"] = "watcher"
+                df.at[index, "breakeven_price"] = row.get("entry")
+                df.at[index, "new_stop_notification_sent"] = 1
+                if not str(row.get("new_stop_notification_at", "")).strip():
+                    df.at[index, "new_stop_notification_at"] = datetime.now(timezone.utc).isoformat()
+                df.at[index, "new_stop_notification_key"] = stop_notification_key
+                df.at[index, "new_stop_notification_stop_price"] = format_price(new_stop_price) if new_stop_price is not None else ""
+                df.at[index, "position_watcher_alert_key"] = alert_key
+                df.at[index, "position_watcher_lock_file"] = str(lock_path)
+                df.at[index, "position_management_stage"] = "TP1_REACHED_BE_RECOMMENDED"
+                save_journal(df, journal_path)
+                continue
         sent_any = False
         command_status = ""
         command_error = ""
@@ -614,11 +708,17 @@ def process_once(
             df.at[index, "new_stop_notification_at"] = datetime.now(timezone.utc).isoformat()
             df.at[index, "new_stop_notification_key"] = stop_notification_key
             df.at[index, "new_stop_notification_stop_price"] = format_price(new_stop_price) if new_stop_price is not None else ""
+            df.at[index, "position_watcher_alert_key"] = alert_key
+            if lock_path is not None:
+                df.at[index, "position_watcher_lock_file"] = str(lock_path)
             df.at[index, "position_management_stage"] = "TP1_REACHED_BE_RECOMMENDED"
             sent_new_stop_keys.add(stop_notification_key)
+            sent_alert_keys.add(alert_key.upper())
             LOGGER.info("Watcher detected TP1 first: symbol=%s source=watcher", symbol)
             save_journal(df, journal_path)
         else:
+            if lock_claimed and lock_path is not None:
+                release_alert_lock(lock_path)
             LOGGER.error("Position watcher alert not marked sent: %s", symbol)
     return stats
 
