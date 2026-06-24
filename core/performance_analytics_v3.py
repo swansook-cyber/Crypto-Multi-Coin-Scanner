@@ -17,6 +17,7 @@ from core.performance_analytics_v2 import canonical_session
 MIN_WEAK_SYMBOL_TRADES = 5
 WEAK_SYMBOL_WIN_RATE = 40.0
 PRODUCTION_UNIVERSE_MIN_TRADES = 5
+REPORT_ONLY_STATUSES = {"tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only"}
 
 
 def _num(value: Any) -> float | None:
@@ -160,6 +161,32 @@ def _summary(df: pd.DataFrame) -> dict[str, Any]:
         "Avg loss %": round(float(loss.mean()), 2) if not loss.empty else 0.0,
         "TP1 hits": int(closed["hit_target"].map(_hit_level).ge(1).sum()) if "hit_target" in closed else 0,
         "SL hits": int(len(losses)),
+    }
+
+
+def _closed_pool_summary(df: pd.DataFrame, label: str) -> dict[str, Any]:
+    closed = _closed_trades(df)
+    wins = closed[closed["result"] == "WIN"]
+    losses = closed[closed["result"] == "LOSS"]
+    pnl = pd.to_numeric(closed.get("pnl_percent", pd.Series(dtype=float)), errors="coerce")
+    profit = pnl[pnl > 0]
+    loss = pnl[pnl < 0]
+    hit_levels = closed["hit_target"].map(_hit_level) if "hit_target" in closed else pd.Series(dtype=int)
+    return {
+        "Pool": label,
+        "Closed Trades": int(len(closed)),
+        "Wins": int(len(wins)),
+        "Losses": int(len(losses)),
+        "Win Rate": round(len(wins) / len(closed) * 100.0, 1) if len(closed) else 0.0,
+        "Net R": round(float(pd.to_numeric(closed.get("estimated_r", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()), 2),
+        "TP1 Hits": int(hit_levels.ge(1).sum()) if not hit_levels.empty else 0,
+        "TP2 Hits": int(hit_levels.ge(2).sum()) if not hit_levels.empty else 0,
+        "Avg Profit %": round(float(profit.mean()), 2) if not profit.empty else 0.0,
+        "Avg Loss %": round(float(loss.mean()), 2) if not loss.empty else 0.0,
+        "Avg Drawdown %": round(float(closed["max_drawdown_pct"].mean()), 2) if "max_drawdown_pct" in closed and closed["max_drawdown_pct"].notna().any() else 0.0,
+        "Avg Max Profit %": round(float(closed["max_profit_pct"].mean()), 2) if "max_profit_pct" in closed and closed["max_profit_pct"].notna().any() else 0.0,
+        "Avg Time To TP": round(float(wins["holding_minutes"].mean()), 1) if not wins.empty and wins["holding_minutes"].notna().any() else 0.0,
+        "Avg Time To SL": round(float(losses["holding_minutes"].mean()), 1) if not losses.empty and losses["holding_minutes"].notna().any() else 0.0,
     }
 
 
@@ -379,7 +406,7 @@ def production_universe_ranking(df: pd.DataFrame, min_trades: int = PRODUCTION_U
         "Confidence Score",
         "Classification",
     ]
-    closed = _closed_trades(_sent_signals(df))
+    closed = _closed_trades(df)
     if closed.empty or "symbol" not in closed.columns:
         return pd.DataFrame(columns=columns)
 
@@ -426,6 +453,85 @@ def production_universe_ranking(df: pd.DataFrame, min_trades: int = PRODUCTION_U
         ["Confidence Score", "Net R", "Win Rate", "Closed Trades"],
         ascending=[False, False, False, False],
     )
+
+
+def post_filter_live_performance(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Pool",
+        "Closed Trades",
+        "Wins",
+        "Losses",
+        "Win Rate",
+        "Net R",
+        "TP1 Hits",
+        "TP2 Hits",
+        "Avg Profit %",
+        "Avg Loss %",
+        "Avg Drawdown %",
+        "Avg Max Profit %",
+        "Avg Time To TP",
+        "Avg Time To SL",
+    ]
+    data = normalize_for_v3(df)
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    status = data["signal_status"].fillna("sent").astype(str).str.lower()
+    historical = _closed_pool_summary(data, "Historical")
+    post_filter = _closed_pool_summary(data[~status.isin(REPORT_ONLY_STATUSES)].copy(), "Post-Filter Live Pool")
+    improvement = {
+        "Pool": "Improvement",
+        "Closed Trades": int(post_filter["Closed Trades"] - historical["Closed Trades"]),
+        "Wins": int(post_filter["Wins"] - historical["Wins"]),
+        "Losses": int(post_filter["Losses"] - historical["Losses"]),
+        "Win Rate": round(float(post_filter["Win Rate"]) - float(historical["Win Rate"]), 1),
+        "Net R": round(float(post_filter["Net R"]) - float(historical["Net R"]), 2),
+        "TP1 Hits": int(post_filter["TP1 Hits"] - historical["TP1 Hits"]),
+        "TP2 Hits": int(post_filter["TP2 Hits"] - historical["TP2 Hits"]),
+        "Avg Profit %": round(float(post_filter["Avg Profit %"]) - float(historical["Avg Profit %"]), 2),
+        "Avg Loss %": round(float(post_filter["Avg Loss %"]) - float(historical["Avg Loss %"]), 2),
+        "Avg Drawdown %": round(float(post_filter["Avg Drawdown %"]) - float(historical["Avg Drawdown %"]), 2),
+        "Avg Max Profit %": round(float(post_filter["Avg Max Profit %"]) - float(historical["Avg Max Profit %"]), 2),
+        "Avg Time To TP": round(float(post_filter["Avg Time To TP"]) - float(historical["Avg Time To TP"]), 1),
+        "Avg Time To SL": round(float(post_filter["Avg Time To SL"]) - float(historical["Avg Time To SL"]), 1),
+    }
+    return pd.DataFrame([historical, post_filter, improvement], columns=columns)
+
+
+def production_universe_performance(df: pd.DataFrame) -> pd.DataFrame:
+    ranking = production_universe_ranking(df)
+    columns = [
+        "Pool",
+        "Closed Trades",
+        "Wins",
+        "Losses",
+        "Win Rate",
+        "Net R",
+        "TP1 Hits",
+        "TP2 Hits",
+        "Avg Profit %",
+        "Avg Loss %",
+        "Avg Drawdown %",
+        "Avg Max Profit %",
+        "Avg Time To TP",
+        "Avg Time To SL",
+    ]
+    data = normalize_for_v3(df)
+    if data.empty or ranking.empty:
+        return pd.DataFrame(columns=columns)
+    classified = {
+        classification: set(ranking.loc[ranking["Classification"].eq(classification), "Symbol"].astype(str))
+        for classification in ["Tier S", "Tier A", "Watch", "Report Only"]
+    }
+    pools = [
+        ("Tier S symbols only", classified["Tier S"]),
+        ("Tier S + Tier A symbols", classified["Tier S"] | classified["Tier A"]),
+        ("Watch symbols", classified["Watch"]),
+        ("Report-only symbols", classified["Report Only"]),
+    ]
+    rows = []
+    for label, symbols in pools:
+        rows.append(_closed_pool_summary(data[data["symbol"].isin(symbols)].copy(), label))
+    return pd.DataFrame(rows, columns=columns)
 
 
 def weak_symbols(df: pd.DataFrame, min_trades: int = MIN_WEAK_SYMBOL_TRADES, max_win_rate: float = WEAK_SYMBOL_WIN_RATE) -> set[str]:
@@ -534,6 +640,8 @@ def build_performance_v3(df: pd.DataFrame) -> dict[str, Any]:
         "score_symbol_audit": score_cross_audit(data, "symbol", "Symbol", min_trades=5),
         "score_efficiency_audit": score_efficiency_audit(data),
         "production_universe_ranking": production_universe_ranking(data),
+        "post_filter_live_performance": post_filter_live_performance(data),
+        "production_universe_performance": production_universe_performance(data),
         "shadow_filter_backtest": shadow_filter_backtest(data),
         "recommended_actions": recommendations(data),
     }

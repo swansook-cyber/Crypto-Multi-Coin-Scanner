@@ -1598,6 +1598,8 @@ def test_daily_performance_report_metrics() -> None:
     assert "Score Deep Audit" in message
     assert "Production Universe Ranking" in message
     assert "Recommended Production Universe" in message
+    assert "Post-Filter Live Performance" in message
+    assert "Production Universe Performance" in message
     assert "Session Risk Experimental Performance" in message
 
 
@@ -1927,6 +1929,8 @@ def test_complete_performance_analytics_v1_outputs() -> None:
         assert paths["score_symbol_audit"].exists()
         assert paths["score_efficiency_audit"].exists()
         assert paths["production_universe_ranking"].exists()
+        assert paths["post_filter_live_performance"].exists()
+        assert paths["production_universe_performance"].exists()
     finally:
         for path in export_dir.glob("*.csv"):
             try:
@@ -2116,6 +2120,25 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
                 "holding_minutes": 55,
             }
         )
+    for index in range(5):
+        rows.append(
+            {
+                "timestamp": f"2026-06-02T{18 + index}:00:00+00:00",
+                "symbol": "FILTEREDUSDT",
+                "side": "LONG",
+                "tier": "B",
+                "session": "London",
+                "signal_status": "weak_symbol_report_only",
+                "result": "LOSS",
+                "hit_target": "SL",
+                "risk_reward": 2.0,
+                "pnl_percent": -1.0,
+                "score": 82,
+                "max_profit_pct": 0.3,
+                "max_drawdown_pct": -1.5,
+                "holding_minutes": 25,
+            }
+        )
     df = pd.DataFrame(rows)
     before = df.copy(deep=True)
     v3 = build_performance_v3(df)
@@ -2146,11 +2169,24 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
     assert not ranking.empty
     good_rank = ranking[ranking["Symbol"] == "GOODUSDT"].iloc[0]
     weak_rank = ranking[ranking["Symbol"] == "WEAKUSDT"].iloc[0]
+    filtered_rank = ranking[ranking["Symbol"] == "FILTEREDUSDT"].iloc[0]
     assert good_rank["Classification"] == "Tier A"
     assert weak_rank["Classification"] == "Report Only"
+    assert filtered_rank["Classification"] == "Report Only"
     assert float(good_rank["Confidence Score"]) > float(weak_rank["Confidence Score"])
     assert int(good_rank["Closed Trades"]) == 6
     assert int(weak_rank["Closed Trades"]) == 5
+    post_filter = v3["post_filter_live_performance"]
+    assert not post_filter.empty
+    historical = post_filter[post_filter["Pool"] == "Historical"].iloc[0]
+    live_pool = post_filter[post_filter["Pool"] == "Post-Filter Live Pool"].iloc[0]
+    improvement = post_filter[post_filter["Pool"] == "Improvement"].iloc[0]
+    assert int(historical["Closed Trades"]) == 16
+    assert int(live_pool["Closed Trades"]) == 11
+    assert float(improvement["Net R"]) == 5.0
+    universe_perf = v3["production_universe_performance"]
+    assert "Tier S + Tier A symbols" in universe_perf["Pool"].tolist()
+    assert "Report-only symbols" in universe_perf["Pool"].tolist()
     score_symbol = v3["score_symbol_audit"]
     assert "GOODUSDT" in score_symbol["Symbol"].tolist()
     assert "WEAKUSDT" in score_symbol["Symbol"].tolist()
