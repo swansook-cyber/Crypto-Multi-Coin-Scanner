@@ -30,6 +30,7 @@ from core.btc_regime_filter import detect_btc_regime
 from core.loss_cooldown import LossCooldownTracker
 from core.performance_analytics_v1 import build_complete_report, export_v1_outputs
 from core.performance_analytics_v2 import build_performance_v2, canonical_session, generate_performance_warnings
+from core.performance_analytics_v3 import build_performance_v3, shadow_filter_backtest
 from core import wave_structure_analyzer as wave
 
 WATCHDOG_MONITOR_PATH = Path(__file__).resolve().parents[1] / "watchdog" / "monitor.py"
@@ -1852,6 +1853,74 @@ def test_performance_analytics_v2_tables_and_warnings() -> None:
     assert v2["bottom_symbols"].iloc[0]["Symbol"] == "SEIUSDT"
 
 
+def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
+    rows = []
+    for index in range(5):
+        rows.append(
+            {
+                "timestamp": f"2026-06-02T0{index}:00:00+00:00",
+                "symbol": "WEAKUSDT",
+                "side": "LONG",
+                "tier": "C",
+                "session": "NewYork",
+                "signal_status": "sent",
+                "result": "LOSS",
+                "hit_target": "SL",
+                "risk_reward": 2.0,
+                "pnl_percent": -1.0,
+            }
+        )
+    for index in range(6):
+        rows.append(
+            {
+                "timestamp": f"2026-06-02T1{index}:00:00+00:00",
+                "symbol": "GOODUSDT",
+                "side": "SHORT",
+                "tier": "A",
+                "session": "London+NewYork",
+                "signal_status": "sent",
+                "result": "WIN",
+                "hit_target": "TP1",
+                "risk_reward": 2.0,
+                "pnl_percent": 1.2,
+            }
+        )
+    df = pd.DataFrame(rows)
+    before = df.copy(deep=True)
+    v3 = build_performance_v3(df)
+    shadow = v3["shadow_filter_backtest"]
+    actions = v3["recommended_actions"]
+    assert not v3["symbol_performance_v3"].empty
+    assert not v3["session_performance_v3"].empty
+    assert not v3["tier_performance_v3"].empty
+    assert not v3["direction_performance_v3"].empty
+    assert not v3["hour_performance_v3"].empty
+    assert "No Tier C" in shadow["Scenario"].tolist()
+    assert "Exclude weak symbols <40% WR / >=5 trades" in shadow["Scenario"].tolist()
+    no_tier_c = shadow[shadow["Scenario"] == "No Tier C"].iloc[0]
+    current = shadow[shadow["Scenario"] == "Current"].iloc[0]
+    assert float(no_tier_c["Net R estimate"]) > float(current["Net R estimate"])
+    weak = actions[actions["Symbol"] == "WEAKUSDT"].iloc[0]
+    assert weak["Recommendation"] == "FLAG FOR REMOVAL"
+    assert set(actions["Recommendation"]).issubset({"FLAG FOR REMOVAL", "KEEP", "WATCH"})
+    pd.testing.assert_frame_equal(df, before)
+
+
+def test_performance_analytics_v3_missing_fields_safe() -> None:
+    df = pd.DataFrame(
+        [
+            {"timestamp": "2026-06-03T00:00:00+00:00", "symbol": "BTCUSDT", "result": "WIN", "signal_status": "sent"},
+            {"timestamp": "2026-06-03T01:00:00+00:00", "symbol": "ETHUSDT", "result": "LOSS", "signal_status": "sent"},
+        ]
+    )
+    v3 = build_performance_v3(df)
+    shadow = shadow_filter_backtest(df)
+    assert not shadow.empty
+    assert "Current" in shadow["Scenario"].tolist()
+    assert "symbol_performance_v3" in v3
+    assert "recommended_actions" in v3
+
+
 def test_dashboard_renders_html() -> None:
     df = performance_report.normalize(
         pd.DataFrame(
@@ -2432,6 +2501,8 @@ def main() -> int:
     test_complete_performance_analytics_v1_outputs()
     test_performance_analytics_production_mapping()
     test_performance_analytics_v2_tables_and_warnings()
+    test_performance_analytics_v3_shadow_filters_and_recommendations()
+    test_performance_analytics_v3_missing_fields_safe()
     test_dashboard_renders_html()
     test_dashboard_v2_handles_missing_and_empty_data()
     test_dashboard_v3_equity_drawdown_monthly_simulator()

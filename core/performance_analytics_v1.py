@@ -13,6 +13,7 @@ from typing import Any
 import pandas as pd
 
 from core.performance_analytics_v2 import build_performance_v2
+from core.performance_analytics_v3 import build_performance_v3, format_table as format_v3_table
 
 
 NA = "N/A"
@@ -671,6 +672,7 @@ def build_complete_report(
 
     source_perf = performance_by(sent_day, "source")
     v2 = build_performance_v2(sent_day)
+    v3 = build_performance_v3(scanner_day)
     external_summary = pd.DataFrame(
         [
             {
@@ -690,6 +692,13 @@ def build_complete_report(
         source_perf = pd.concat([source_perf.drop(columns=["win_rate_sort"], errors="ignore"), external_summary], ignore_index=True, sort=False)
 
     report["performance_warnings"] = "\n\n".join(v2["warnings"]) if v2["warnings"] else NA
+    report["performance_v3_symbol"] = format_v3_table(v3["symbol_performance_v3"])
+    report["performance_v3_session"] = format_v3_table(v3["session_performance_v3"])
+    report["performance_v3_tier"] = format_v3_table(v3["tier_performance_v3"])
+    report["performance_v3_direction"] = format_v3_table(v3["direction_performance_v3"])
+    report["performance_v3_hour"] = format_v3_table(v3["hour_performance_v3"])
+    report["shadow_filter_backtest"] = format_v3_table(v3["shadow_filter_backtest"], limit=12)
+    report["recommended_actions"] = format_v3_table(v3["recommended_actions"], limit=12)
 
     tables = {
         "symbol_performance": performance_by(sent_day, "symbol").drop(columns=["win_rate_sort"], errors="ignore"),
@@ -707,6 +716,13 @@ def build_complete_report(
         "direction_performance_v2": v2["direction_performance_v2"],
         "tier_performance_v2": v2["tier_performance_v2"],
         "performance_warnings": pd.DataFrame({"warning": v2["warnings"]}),
+        "symbol_performance_v3": v3["symbol_performance_v3"],
+        "session_performance_v3": v3["session_performance_v3"],
+        "tier_performance_v3": v3["tier_performance_v3"],
+        "direction_performance_v3": v3["direction_performance_v3"],
+        "hour_performance_v3": v3["hour_performance_v3"],
+        "shadow_filter_backtest": v3["shadow_filter_backtest"],
+        "recommended_actions": v3["recommended_actions"],
     }
     return report, tables
 
@@ -723,6 +739,13 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
         "direction_performance_v2": logs_dir / "direction_performance_v2.csv",
         "tier_performance_v2": logs_dir / "tier_performance_v2.csv",
         "performance_warnings": logs_dir / "performance_warnings.csv",
+        "symbol_performance_v3": logs_dir / "symbol_performance_v3.csv",
+        "session_performance_v3": logs_dir / "session_performance_v3.csv",
+        "tier_performance_v3": logs_dir / "tier_performance_v3.csv",
+        "direction_performance_v3": logs_dir / "direction_performance_v3.csv",
+        "hour_performance_v3": logs_dir / "hour_performance_v3.csv",
+        "shadow_filter_backtest": logs_dir / "shadow_filter_backtest.csv",
+        "recommended_actions": logs_dir / "recommended_actions.csv",
     }
 
     daily_row = pd.DataFrame([{column: report.get(column, NA) for column in DAILY_PERFORMANCE_COLUMNS}])
@@ -742,6 +765,13 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
     tables.get("direction_performance_v2", pd.DataFrame()).to_csv(paths["direction_performance_v2"], index=False)
     tables.get("tier_performance_v2", pd.DataFrame()).to_csv(paths["tier_performance_v2"], index=False)
     tables.get("performance_warnings", pd.DataFrame()).to_csv(paths["performance_warnings"], index=False)
+    tables.get("symbol_performance_v3", pd.DataFrame()).to_csv(paths["symbol_performance_v3"], index=False)
+    tables.get("session_performance_v3", pd.DataFrame()).to_csv(paths["session_performance_v3"], index=False)
+    tables.get("tier_performance_v3", pd.DataFrame()).to_csv(paths["tier_performance_v3"], index=False)
+    tables.get("direction_performance_v3", pd.DataFrame()).to_csv(paths["direction_performance_v3"], index=False)
+    tables.get("hour_performance_v3", pd.DataFrame()).to_csv(paths["hour_performance_v3"], index=False)
+    tables.get("shadow_filter_backtest", pd.DataFrame()).to_csv(paths["shadow_filter_backtest"], index=False)
+    tables.get("recommended_actions", pd.DataFrame()).to_csv(paths["recommended_actions"], index=False)
     position_row = tables.get("position_management", pd.DataFrame())
     if paths["position_management"].exists():
         existing_position = load_csv_safely(paths["position_management"])
