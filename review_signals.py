@@ -29,6 +29,9 @@ HISTORY = BASE_DIR / "logs" / "signals_history.csv"
 REJECTED = BASE_DIR / "logs" / "rejected_signals.csv"
 EXTERNAL_SIGNALS = BASE_DIR / "logs" / "external_signals.csv"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
+OUTCOME_EXCHANGE = "Binance"
+OUTCOME_MARKET_TYPE = "USDT-M Futures"
+OUTCOME_TIMEFRAME = "15m"
 ERROR_RETRY_SECONDS = 60
 
 logging.basicConfig(
@@ -160,12 +163,22 @@ def build_session() -> requests.Session:
 
 
 def display_symbol(symbol: str) -> str:
-    cleaned = str(symbol).strip().upper().replace("BINANCE:", "").replace(".P", "")
+    cleaned = clean_symbol(symbol)
     return f"{cleaned}.P"
 
 
 def clean_symbol(symbol: str) -> str:
-    return str(symbol).strip().upper().replace("BINANCE:", "").replace(".P", "")
+    return (
+        str(symbol)
+        .strip()
+        .upper()
+        .replace("BINANCE:", "")
+        .replace(".P", "")
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
 
 
 def format_price(value: Any) -> str:
@@ -571,13 +584,24 @@ def send_test_report(session: requests.Session) -> bool:
 
 
 def fetch_klines(session: requests.Session, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    normalized_symbol = clean_symbol(symbol)
     params = {
-        "symbol": symbol,
-        "interval": "15m",
+        "symbol": normalized_symbol,
+        "interval": OUTCOME_TIMEFRAME,
         "startTime": start_ms,
         "endTime": end_ms,
         "limit": 1000,
     }
+    LOGGER.info(
+        "OUTCOME PRICE SOURCE exchange=%s market_type=%s endpoint=%s symbol=%s timeframe=%s start_ms=%s end_ms=%s",
+        OUTCOME_EXCHANGE,
+        OUTCOME_MARKET_TYPE,
+        BINANCE_FUTURES_KLINES,
+        normalized_symbol,
+        OUTCOME_TIMEFRAME,
+        start_ms,
+        end_ms,
+    )
     response = session.get(BINANCE_FUTURES_KLINES, params=params, timeout=20)
     response.raise_for_status()
     data = response.json()
@@ -599,6 +623,80 @@ def fetch_klines(session: requests.Session, symbol: str, start_ms: int, end_ms: 
     return df
 
 
+def candle_extremes(candles: pd.DataFrame) -> tuple[float, float]:
+    if candles.empty:
+        return 0.0, 0.0
+    return float(candles["low"].min()), float(candles["high"].max())
+
+
+def log_outcome_price_audit(row: pd.Series, candles: pd.DataFrame, outcome: Outcome) -> None:
+    symbol = clean_symbol(row.get("symbol", ""))
+    side = str(row.get("side", "")).upper()
+    entry = safe_float(row.get("entry"))
+    tp1 = safe_float(row.get("tp1"))
+    tp2 = safe_float(row.get("tp2"))
+    stop_loss = safe_float(row.get("stop_loss", row.get("sl")))
+    min_low, max_high = candle_extremes(candles)
+    LOGGER.info(
+        "OUTCOME PRICE AUDIT exchange=%s market_type=%s symbol=%s timeframe=%s side=%s entry=%s tp1=%s tp2=%s sl=%s min_low_after_entry=%s max_high_after_entry=%s outcome=%s hit_target=%s candles=%s",
+        OUTCOME_EXCHANGE,
+        OUTCOME_MARKET_TYPE,
+        symbol,
+        OUTCOME_TIMEFRAME,
+        side,
+        format_price(entry) if entry > 0 else "-",
+        format_price(tp1) if tp1 > 0 else "-",
+        format_price(tp2) if tp2 > 0 else "-",
+        format_price(stop_loss) if stop_loss > 0 else "-",
+        format_price(min_low) if min_low > 0 else "-",
+        format_price(max_high) if max_high > 0 else "-",
+        outcome.result,
+        outcome.hit_target or "-",
+        len(candles),
+    )
+    hit_target = str(outcome.hit_target).upper()
+    if outcome.result == "WIN" and hit_target == "TP2":
+        if side == "SHORT" and tp2 > 0 and min_low > tp2:
+            LOGGER.warning(
+                "SUSPICIOUS OUTCOME symbol=%s side=%s entry=%s tp2=%s min_low_after_entry=%s outcome=%s reason=SHORT_TP2_WITHOUT_LOW_TOUCH",
+                symbol,
+                side,
+                format_price(entry),
+                format_price(tp2),
+                format_price(min_low),
+                hit_target,
+            )
+        if side == "LONG" and tp2 > 0 and max_high < tp2:
+            LOGGER.warning(
+                "SUSPICIOUS OUTCOME symbol=%s side=%s entry=%s tp2=%s max_high_after_entry=%s outcome=%s reason=LONG_TP2_WITHOUT_HIGH_TOUCH",
+                symbol,
+                side,
+                format_price(entry),
+                format_price(tp2),
+                format_price(max_high),
+                hit_target,
+            )
+
+
+def log_outcome_kline_used(symbol: str, side: str, candle: pd.Series, result: str, hit_target: str) -> None:
+    LOGGER.info(
+        "OUTCOME KLINE USED exchange=%s market_type=%s symbol=%s timeframe=%s side=%s result=%s hit_target=%s open_time=%s close_time=%s open=%s high=%s low=%s close=%s",
+        OUTCOME_EXCHANGE,
+        OUTCOME_MARKET_TYPE,
+        clean_symbol(symbol),
+        OUTCOME_TIMEFRAME,
+        side,
+        result,
+        hit_target or "-",
+        candle.get("open_time", "-"),
+        candle.get("close_time", "-"),
+        format_price(candle.get("open")),
+        format_price(candle.get("high")),
+        format_price(candle.get("low")),
+        format_price(candle.get("close")),
+    )
+
+
 def calculate_extremes(side: str, entry: float, candles: pd.DataFrame) -> tuple[float, float]:
     if candles.empty or entry <= 0:
         return 0.0, 0.0
@@ -613,6 +711,7 @@ def calculate_extremes(side: str, entry: float, candles: pd.DataFrame) -> tuple[
 
 def evaluate_outcome(row: pd.Series, candles: pd.DataFrame) -> Outcome:
     side = str(row["side"]).upper()
+    symbol = clean_symbol(row.get("symbol", ""))
     entry = float(row["entry"])
     stop_loss = float(row["stop_loss"])
     tp1 = float(row["tp1"])
@@ -638,10 +737,13 @@ def evaluate_outcome(row: pd.Series, candles: pd.DataFrame) -> Outcome:
 
         # Conservative mode: if SL and TP happen in the same candle, SL wins.
         if sl_hit:
+            log_outcome_kline_used(symbol, side, candle, "LOSS", "SL")
             return Outcome("LOSS", "SL", closed_at, max_profit_pct, max_drawdown_pct)
         if tp2_hit:
+            log_outcome_kline_used(symbol, side, candle, "WIN", "TP2")
             return Outcome("WIN", "TP2", closed_at, max_profit_pct, max_drawdown_pct)
         if tp1_hit:
+            log_outcome_kline_used(symbol, side, candle, "WIN", "TP1")
             return Outcome("WIN", "TP1", closed_at, max_profit_pct, max_drawdown_pct)
 
     return Outcome("OPEN", "", "", max_profit_pct, max_drawdown_pct)
@@ -655,8 +757,12 @@ def review_signal(session: requests.Session, row: pd.Series, lookahead_hours: in
     start_ms = int(timestamp.timestamp() * 1000)
     end_ts = min(timestamp + pd.Timedelta(hours=lookahead_hours), pd.Timestamp.now(tz="UTC"))
     end_ms = int(end_ts.timestamp() * 1000)
-    candles = fetch_klines(session, str(row["symbol"]).upper(), start_ms, end_ms)
-    return evaluate_outcome(row, candles)
+    review_row = row.copy()
+    review_row["symbol"] = clean_symbol(row.get("symbol", ""))
+    candles = fetch_klines(session, review_row["symbol"], start_ms, end_ms)
+    outcome = evaluate_outcome(review_row, candles)
+    log_outcome_price_audit(review_row, candles, outcome)
+    return outcome
 
 
 def is_external_approved(row: pd.Series) -> bool:

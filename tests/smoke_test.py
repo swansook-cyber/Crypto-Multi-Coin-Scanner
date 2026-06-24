@@ -564,6 +564,90 @@ def _closed_outcome_row() -> dict:
     }
 
 
+def test_outcome_uses_futures_klines_and_symbol_normalization() -> None:
+    assert review_signals.clean_symbol("INJUSDT.P") == "INJUSDT"
+    assert review_signals.clean_symbol("BINANCE:INJUSDT.P") == "INJUSDT"
+    assert review_signals.clean_symbol("INJ/USDT") == "INJUSDT"
+    assert review_signals.clean_symbol("INJUSDT") == "INJUSDT"
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.url = ""
+            self.params = {}
+
+        def get(self, url, params=None, timeout=None):
+            self.url = url
+            self.params = params or {}
+
+            class Response:
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self):
+                    return [
+                        [
+                            1_800_000_000_000,
+                            "10",
+                            "11",
+                            "9",
+                            "10.5",
+                            "100",
+                            1_800_000_900_000,
+                            "0",
+                            1,
+                            "0",
+                            "0",
+                            "0",
+                        ]
+                    ]
+
+            return Response()
+
+    session = FakeSession()
+    candles = review_signals.fetch_klines(session, "INJ/USDT", 1, 2)
+    assert review_signals.BINANCE_FUTURES_KLINES == "https://fapi.binance.com/fapi/v1/klines"
+    assert session.url == review_signals.BINANCE_FUTURES_KLINES
+    assert session.params["symbol"] == "INJUSDT"
+    assert session.params["interval"] == "15m"
+    assert float(candles.iloc[0]["high"]) == 11.0
+
+
+def test_outcome_high_low_direction_rules() -> None:
+    candles = pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp("2026-06-01T00:00:00Z"),
+                "close_time": pd.Timestamp("2026-06-01T00:15:00Z"),
+                "open": 100.0,
+                "high": 101.0,
+                "low": 95.0,
+                "close": 96.0,
+            }
+        ]
+    )
+    short = pd.Series({"symbol": "INJUSDT", "side": "SHORT", "entry": 100.0, "stop_loss": 105.0, "tp1": 98.0, "tp2": 96.0})
+    short_outcome = review_signals.evaluate_outcome(short, candles)
+    assert short_outcome.result == "WIN"
+    assert short_outcome.hit_target == "TP2"
+
+    short_sl = short.copy()
+    short_sl["stop_loss"] = 100.5
+    short_sl_outcome = review_signals.evaluate_outcome(short_sl, candles)
+    assert short_sl_outcome.result == "LOSS"
+    assert short_sl_outcome.hit_target == "SL"
+
+    long = pd.Series({"symbol": "INJUSDT", "side": "LONG", "entry": 100.0, "stop_loss": 95.0, "tp1": 100.5, "tp2": 101.0})
+    long_outcome = review_signals.evaluate_outcome(long, candles)
+    assert long_outcome.result == "LOSS"
+    assert long_outcome.hit_target == "SL"
+
+    long_tp = long.copy()
+    long_tp["stop_loss"] = 94.0
+    long_tp_outcome = review_signals.evaluate_outcome(long_tp, candles)
+    assert long_tp_outcome.result == "WIN"
+    assert long_tp_outcome.hit_target == "TP2"
+
+
 def test_outcome_alert_success_marks_sent_and_failure_does_not() -> None:
     class FakeSession:
         def __init__(self, status_code: int) -> None:
@@ -2481,6 +2565,8 @@ def main() -> int:
     test_external_signal_approved_routes_to_signals_and_cornix_and_logs()
     test_external_signal_refine_conflict_not_approved_or_routed()
     test_outcome_alert_reports_only()
+    test_outcome_uses_futures_klines_and_symbol_normalization()
+    test_outcome_high_low_direction_rules()
     test_outcome_alert_success_marks_sent_and_failure_does_not()
     test_wave_bullish_higher_high_higher_low()
     test_wave_bearish_lower_high_lower_low()
