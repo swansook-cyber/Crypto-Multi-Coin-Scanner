@@ -2691,6 +2691,61 @@ def test_position_watcher_cornix_stop_price_duplicate_prevention() -> None:
             pass
 
 
+def test_position_watcher_float_flag_duplicate_prevention() -> None:
+    path = Path(tempfile.gettempdir()) / "position_watcher_float_flag_dedupe_smoke.csv"
+    pd.DataFrame(
+        [
+            {
+                **_watcher_row(side="SHORT", tp1=68.500),
+                "cornix_be_command_sent": 1.0,
+                "cornix_be_stop_price": 70.744,
+                "new_stop_notification_sent": 1.0,
+                "new_stop_notification_stop_price": 70.744,
+            }
+        ]
+    ).to_csv(path, index=False)
+    session = WatcherFakeSession("68.000")
+    try:
+        stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
+        assert stats.skipped_duplicates == 1
+        assert stats.cornix_commands_sent == 0
+        assert len(session.posts) == 0
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def test_position_watcher_cross_row_new_stop_dedupe() -> None:
+    path = Path(tempfile.gettempdir()) / "position_watcher_cross_row_dedupe_smoke.csv"
+    pd.DataFrame(
+        [
+            {**_watcher_row(side="SHORT", entry=0.696, tp1=0.680), "symbol": "SUIUSDT"},
+            {**_watcher_row(side="SHORT", entry=0.696, tp1=0.680), "symbol": "SUIUSDT"},
+        ]
+    ).to_csv(path, index=False)
+    session = WatcherFakeSession("0.679")
+    try:
+        stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
+        assert stats.tp1_reached == 1
+        assert stats.cornix_commands_sent == 1
+        assert stats.skipped_duplicates == 1
+        assert len(session.posts) == 2
+        assert session.posts[0][0] == "cornix"
+        assert session.posts[0][1].count("NEW STOP:") == 1
+
+        stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
+        assert stats.cornix_commands_sent == 0
+        assert stats.skipped_duplicates == 2
+        assert len(session.posts) == 2
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def test_position_watcher_new_stop_notification_key_dedupe_and_closed_skip() -> None:
     duplicate_path = Path(tempfile.gettempdir()) / "position_watcher_new_stop_key_dedupe_smoke.csv"
     closed_path = Path(tempfile.gettempdir()) / "position_watcher_closed_new_stop_smoke.csv"
@@ -2941,6 +2996,8 @@ def main() -> int:
     test_position_watcher_tp1_breakeven_alert_and_dedupe()
     test_position_watcher_cornix_command_long_short_and_dedupe()
     test_position_watcher_cornix_stop_price_duplicate_prevention()
+    test_position_watcher_float_flag_duplicate_prevention()
+    test_position_watcher_cross_row_new_stop_dedupe()
     test_position_watcher_new_stop_notification_key_dedupe_and_closed_skip()
     test_position_watcher_command_safety_modes()
     test_position_watcher_cornix_breakeven_formats()
