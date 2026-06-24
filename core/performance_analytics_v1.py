@@ -51,6 +51,10 @@ DAILY_PERFORMANCE_COLUMNS = [
     "tier_c_report_wins",
     "tier_c_report_losses",
     "tier_c_report_win_rate",
+    "weak_symbol_report_count",
+    "weak_symbol_report_wins",
+    "weak_symbol_report_losses",
+    "weak_symbol_report_win_rate",
     "tp1_alerts_watcher",
     "tp1_alerts_outcome_review",
     "breakeven_recommendations",
@@ -616,6 +620,12 @@ def build_complete_report(
     tier_c_report_closed = closed_trades(tier_c_report)
     tier_c_report_wins = winning_trades(tier_c_report)
     tier_c_report_losses = losing_trades(tier_c_report)
+    weak_symbol_report = scanner_day[
+        scanner_day["signal_status"].fillna("").astype(str).str.lower().eq("weak_symbol_report_only")
+    ].copy() if not scanner_day.empty else scanner_day
+    weak_symbol_report_closed = closed_trades(weak_symbol_report)
+    weak_symbol_report_wins = winning_trades(weak_symbol_report)
+    weak_symbol_report_losses = losing_trades(weak_symbol_report)
     closed = closed_trades(sent_day)
     wins = winning_trades(sent_day)
     losses = losing_trades(sent_day)
@@ -662,6 +672,10 @@ def build_complete_report(
         "tier_c_report_wins": int(len(tier_c_report_wins)),
         "tier_c_report_losses": int(len(tier_c_report_losses)),
         "tier_c_report_win_rate": safe_percent(len(tier_c_report_wins), len(tier_c_report_closed)),
+        "weak_symbol_report_count": int(len(weak_symbol_report)),
+        "weak_symbol_report_wins": int(len(weak_symbol_report_wins)),
+        "weak_symbol_report_losses": int(len(weak_symbol_report_losses)),
+        "weak_symbol_report_win_rate": safe_percent(len(weak_symbol_report_wins), len(weak_symbol_report_closed)),
         "tp1_alerts_watcher": int(tp1_sources.eq("watcher").sum()) if not tp1_sources.empty else 0,
         "tp1_alerts_outcome_review": int(tp1_sources.eq("outcome_review").sum()) if not tp1_sources.empty else 0,
         "breakeven_recommendations": int(breakeven.sum()) if not breakeven.empty else 0,

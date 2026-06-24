@@ -191,6 +191,7 @@ class ScannerConfig:
     telegram_reports_chat_id: str
     telegram_external_inbox_chat_id: str
     enable_tier_c_report_only: bool
+    weak_symbol_report_only_symbols: list[str]
 
     @classmethod
     def from_env(cls) -> "ScannerConfig":
@@ -305,6 +306,9 @@ class ScannerConfig:
             telegram_reports_chat_id=os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip(),
             telegram_external_inbox_chat_id=os.getenv("TELEGRAM_EXTERNAL_INBOX_CHAT_ID", "").strip(),
             enable_tier_c_report_only=env_bool("ENABLE_TIER_C_REPORT_ONLY", True),
+            weak_symbol_report_only_symbols=parse_symbols(
+                os.getenv("WEAK_SYMBOL_REPORT_ONLY_SYMBOLS", "SEIUSDT,FILUSDT,WIFUSDT,BNBUSDT,OPUSDT,UNIUSDT,LINKUSDT")
+            ),
         )
 
 
@@ -1106,7 +1110,8 @@ class TradeJournalLogger:
             df.to_csv(self.path, index=False)
 
     def log_signal(self, signal: TradeSignal, signal_status: str = "sent", skip_reason: str = "") -> None:
-        result = "OPEN" if signal_status == "sent" else "SKIPPED"
+        active_report_statuses = {"sent", "tier_c_report_only", "weak_symbol_report_only"}
+        result = "OPEN" if signal_status in active_report_statuses else "SKIPPED"
         with self.path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
             writer.writerow(
@@ -1463,19 +1468,29 @@ class TelegramNotifier:
         return delivered
 
     def send_tier_c_report_signal(self, signal: TradeSignal) -> bool:
+        return self.send_report_only_signal(signal, "TIER C EXPERIMENTAL REPORT ONLY", "Tier C report-only")
+
+    def send_weak_symbol_report_signal(self, signal: TradeSignal) -> bool:
+        return self.send_report_only_signal(
+            signal,
+            "WEAK SYMBOL EXPERIMENTAL REPORT ONLY",
+            "Weak symbol report-only",
+        )
+
+    def send_report_only_signal(self, signal: TradeSignal, header: str, log_label: str) -> bool:
         message = (
-            "TIER C EXPERIMENTAL REPORT ONLY\n"
+            f"{header}\n"
             "Not sent to Signals channel. Not sent to Cornix channel.\n\n"
             f"{self.build_message(signal)}"
         )
         if self.config.dry_run:
-            LOGGER.info("DRY_RUN Tier C report-only signal for %s:\n%s", signal.symbol, message)
+            LOGGER.info("DRY_RUN %s signal for %s:\n%s", log_label, signal.symbol, message)
             return True
         if not self.config.send_telegram:
-            LOGGER.info("SEND_TELEGRAM=0, skipped Tier C report-only signal for %s", signal.symbol)
+            LOGGER.info("SEND_TELEGRAM=0, skipped %s signal for %s", log_label, signal.symbol)
             return True
         if not self.config.telegram_bot_token:
-            LOGGER.warning("Telegram credentials are missing; skipped Tier C report-only signal for %s", signal.symbol)
+            LOGGER.warning("Telegram credentials are missing; skipped %s signal for %s", log_label, signal.symbol)
             return False
         reports_chat_id = self._channel_chat_id("reports")
         if signal.chart_path and signal.chart_path.exists():
@@ -1767,6 +1782,12 @@ class AgentRunner:
                 self.chart_exporter.export(signal.symbol, self.indicators.add_indicators(self.data_client.fetch_closed_klines(signal.symbol, "1h", 120)), signal)
             except Exception as exc:
                 LOGGER.warning("Chart export failed for %s: %s", signal.symbol, exc)
+            if signal.symbol in self.config.weak_symbol_report_only_symbols:
+                self.journal.log_signal(signal, "weak_symbol_report_only", "weak_symbol_experimental_report_only")
+                if self.notifier.send_weak_symbol_report_signal(signal) and not self.config.dry_run:
+                    self.mark_sent(signal)
+                LOGGER.info("%s routed to reports only: weak symbol experimental mode", signal.symbol)
+                continue
             if signal.watchlist_tier == "C" and self.config.enable_tier_c_report_only:
                 self.journal.log_signal(signal, "tier_c_report_only", "tier_c_experimental_report_only")
                 if self.notifier.send_tier_c_report_signal(signal) and not self.config.dry_run:

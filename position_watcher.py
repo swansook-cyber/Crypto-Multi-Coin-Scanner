@@ -183,7 +183,7 @@ def open_positions(df: pd.DataFrame) -> pd.DataFrame:
     data = ensure_columns(df)
     if data.empty:
         return data
-    active_statuses = {"sent", "tier_c_report_only"}
+    active_statuses = {"sent", "tier_c_report_only", "weak_symbol_report_only"}
     final_mask = data.apply(final_outcome_reached, axis=1)
     return data[(~final_mask) & (data["signal_status"].isin(active_statuses))].copy()
 
@@ -461,7 +461,7 @@ def process_once(
     session = session or build_session()
     stats = WatcherStats()
     df = ensure_columns(load_csv_safely(journal_path))
-    active_statuses = {"sent", "tier_c_report_only"}
+    active_statuses = {"sent", "tier_c_report_only", "weak_symbol_report_only"}
     final_mask = df.apply(final_outcome_reached, axis=1) if not df.empty else pd.Series(dtype=bool)
     closed_candidates = df[(final_mask) & (df["signal_status"].isin(active_statuses))]
     if not closed_candidates.empty:
@@ -480,7 +480,9 @@ def process_once(
             stats.errors += 1
             continue
         new_stop_price = breakeven_stop_price(row)
-        if config.command_mode == "cornix_command":
+        signal_status = str(row.get("signal_status", "")).strip().lower()
+        report_only_status = signal_status in {"tier_c_report_only", "weak_symbol_report_only"}
+        if config.command_mode == "cornix_command" and not report_only_status:
             if cornix_breakeven_already_sent_for_stop(row, new_stop_price):
                 stats.skipped_duplicates += 1
                 LOGGER.info(
@@ -508,7 +510,7 @@ def process_once(
         sent_any = False
         command_status = ""
         command_error = ""
-        if config.command_mode == "cornix_command":
+        if config.command_mode == "cornix_command" and not report_only_status:
             command = format_cornix_breakeven_command(row, config.cornix_breakeven_format)
             sent_command, command_status = send_cornix_breakeven_command(
                 session,
@@ -533,6 +535,8 @@ def process_once(
                 if send_breakeven_alert(session, config, report_copy, dry_run=False):
                     stats.report_copies_sent += 1
         else:
+            if report_only_status and config.command_mode == "cornix_command":
+                LOGGER.info("Report-only status %s blocked Cornix breakeven command for %s", signal_status, symbol)
             message = build_alert_message(row, current_price)
             sent_any = send_breakeven_alert(session, config, message, dry_run=config.dry_run)
 

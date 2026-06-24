@@ -202,6 +202,35 @@ def test_tier_c_report_only_routing() -> None:
     assert "Not sent to Signals channel" in calls[0][2]
 
 
+def test_weak_symbol_report_only_routing() -> None:
+    cfg = scanner.ScannerConfig.from_env()
+    cfg.dry_run = False
+    cfg.send_telegram = True
+    cfg.telegram_bot_token = "token"
+    cfg.telegram_signals_chat_id = "signals"
+    cfg.telegram_cornix_chat_id = "cornix"
+    cfg.telegram_reports_chat_id = "reports"
+    signal = sample_signal()
+    signal.symbol = "LINKUSDT"
+    notifier = scanner.TelegramNotifier(cfg)
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_message(message: str, chat_id: str, channel_name: str = "telegram") -> bool:
+        calls.append((chat_id, channel_name, message))
+        return True
+
+    notifier._send_message = fake_message  # type: ignore[method-assign]
+    notifier._send_photo = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
+
+    assert notifier.send_weak_symbol_report_signal(signal) is True
+    assert len(calls) == 1
+    assert calls[0][0] == "reports"
+    assert calls[0][1] == "reports"
+    assert "WEAK SYMBOL EXPERIMENTAL REPORT ONLY" in calls[0][2]
+    assert "Not sent to Signals channel" in calls[0][2]
+    assert "Not sent to Cornix channel" in calls[0][2]
+
+
 def test_missing_telegram_channel_ids_do_not_crash() -> None:
     cfg = scanner.ScannerConfig.from_env()
     cfg.dry_run = False
@@ -1694,6 +1723,36 @@ def test_complete_performance_analytics_v1_outputs() -> None:
                 "hit_target": "SL",
                 "signal_status": "tier_c_report_only",
             },
+            {
+                "timestamp": "2026-05-30T10:00:00+00:00",
+                "closed_at": "2026-05-30T11:00:00+00:00",
+                "symbol": "LINKUSDT",
+                "side": "LONG",
+                "watchlist_tier": "B",
+                "entry": 100,
+                "tp1": 102,
+                "tp2": 104,
+                "stop_loss": 98,
+                "risk_reward": 2.0,
+                "result": "WIN",
+                "hit_target": "TP1",
+                "signal_status": "weak_symbol_report_only",
+            },
+            {
+                "timestamp": "2026-05-30T12:00:00+00:00",
+                "closed_at": "2026-05-30T13:00:00+00:00",
+                "symbol": "SEIUSDT",
+                "side": "SHORT",
+                "watchlist_tier": "C",
+                "entry": 100,
+                "tp1": 98,
+                "tp2": 96,
+                "stop_loss": 102,
+                "risk_reward": 2.0,
+                "result": "LOSS",
+                "hit_target": "SL",
+                "signal_status": "weak_symbol_report_only",
+            },
         ]
     )
     external = pd.DataFrame(
@@ -1773,6 +1832,10 @@ def test_complete_performance_analytics_v1_outputs() -> None:
     assert report["tier_c_report_wins"] == 1
     assert report["tier_c_report_losses"] == 1
     assert report["tier_c_report_win_rate"] == 50.0
+    assert report["weak_symbol_report_count"] == 2
+    assert report["weak_symbol_report_wins"] == 1
+    assert report["weak_symbol_report_losses"] == 1
+    assert report["weak_symbol_report_win_rate"] == 50.0
     assert "missing stop loss" in report["external_top_reject_reasons"]
     assert "NEARUSDT" in report["external_top_approved_symbols"]
     assert "XRPUSDT" in report["external_top_rejected_symbols"]
@@ -2404,6 +2467,7 @@ def test_position_watcher_cornix_stop_price_duplicate_prevention() -> None:
 def test_position_watcher_command_safety_modes() -> None:
     missing_entry = Path(tempfile.gettempdir()) / "position_watcher_missing_entry_smoke.csv"
     report_only = Path(tempfile.gettempdir()) / "position_watcher_report_only_smoke.csv"
+    weak_report_only = Path(tempfile.gettempdir()) / "position_watcher_weak_report_only_smoke.csv"
     dry_run = Path(tempfile.gettempdir()) / "position_watcher_dry_run_smoke.csv"
     try:
         pd.DataFrame([_watcher_row(entry="")]).to_csv(missing_entry, index=False)
@@ -2419,6 +2483,14 @@ def test_position_watcher_command_safety_modes() -> None:
         assert len(session.posts) == 1
         assert session.posts[0][0] == "reports"
 
+        pd.DataFrame([{**_watcher_row(), "symbol": "LINKUSDT", "signal_status": "weak_symbol_report_only"}]).to_csv(weak_report_only, index=False)
+        session = WatcherFakeSession("72.500")
+        stats = position_watcher.process_once(weak_report_only, session, _watcher_config("cornix_command"))
+        assert stats.alerts_sent == 1
+        assert stats.cornix_commands_sent == 0
+        assert len(session.posts) == 1
+        assert session.posts[0][0] == "reports"
+
         pd.DataFrame([_watcher_row()]).to_csv(dry_run, index=False)
         session = WatcherFakeSession("72.500")
         stats = position_watcher.process_once(dry_run, session, _watcher_config("cornix_command", dry_run=True))
@@ -2429,7 +2501,7 @@ def test_position_watcher_command_safety_modes() -> None:
         saved = pd.read_csv(dry_run)
         assert int(saved.loc[0].get("cornix_be_command_sent", 0)) == 0
     finally:
-        for path in [missing_entry, report_only, dry_run]:
+        for path in [missing_entry, report_only, weak_report_only, dry_run]:
             try:
                 path.unlink()
             except OSError:
@@ -2557,6 +2629,7 @@ def main() -> int:
     test_cornix_dry_run_format_and_signal_immutability()
     test_internal_signal_channel_routing()
     test_tier_c_report_only_routing()
+    test_weak_symbol_report_only_routing()
     test_missing_telegram_channel_ids_do_not_crash()
     test_external_inbox_logging_and_debug_format()
     test_external_signal_parse_long_short_and_symbols()
