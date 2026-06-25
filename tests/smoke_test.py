@@ -32,6 +32,7 @@ from core.loss_cooldown import LossCooldownTracker
 from core.performance_analytics_v1 import build_complete_report, export_v1_outputs
 from core.performance_analytics_v2 import build_performance_v2, canonical_session, generate_performance_warnings
 from core.performance_analytics_v3 import build_performance_v3, shadow_filter_backtest
+from core.performance_analytics_v8 import build_root_cause_analytics
 from core import wave_structure_analyzer as wave
 
 WATCHDOG_MONITOR_PATH = Path(__file__).resolve().parents[1] / "watchdog" / "monitor.py"
@@ -2274,6 +2275,96 @@ def test_score_calibration_report_detects_inversion() -> None:
     assert "High-score signals underperform lower-score signals" in v3["score_calibration_recommendations"]
 
 
+def _root_cause_sample() -> pd.DataFrame:
+    rows = []
+    for index in range(5):
+        rows.append(
+            {
+                "timestamp": f"2026-06-06T0{index}:00:00+00:00",
+                "symbol": "LOSSUSDT",
+                "side": "LONG",
+                "tier": "C",
+                "session": "NewYork",
+                "signal_status": "sent",
+                "result": "LOSS",
+                "hit_target": "SL",
+                "risk_reward": 2.0,
+                "score": 92,
+                "max_profit_pct": 0.4,
+                "max_drawdown_pct": -1.1,
+                "holding_minutes": 30,
+            }
+        )
+    for index in range(5):
+        rows.append(
+            {
+                "timestamp": f"2026-06-06T1{index}:00:00+00:00",
+                "symbol": "WINUSDT",
+                "side": "SHORT",
+                "tier": "A",
+                "session": "London",
+                "signal_status": "sent",
+                "result": "WIN",
+                "hit_target": "TP2",
+                "risk_reward": 2.0,
+                "score": 82,
+                "max_profit_pct": 2.2,
+                "max_drawdown_pct": -0.3,
+                "holding_minutes": 45,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_root_cause_analytics_sections_exports_and_clusters() -> None:
+    df = _root_cause_sample()
+    before = df.copy(deep=True)
+    root = build_root_cause_analytics(df)
+    assert not root["root_score_session"].empty
+    assert not root["root_score_direction"].empty
+    assert not root["root_tier_session"].empty
+    assert not root["root_symbol_session"].empty
+    assert not root["root_symbol_direction"].empty
+    assert not root["root_loss_clusters"].empty
+    assert not root["root_win_clusters"].empty
+    assert not root["root_cause_recommendations"].empty
+    worst = root["root_loss_clusters"].iloc[0]
+    best = root["root_win_clusters"].iloc[0]
+    assert "NewYork" in worst["Cluster Name"]
+    assert int(worst["Loss Count"]) >= 3
+    assert "London" in best["Cluster Name"]
+    assert int(best["Win Count"]) >= 3
+
+    report, tables = build_complete_report(df, pd.DataFrame(), pd.DataFrame(), "2026-06-06")
+    message = performance_report.format_report(report)
+    assert "Root Cause Analytics" in message
+    assert "Root Cause Recommendations" in message
+    assert "root_loss_clusters" in tables
+    assert "root_win_clusters" in tables
+
+    export_dir = Path(tempfile.gettempdir()) / "crypto_root_cause_exports_smoke"
+    shutil.rmtree(export_dir, ignore_errors=True)
+    try:
+        paths = export_v1_outputs(report, tables, export_dir)
+        for key in [
+            "root_score_session",
+            "root_score_direction",
+            "root_tier_session",
+            "root_symbol_session",
+            "root_symbol_direction",
+            "root_loss_clusters",
+            "root_win_clusters",
+            "root_cause_recommendations",
+        ]:
+            assert key in paths
+            assert paths[key].exists()
+            exported = pd.read_csv(paths[key])
+            assert not exported.empty
+    finally:
+        shutil.rmtree(export_dir, ignore_errors=True)
+    pd.testing.assert_frame_equal(df, before)
+
+
 def test_performance_analytics_v3_missing_fields_safe() -> None:
     df = pd.DataFrame(
         [
@@ -3062,6 +3153,7 @@ def main() -> int:
     test_performance_analytics_v2_tables_and_warnings()
     test_performance_analytics_v3_shadow_filters_and_recommendations()
     test_score_calibration_report_detects_inversion()
+    test_root_cause_analytics_sections_exports_and_clusters()
     test_performance_analytics_v3_missing_fields_safe()
     test_dashboard_renders_html()
     test_dashboard_v2_handles_missing_and_empty_data()

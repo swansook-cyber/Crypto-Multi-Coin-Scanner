@@ -14,6 +14,7 @@ import pandas as pd
 
 from core.performance_analytics_v2 import build_performance_v2
 from core.performance_analytics_v3 import build_performance_v3, format_table as format_v3_table
+from core.performance_analytics_v8 import build_root_cause_analytics
 
 
 NA = "N/A"
@@ -708,6 +709,7 @@ def build_complete_report(
     source_perf = performance_by(sent_day, "source")
     v2 = build_performance_v2(sent_day)
     v3 = build_performance_v3(scanner_day)
+    v8 = build_root_cause_analytics(scanner_day)
     external_summary = pd.DataFrame(
         [
             {
@@ -752,6 +754,14 @@ def build_complete_report(
     report["production_universe_performance"] = format_v3_table(v3["production_universe_performance"], limit=8)
     report["shadow_filter_backtest"] = format_v3_table(v3["shadow_filter_backtest"], limit=12)
     report["recommended_actions"] = format_v3_table(v3["recommended_actions"], limit=12)
+    report["root_score_session"] = format_v3_table(v8["root_score_session"], limit=12)
+    report["root_score_direction"] = format_v3_table(v8["root_score_direction"], limit=12)
+    report["root_tier_session"] = format_v3_table(v8["root_tier_session"], limit=12)
+    report["root_symbol_session"] = format_v3_table(v8["root_symbol_session"], limit=12)
+    report["root_symbol_direction"] = format_v3_table(v8["root_symbol_direction"], limit=12)
+    report["root_loss_clusters"] = format_v3_table(v8["root_loss_clusters"], limit=12)
+    report["root_win_clusters"] = format_v3_table(v8["root_win_clusters"], limit=12)
+    report["root_cause_recommendations"] = format_v3_table(v8["root_cause_recommendations"], limit=12)
 
     tables = {
         "symbol_performance": performance_by(sent_day, "symbol").drop(columns=["win_rate_sort"], errors="ignore"),
@@ -788,6 +798,14 @@ def build_complete_report(
         "production_universe_performance": v3["production_universe_performance"],
         "shadow_filter_backtest": v3["shadow_filter_backtest"],
         "recommended_actions": v3["recommended_actions"],
+        "root_score_session": v8["root_score_session"],
+        "root_score_direction": v8["root_score_direction"],
+        "root_tier_session": v8["root_tier_session"],
+        "root_symbol_session": v8["root_symbol_session"],
+        "root_symbol_direction": v8["root_symbol_direction"],
+        "root_loss_clusters": v8["root_loss_clusters"],
+        "root_win_clusters": v8["root_win_clusters"],
+        "root_cause_recommendations": v8["root_cause_recommendations"],
     }
     return report, tables
 
@@ -823,6 +841,14 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
         "production_universe_performance": logs_dir / "production_universe_performance.csv",
         "shadow_filter_backtest": logs_dir / "shadow_filter_backtest.csv",
         "recommended_actions": logs_dir / "recommended_actions.csv",
+        "root_score_session": logs_dir / "root_score_session.csv",
+        "root_score_direction": logs_dir / "root_score_direction.csv",
+        "root_tier_session": logs_dir / "root_tier_session.csv",
+        "root_symbol_session": logs_dir / "root_symbol_session.csv",
+        "root_symbol_direction": logs_dir / "root_symbol_direction.csv",
+        "root_loss_clusters": logs_dir / "root_loss_clusters.csv",
+        "root_win_clusters": logs_dir / "root_win_clusters.csv",
+        "root_cause_recommendations": logs_dir / "root_cause_recommendations.csv",
     }
 
     daily_row = pd.DataFrame([{column: report.get(column, NA) for column in DAILY_PERFORMANCE_COLUMNS}])
@@ -861,6 +887,14 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
     tables.get("production_universe_performance", pd.DataFrame()).to_csv(paths["production_universe_performance"], index=False)
     tables.get("shadow_filter_backtest", pd.DataFrame()).to_csv(paths["shadow_filter_backtest"], index=False)
     tables.get("recommended_actions", pd.DataFrame()).to_csv(paths["recommended_actions"], index=False)
+    tables.get("root_score_session", pd.DataFrame()).to_csv(paths["root_score_session"], index=False)
+    tables.get("root_score_direction", pd.DataFrame()).to_csv(paths["root_score_direction"], index=False)
+    tables.get("root_tier_session", pd.DataFrame()).to_csv(paths["root_tier_session"], index=False)
+    tables.get("root_symbol_session", pd.DataFrame()).to_csv(paths["root_symbol_session"], index=False)
+    tables.get("root_symbol_direction", pd.DataFrame()).to_csv(paths["root_symbol_direction"], index=False)
+    tables.get("root_loss_clusters", pd.DataFrame()).to_csv(paths["root_loss_clusters"], index=False)
+    tables.get("root_win_clusters", pd.DataFrame()).to_csv(paths["root_win_clusters"], index=False)
+    tables.get("root_cause_recommendations", pd.DataFrame()).to_csv(paths["root_cause_recommendations"], index=False)
     position_row = tables.get("position_management", pd.DataFrame())
     if paths["position_management"].exists():
         existing_position = load_csv_safely(paths["position_management"])
