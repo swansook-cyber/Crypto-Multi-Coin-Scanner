@@ -60,6 +60,12 @@ DAILY_PERFORMANCE_COLUMNS = [
     "session_risk_report_wins",
     "session_risk_report_losses",
     "session_risk_report_win_rate",
+    "london_long_report_count",
+    "london_long_report_wins",
+    "london_long_report_losses",
+    "london_long_report_open",
+    "london_long_report_win_rate",
+    "london_long_report_net_r",
     "tp1_alerts_watcher",
     "tp1_alerts_outcome_review",
     "breakeven_recommendations",
@@ -644,6 +650,14 @@ def build_complete_report(
     session_risk_report_closed = closed_trades(session_risk_report)
     session_risk_report_wins = winning_trades(session_risk_report)
     session_risk_report_losses = losing_trades(session_risk_report)
+    london_long_report = scanner_day[
+        scanner_day["signal_status"].fillna("").astype(str).str.lower().eq("london_long_report_only")
+    ].copy() if not scanner_day.empty else scanner_day
+    london_long_report_closed = closed_trades(london_long_report)
+    london_long_report_wins = winning_trades(london_long_report)
+    london_long_report_losses = losing_trades(london_long_report)
+    london_long_report_open = london_long_report[london_long_report["result"] == "OPEN"].copy() if not london_long_report.empty else london_long_report
+    london_long_report_net_r = london_long_report_closed.apply(estimated_r, axis=1).sum() if not london_long_report_closed.empty else 0.0
     closed = closed_trades(sent_day)
     wins = winning_trades(sent_day)
     losses = losing_trades(sent_day)
@@ -698,6 +712,12 @@ def build_complete_report(
         "session_risk_report_wins": int(len(session_risk_report_wins)),
         "session_risk_report_losses": int(len(session_risk_report_losses)),
         "session_risk_report_win_rate": safe_percent(len(session_risk_report_wins), len(session_risk_report_closed)),
+        "london_long_report_count": int(len(london_long_report)),
+        "london_long_report_wins": int(len(london_long_report_wins)),
+        "london_long_report_losses": int(len(london_long_report_losses)),
+        "london_long_report_open": int(len(london_long_report_open)),
+        "london_long_report_win_rate": safe_percent(len(london_long_report_wins), len(london_long_report_closed)),
+        "london_long_report_net_r": float(london_long_report_net_r),
         "tp1_alerts_watcher": int(tp1_sources.eq("watcher").sum()) if not tp1_sources.empty else 0,
         "tp1_alerts_outcome_review": int(tp1_sources.eq("outcome_review").sum()) if not tp1_sources.empty else 0,
         "breakeven_recommendations": int(breakeven.sum()) if not breakeven.empty else 0,

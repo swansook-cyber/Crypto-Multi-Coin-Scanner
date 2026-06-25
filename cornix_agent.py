@@ -193,6 +193,7 @@ class ScannerConfig:
     enable_tier_c_report_only: bool
     weak_symbol_report_only_symbols: list[str]
     session_report_only_sessions: list[str]
+    london_long_report_only: bool
 
     @classmethod
     def from_env(cls) -> "ScannerConfig":
@@ -315,6 +316,7 @@ class ScannerConfig:
                 for item in os.getenv("SESSION_REPORT_ONLY_SESSIONS", "NewYork,London+NewYork").split(",")
                 if item.strip()
             ],
+            london_long_report_only=env_bool("LONDON_LONG_REPORT_ONLY", True),
         )
 
 
@@ -1116,7 +1118,13 @@ class TradeJournalLogger:
             df.to_csv(self.path, index=False)
 
     def log_signal(self, signal: TradeSignal, signal_status: str = "sent", skip_reason: str = "") -> None:
-        active_report_statuses = {"sent", "tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only"}
+        active_report_statuses = {
+            "sent",
+            "tier_c_report_only",
+            "weak_symbol_report_only",
+            "session_risk_report_only",
+            "london_long_report_only",
+        }
         result = "OPEN" if signal_status in active_report_statuses else "SKIPPED"
         with self.path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
@@ -1490,6 +1498,13 @@ class TelegramNotifier:
             "Session risk report-only",
         )
 
+    def send_london_long_report_signal(self, signal: TradeSignal) -> bool:
+        return self.send_report_only_signal(
+            signal,
+            "LONDON LONG EXPERIMENTAL REPORT ONLY",
+            "London LONG report-only",
+        )
+
     def send_report_only_signal(self, signal: TradeSignal, header: str, log_label: str) -> bool:
         message = (
             f"{header}\n"
@@ -1812,6 +1827,16 @@ class AgentRunner:
                 if self.notifier.send_tier_c_report_signal(signal) and not self.config.dry_run:
                     self.mark_sent(signal)
                 LOGGER.info("%s routed to reports only: Tier C experimental mode", signal.symbol)
+                continue
+            if (
+                self.config.london_long_report_only
+                and signal.market_session == "London"
+                and signal.direction == "LONG"
+            ):
+                self.journal.log_signal(signal, "london_long_report_only", "london_long_experimental_report_only")
+                if self.notifier.send_london_long_report_signal(signal) and not self.config.dry_run:
+                    self.mark_sent(signal)
+                LOGGER.info("%s routed to reports only: London LONG experimental mode", signal.symbol)
                 continue
             self.journal.log_signal(signal, "sent", "")
             if self.notifier.send_signal(signal) and not self.config.dry_run:

@@ -17,7 +17,7 @@ from core.performance_analytics_v2 import canonical_session
 MIN_WEAK_SYMBOL_TRADES = 5
 WEAK_SYMBOL_WIN_RATE = 40.0
 PRODUCTION_UNIVERSE_MIN_TRADES = 5
-REPORT_ONLY_STATUSES = {"tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only"}
+REPORT_ONLY_STATUSES = {"tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only", "london_long_report_only"}
 
 
 def _num(value: Any) -> float | None:

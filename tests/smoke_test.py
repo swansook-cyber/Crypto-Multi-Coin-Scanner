@@ -262,6 +262,54 @@ def test_session_risk_report_only_routing() -> None:
     assert "Not sent to Cornix channel" in calls[0][2]
 
 
+def test_london_long_report_only_routing_and_unaffected_signals() -> None:
+    cfg = scanner.ScannerConfig.from_env()
+    cfg.dry_run = False
+    cfg.send_telegram = True
+    cfg.telegram_bot_token = "token"
+    cfg.telegram_signals_chat_id = "signals"
+    cfg.telegram_cornix_chat_id = "cornix"
+    cfg.telegram_reports_chat_id = "reports"
+    notifier = scanner.TelegramNotifier(cfg)
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_message(message: str, chat_id: str, channel_name: str = "telegram") -> bool:
+        calls.append((chat_id, channel_name, message))
+        return True
+
+    notifier._send_message = fake_message  # type: ignore[method-assign]
+    notifier._send_photo = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
+
+    london_long = sample_signal()
+    london_long.direction = "LONG"
+    london_long.market_session = "London"
+    assert notifier.send_london_long_report_signal(london_long) is True
+    assert len(calls) == 1
+    assert calls[0][0] == "reports"
+    assert calls[0][1] == "reports"
+    assert "LONDON LONG EXPERIMENTAL REPORT ONLY" in calls[0][2]
+    assert "Not sent to Signals channel" in calls[0][2]
+    assert "Not sent to Cornix channel" in calls[0][2]
+
+    calls.clear()
+    london_short = sample_signal()
+    london_short.direction = "SHORT"
+    london_short.market_session = "London"
+    assert notifier.send_signal(london_short) is True
+    assert ("signals", "signals") in [(chat, channel) for chat, channel, _message in calls]
+    assert ("cornix", "cornix") in [(chat, channel) for chat, channel, _message in calls]
+    assert not any(channel == "reports" for _chat, channel, _message in calls)
+
+    calls.clear()
+    asia_long = sample_signal()
+    asia_long.direction = "LONG"
+    asia_long.market_session = "Asia"
+    assert notifier.send_signal(asia_long) is True
+    assert ("signals", "signals") in [(chat, channel) for chat, channel, _message in calls]
+    assert ("cornix", "cornix") in [(chat, channel) for chat, channel, _message in calls]
+    assert not any(channel == "reports" for _chat, channel, _message in calls)
+
+
 def test_missing_telegram_channel_ids_do_not_crash() -> None:
     cfg = scanner.ScannerConfig.from_env()
     cfg.dry_run = False
@@ -1608,6 +1656,7 @@ def test_daily_performance_report_metrics() -> None:
     assert "Post-Filter Live Performance" in message
     assert "Production Universe Performance" in message
     assert "Session Risk Experimental Performance" in message
+    assert "London Long Experimental Performance" in message
 
 
 def test_performance_report_routes_to_reports_only() -> None:
@@ -1828,6 +1877,53 @@ def test_complete_performance_analytics_v1_outputs() -> None:
                 "hit_target": "SL",
                 "signal_status": "session_risk_report_only",
             },
+            {
+                "timestamp": "2026-05-30T18:00:00+00:00",
+                "closed_at": "2026-05-30T19:00:00+00:00",
+                "symbol": "AAVEUSDT",
+                "side": "LONG",
+                "watchlist_tier": "B",
+                "market_session": "London",
+                "entry": 100,
+                "tp1": 102,
+                "tp2": 104,
+                "stop_loss": 98,
+                "risk_reward": 2.0,
+                "result": "WIN",
+                "hit_target": "TP2",
+                "signal_status": "london_long_report_only",
+            },
+            {
+                "timestamp": "2026-05-30T20:00:00+00:00",
+                "closed_at": "2026-05-30T21:00:00+00:00",
+                "symbol": "UNIUSDT",
+                "side": "LONG",
+                "watchlist_tier": "B",
+                "market_session": "London",
+                "entry": 100,
+                "tp1": 102,
+                "tp2": 104,
+                "stop_loss": 98,
+                "risk_reward": 2.0,
+                "result": "LOSS",
+                "hit_target": "SL",
+                "signal_status": "london_long_report_only",
+            },
+            {
+                "timestamp": "2026-05-30T22:00:00+00:00",
+                "symbol": "RUNEUSDT",
+                "side": "LONG",
+                "watchlist_tier": "B",
+                "market_session": "London",
+                "entry": 100,
+                "tp1": 102,
+                "tp2": 104,
+                "stop_loss": 98,
+                "risk_reward": 2.0,
+                "result": "OPEN",
+                "hit_target": "",
+                "signal_status": "london_long_report_only",
+            },
         ]
     )
     external = pd.DataFrame(
@@ -1915,6 +2011,12 @@ def test_complete_performance_analytics_v1_outputs() -> None:
     assert report["session_risk_report_wins"] == 1
     assert report["session_risk_report_losses"] == 1
     assert report["session_risk_report_win_rate"] == 50.0
+    assert report["london_long_report_count"] == 3
+    assert report["london_long_report_wins"] == 1
+    assert report["london_long_report_losses"] == 1
+    assert report["london_long_report_open"] == 1
+    assert report["london_long_report_win_rate"] == 50.0
+    assert report["london_long_report_net_r"] == 1.0
     assert "missing stop loss" in report["external_top_reject_reasons"]
     assert "NEARUSDT" in report["external_top_approved_symbols"]
     assert "XRPUSDT" in report["external_top_rejected_symbols"]
@@ -1928,6 +2030,7 @@ def test_complete_performance_analytics_v1_outputs() -> None:
             assert path.exists()
         daily = pd.read_csv(paths["daily_performance"])
         assert daily.loc[0, "tp3_hits"] == 1
+        assert daily.loc[0, "london_long_report_count"] == 3
         position = pd.read_csv(paths["position_management"])
         assert position.loc[0, "hold_count"] == 1
         assert paths["score_tier_audit"].name == "score_tier_audit.csv"
@@ -2951,8 +3054,9 @@ def test_position_watcher_command_safety_modes() -> None:
     report_only = Path(tempfile.gettempdir()) / "position_watcher_report_only_smoke.csv"
     weak_report_only = Path(tempfile.gettempdir()) / "position_watcher_weak_report_only_smoke.csv"
     session_report_only = Path(tempfile.gettempdir()) / "position_watcher_session_report_only_smoke.csv"
+    london_long_report_only = Path(tempfile.gettempdir()) / "position_watcher_london_long_report_only_smoke.csv"
     dry_run = Path(tempfile.gettempdir()) / "position_watcher_dry_run_smoke.csv"
-    for path in [missing_entry, report_only, weak_report_only, session_report_only, dry_run]:
+    for path in [missing_entry, report_only, weak_report_only, session_report_only, london_long_report_only, dry_run]:
         _reset_position_watcher_test_path(path)
     try:
         pd.DataFrame([_watcher_row(entry="")]).to_csv(missing_entry, index=False)
@@ -2984,6 +3088,14 @@ def test_position_watcher_command_safety_modes() -> None:
         assert len(session.posts) == 1
         assert session.posts[0][0] == "reports"
 
+        pd.DataFrame([{**_watcher_row(), "signal_status": "london_long_report_only"}]).to_csv(london_long_report_only, index=False)
+        session = WatcherFakeSession("72.500")
+        stats = position_watcher.process_once(london_long_report_only, session, _watcher_config("cornix_command"))
+        assert stats.alerts_sent == 1
+        assert stats.cornix_commands_sent == 0
+        assert len(session.posts) == 1
+        assert session.posts[0][0] == "reports"
+
         pd.DataFrame([_watcher_row()]).to_csv(dry_run, index=False)
         session = WatcherFakeSession("72.500")
         stats = position_watcher.process_once(dry_run, session, _watcher_config("cornix_command", dry_run=True))
@@ -2994,7 +3106,7 @@ def test_position_watcher_command_safety_modes() -> None:
         saved = pd.read_csv(dry_run)
         assert int(saved.loc[0].get("cornix_be_command_sent", 0)) == 0
     finally:
-        for path in [missing_entry, report_only, weak_report_only, session_report_only, dry_run]:
+        for path in [missing_entry, report_only, weak_report_only, session_report_only, london_long_report_only, dry_run]:
             _reset_position_watcher_test_path(path)
 
 
@@ -3121,6 +3233,7 @@ def main() -> int:
     test_tier_c_report_only_routing()
     test_weak_symbol_report_only_routing()
     test_session_risk_report_only_routing()
+    test_london_long_report_only_routing_and_unaffected_signals()
     test_missing_telegram_channel_ids_do_not_crash()
     test_external_inbox_logging_and_debug_format()
     test_external_signal_parse_long_short_and_symbols()
