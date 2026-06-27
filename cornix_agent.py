@@ -33,6 +33,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from core.btc_regime_filter import detect_btc_regime
+from core.entry_timing_engine import EntryTimingEngine, EntryTimingLogger
 from core.loss_cooldown import LossCooldownTracker
 from core.wave_structure_analyzer import calculate_wave_score
 from position_manager import evaluate_new_signal
@@ -49,6 +50,7 @@ CHART_DIR = BASE_DIR / "charts"
 STATE_FILE = BASE_DIR / "signal_state.json"
 LOG_FILE = LOG_DIR / "cornix_agent.log"
 SIGNAL_JOURNAL = LOG_DIR / "signals.csv"
+ENTRY_TIMING_JOURNAL = LOG_DIR / "entry_timing_engine.csv"
 SIGNAL_VERSION = "internal-lab-v2"
 
 LOG_DIR.mkdir(exist_ok=True)
@@ -1603,6 +1605,8 @@ class AgentRunner:
         )
         self.chart_exporter = ChartExporter()
         self.notifier = TelegramNotifier(config)
+        self.entry_timing = EntryTimingEngine()
+        self.entry_timing_logger = EntryTimingLogger(ENTRY_TIMING_JOURNAL)
         self.state = self._load_state()
         self.fear_greed_value: int | None = None
 
@@ -1713,7 +1717,18 @@ class AgentRunner:
                 LOGGER.exception("Scan failed for %s: %s", symbol, exc)
             time.sleep(self.config.request_delay_seconds)
 
+        self.evaluate_entry_timing_shadow(candidates)
         self.process_candidates(candidates)
+
+    def evaluate_entry_timing_shadow(self, candidates: list[TradeSignal]) -> None:
+        if not candidates:
+            return
+        try:
+            results = [self.entry_timing.evaluate(signal) for signal in candidates]
+            self.entry_timing_logger.log_many(results)
+            LOGGER.info("Entry Timing Engine shadow evaluated %s candidates", len(results))
+        except Exception as exc:
+            LOGGER.warning("Entry Timing Engine shadow evaluation failed: %s", exc)
 
     def scan_symbol(self, symbol: str) -> TradeSignal | None:
         df_1h = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.trend_timeframe, 200))

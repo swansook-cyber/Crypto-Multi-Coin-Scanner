@@ -28,6 +28,7 @@ import stats_dashboard
 import telegram_external_inbox
 from core.analytics_reporting import build_daily_performance_report, export_journal_csvs, journal_signal_export
 from core.btc_regime_filter import detect_btc_regime
+from core.entry_timing_engine import EntryTimingEngine, EntryTimingLogger, format_entry_timing_summary
 from core.loss_cooldown import LossCooldownTracker
 from core.performance_analytics_v1 import build_complete_report, export_v1_outputs
 from core.performance_analytics_v2 import build_performance_v2, canonical_session, generate_performance_warnings
@@ -2604,6 +2605,84 @@ def test_dashboard_v3_equity_drawdown_monthly_simulator() -> None:
     assert round(float(simulator.loc[0, "ending_balance"]), 2) == 101.0
 
 
+def test_entry_timing_engine_shadow_csv_and_report_summary() -> None:
+    engine = EntryTimingEngine()
+    good = sample_signal()
+    good.direction = "LONG"
+    good.entry = 100.0
+    good.sl = 99.0
+    good.support = 99.4
+    good.resistance = 105.0
+    good.volume_spike = True
+    good.mfi_confirmed = True
+    good.atr_expansion_ratio = 1.1
+    result = engine.evaluate(good)
+    assert 0 <= result.entry_quality_score <= 100
+    assert result.recommendation in {
+        "ENTER NOW",
+        "WAIT FOR PULLBACK",
+        "WAIT FOR BREAKOUT",
+        "WAIT FOR BREAKOUT RETEST",
+        "SKIP (poor timing)",
+    }
+    assert result.symbol == "BTCUSDT"
+
+    overextended = sample_signal()
+    overextended.direction = "LONG"
+    overextended.entry = 110.0
+    overextended.sl = 109.0
+    overextended.support = 100.0
+    overextended.resistance = 111.0
+    overextended.atr_expansion_ratio = 2.0
+    skip = engine.evaluate(overextended)
+    assert skip.recommendation == "SKIP (poor timing)"
+    assert skip.overextended_move == "YES"
+
+    path = Path(tempfile.gettempdir()) / "entry_timing_engine_smoke.csv"
+    try:
+        if path.exists():
+            path.unlink()
+        logger = EntryTimingLogger(path)
+        logger.log_many([result, skip])
+        saved = pd.read_csv(path)
+        assert len(saved) == 2
+        assert "entry_quality_score" in saved.columns
+        summary = format_entry_timing_summary(saved)
+        assert "Recommendation" in summary
+        assert "Candidates" in summary
+
+        report = {"date": "ALL", "entry_timing_shadow_summary": summary}
+        message = performance_report.format_report(
+            {
+                **{key: 0 for key in [
+                    "total_sent_signals",
+                    "closed_signals",
+                    "open_signals",
+                    "wins",
+                    "losses",
+                    "tp1_hits",
+                    "tp2_hits",
+                    "sl_hits",
+                    "net_r_estimate",
+                ]},
+                "date": "ALL",
+                "best_symbol": "-",
+                "worst_symbol": "-",
+                "best_tier": "-",
+                "worst_tier": "-",
+                "best_session": "-",
+                "worst_session": "-",
+                **report,
+            }
+        )
+        assert "Entry Timing Engine Shadow Summary" in message
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def test_position_manager_advice() -> None:
     now = pd.Timestamp("2026-05-30T12:00:00Z")
     path = Path(tempfile.gettempdir()) / "position_manager_smoke.csv"
@@ -3271,6 +3350,7 @@ def main() -> int:
     test_dashboard_renders_html()
     test_dashboard_v2_handles_missing_and_empty_data()
     test_dashboard_v3_equity_drawdown_monthly_simulator()
+    test_entry_timing_engine_shadow_csv_and_report_summary()
     test_position_manager_advice()
     test_position_watcher_tp1_breakeven_alert_and_dedupe()
     test_position_watcher_cornix_command_long_short_and_dedupe()

@@ -15,6 +15,7 @@ import requests
 from dotenv import load_dotenv
 
 from core.analytics_reporting import load_csv_safely
+from core.entry_timing_engine import format_entry_timing_summary, summarize_entry_timing
 from core.performance_analytics_v1 import (
     NA,
     build_complete_report,
@@ -28,6 +29,7 @@ BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
 HISTORY = BASE_DIR / "logs" / "signals_history.csv"
 EXTERNAL = BASE_DIR / "logs" / "external_signals.csv"
+ENTRY_TIMING = BASE_DIR / "logs" / "entry_timing_engine.csv"
 LOGS_DIR = BASE_DIR / "logs"
 REPORTS_DIR = BASE_DIR / "reports"
 SMALL_SAMPLE_CLOSED_TRADES = 30
@@ -292,6 +294,8 @@ def format_report(report: dict[str, Any]) -> str:
         f"{report.get('root_win_clusters') or NA}\n\n"
         "Root Cause Recommendations\n"
         f"{report.get('root_cause_recommendations') or NA}\n\n"
+        "Entry Timing Engine Shadow Summary\n"
+        f"{report.get('entry_timing_shadow_summary') or NA}\n\n"
         "Tier C Experimental Performance\n"
         f"Reported: {report.get('tier_c_report_count', 0)}\n"
         f"Wins: {report.get('tier_c_report_wins', 0)}\n"
@@ -392,6 +396,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--journal", type=Path, default=JOURNAL, help="Path to signals.csv.")
     parser.add_argument("--history", type=Path, default=HISTORY, help="Path to signals_history.csv.")
     parser.add_argument("--external", type=Path, default=EXTERNAL, help="Path to external_signals.csv.")
+    parser.add_argument("--entry-timing", type=Path, default=ENTRY_TIMING, help="Path to entry_timing_engine.csv.")
     return parser.parse_args()
 
 
@@ -404,8 +409,12 @@ def main() -> int:
     journal = load_csv_safely(args.journal)
     history = load_csv_safely(args.history)
     external = load_csv_safely(args.external)
+    entry_timing = load_csv_safely(args.entry_timing)
     report, tables = build_full_report(journal, history, external, args.date)
+    report["entry_timing_shadow_summary"] = format_entry_timing_summary(entry_timing)
+    tables["entry_timing_shadow_summary"] = summarize_entry_timing(entry_timing)
     export_v1_outputs(report, tables, LOGS_DIR)
+    tables["entry_timing_shadow_summary"].to_csv(LOGS_DIR / "entry_timing_shadow_summary.csv", index=False)
     persist_report(report)
     message = format_report(report)
     print(message)
