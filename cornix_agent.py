@@ -1717,18 +1717,21 @@ class AgentRunner:
                 LOGGER.exception("Scan failed for %s: %s", symbol, exc)
             time.sleep(self.config.request_delay_seconds)
 
-        self.evaluate_entry_timing_shadow(candidates)
         self.process_candidates(candidates)
 
-    def evaluate_entry_timing_shadow(self, candidates: list[TradeSignal]) -> None:
-        if not candidates:
-            return
+    def evaluate_entry_timing_shadow(self, signal: TradeSignal, signal_status: str) -> None:
         try:
-            results = [self.entry_timing.evaluate(signal) for signal in candidates]
-            self.entry_timing_logger.log_many(results)
-            LOGGER.info("Entry Timing Engine shadow evaluated %s candidates", len(results))
+            result = self.entry_timing.evaluate(signal)
+            self.entry_timing_logger.log(result)
+            LOGGER.info(
+                "Entry Timing Engine shadow evaluated final candidate: symbol=%s status=%s recommendation=%s score=%s",
+                signal.symbol,
+                signal_status,
+                result.recommendation,
+                result.entry_quality_score,
+            )
         except Exception as exc:
-            LOGGER.warning("Entry Timing Engine shadow evaluation failed: %s", exc)
+            LOGGER.warning("Entry Timing Engine shadow evaluation failed for %s: %s", signal.symbol, exc)
 
     def scan_symbol(self, symbol: str) -> TradeSignal | None:
         df_1h = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.trend_timeframe, 200))
@@ -1827,18 +1830,21 @@ class AgentRunner:
                 LOGGER.warning("Chart export failed for %s: %s", signal.symbol, exc)
             if signal.market_session in self.config.session_report_only_sessions:
                 self.journal.log_signal(signal, "session_risk_report_only", "session_risk_experimental_report_only")
+                self.evaluate_entry_timing_shadow(signal, "session_risk_report_only")
                 if self.notifier.send_session_risk_report_signal(signal) and not self.config.dry_run:
                     self.mark_sent(signal)
                 LOGGER.info("%s routed to reports only: session risk mode %s", signal.symbol, signal.market_session)
                 continue
             if signal.symbol in self.config.weak_symbol_report_only_symbols:
                 self.journal.log_signal(signal, "weak_symbol_report_only", "weak_symbol_experimental_report_only")
+                self.evaluate_entry_timing_shadow(signal, "weak_symbol_report_only")
                 if self.notifier.send_weak_symbol_report_signal(signal) and not self.config.dry_run:
                     self.mark_sent(signal)
                 LOGGER.info("%s routed to reports only: weak symbol experimental mode", signal.symbol)
                 continue
             if signal.watchlist_tier == "C" and self.config.enable_tier_c_report_only:
                 self.journal.log_signal(signal, "tier_c_report_only", "tier_c_experimental_report_only")
+                self.evaluate_entry_timing_shadow(signal, "tier_c_report_only")
                 if self.notifier.send_tier_c_report_signal(signal) and not self.config.dry_run:
                     self.mark_sent(signal)
                 LOGGER.info("%s routed to reports only: Tier C experimental mode", signal.symbol)
@@ -1849,11 +1855,13 @@ class AgentRunner:
                 and signal.direction == "LONG"
             ):
                 self.journal.log_signal(signal, "london_long_report_only", "london_long_experimental_report_only")
+                self.evaluate_entry_timing_shadow(signal, "london_long_report_only")
                 if self.notifier.send_london_long_report_signal(signal) and not self.config.dry_run:
                     self.mark_sent(signal)
                 LOGGER.info("%s routed to reports only: London LONG experimental mode", signal.symbol)
                 continue
             self.journal.log_signal(signal, "sent", "")
+            self.evaluate_entry_timing_shadow(signal, "sent")
             if self.notifier.send_signal(signal) and not self.config.dry_run:
                 self.mark_sent(signal)
 

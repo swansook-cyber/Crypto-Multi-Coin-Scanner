@@ -2683,6 +2683,42 @@ def test_entry_timing_engine_shadow_csv_and_report_summary() -> None:
             pass
 
 
+def test_scanner_final_candidate_writes_entry_timing_row() -> None:
+    path = Path(tempfile.gettempdir()) / "entry_timing_final_candidate_smoke.csv"
+    try:
+        if path.exists():
+            path.unlink()
+        runner = object.__new__(scanner.AgentRunner)
+        runner.entry_timing = EntryTimingEngine()
+        runner.entry_timing_logger = EntryTimingLogger(path)
+
+        production_signal = sample_signal()
+        runner.evaluate_entry_timing_shadow(production_signal, "sent")
+
+        report_only_signal = sample_signal()
+        report_only_signal.symbol = "SUIUSDT"
+        runner.evaluate_entry_timing_shadow(report_only_signal, "session_risk_report_only")
+
+        saved = pd.read_csv(path)
+        assert len(saved) == 2
+        assert saved["symbol"].tolist() == ["BTCUSDT", "SUIUSDT"]
+        assert saved["entry_quality_score"].between(0, 100).all()
+        assert set(saved["recommendation"]).issubset(
+            {
+                "ENTER NOW",
+                "WAIT FOR PULLBACK",
+                "WAIT FOR BREAKOUT",
+                "WAIT FOR BREAKOUT RETEST",
+                "SKIP (poor timing)",
+            }
+        )
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def test_position_manager_advice() -> None:
     now = pd.Timestamp("2026-05-30T12:00:00Z")
     path = Path(tempfile.gettempdir()) / "position_manager_smoke.csv"
@@ -3351,6 +3387,7 @@ def main() -> int:
     test_dashboard_v2_handles_missing_and_empty_data()
     test_dashboard_v3_equity_drawdown_monthly_simulator()
     test_entry_timing_engine_shadow_csv_and_report_summary()
+    test_scanner_final_candidate_writes_entry_timing_row()
     test_position_manager_advice()
     test_position_watcher_tp1_breakeven_alert_and_dedupe()
     test_position_watcher_cornix_command_long_short_and_dedupe()
