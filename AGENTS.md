@@ -8,6 +8,7 @@
 - Protect signal quality
 - Avoid feature bloat
 - Confirm that the change does not introduce auto trading
+- During RC1 hardening, prefer stability, observability, data integrity, backups, and deployment safety over new features
 
 ## Product Priorities
 
@@ -28,6 +29,10 @@
 - `position_manager.py` prevents duplicate/opposite/stale position confusion
 - `external_signal_analyzer.py` parses and reviews forwarded external/VIP signals
 - `telegram_external_inbox.py` polls the External Inbox
+- `production_health.py` checks production readiness without sending Telegram
+- `data_integrity_audit.py` audits CSV runtime data read-only by default
+- `backup_runtime_data.py` creates secret-safe runtime backups
+- `entry_timing_operational_summary.py` summarizes Entry Timing shadow data without affecting routing
 
 ## Telegram Routing
 
@@ -73,11 +78,14 @@ Current systemd names:
 - `crypto-performance-report.service`
 - `crypto-performance-report.timer`
 - `crypto-external-inbox.service`
+- `crypto-position-watcher.service`
 
 Common production checks:
 
 ```bash
 systemctl status crypto-scanner.service --no-pager
+systemctl status crypto-position-watcher.service --no-pager
+systemctl status crypto-performance-report.timer --no-pager
 journalctl -u crypto-scanner.service -n 140 --no-pager
 systemctl list-timers crypto-outcome-checker.timer crypto-daily-summary.timer crypto-performance-report.timer --no-pager
 ```
@@ -95,6 +103,14 @@ Required local validation:
 ```bash
 python -m compileall -q .
 python tests/smoke_test.py
+```
+
+Production-readiness validation when deployment/ops tooling changes:
+
+```bash
+python production_health.py
+python data_integrity_audit.py
+python backup_runtime_data.py
 ```
 
 ## After Success

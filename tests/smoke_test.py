@@ -20,12 +20,16 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import cornix_agent as scanner
+import backup_runtime_data
 import dashboard
+import data_integrity_audit
 import daily_summary
+import entry_timing_operational_summary
 import external_signal_analyzer
 import performance_report
 import position_manager
 import position_watcher
+import production_health
 import review_signals
 import stats_dashboard
 import telegram_external_inbox
@@ -3674,6 +3678,170 @@ def test_velahub_watchdog_threshold_recovery_and_report() -> None:
                 pass
 
 
+def test_production_health_exit_codes_and_no_telegram_send() -> None:
+    checks = [
+        production_health.HealthCheck("a", production_health.PASS, "ok"),
+        production_health.HealthCheck("b", production_health.WARNING, "warn"),
+    ]
+    assert production_health.exit_code(checks) == 1
+    checks.append(production_health.HealthCheck("c", production_health.FAIL, "bad"))
+    assert production_health.exit_code(checks) == 2
+    assert production_health.exit_code([production_health.HealthCheck("a", production_health.PASS, "ok")]) == 0
+
+    class NoTelegramSession:
+        def post(self, *_args, **_kwargs):
+            raise AssertionError("health checks must not send Telegram")
+
+    assert NoTelegramSession
+    env_checks = production_health._check_env()
+    assert any("Telegram" in check.name or "environment" in check.name for check in env_checks)
+
+
+def test_data_integrity_audit_detects_duplicates_and_malformed_rows() -> None:
+    journal = pd.DataFrame(
+        [
+            {
+                "timestamp": "bad timestamp",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "entry": "100",
+                "stop_loss": "99",
+                "tp1": "101",
+                "result": "OPEN",
+                "hit_target": "TP1",
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "bad timestamp",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "entry": "100",
+                "stop_loss": "99",
+                "tp1": "101",
+                "result": "OPEN",
+                "hit_target": "TP1",
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "2026-06-01T00:00:00+00:00",
+                "symbol": "",
+                "side": "SHORT",
+                "entry": "not-a-number",
+                "stop_loss": "102",
+                "tp1": "98",
+                "result": "MAYBE",
+                "signal_status": "strange_status",
+            },
+        ]
+    )
+    entry = pd.DataFrame(
+        [
+            {"timestamp": "2026-06-01T00:00:00+00:00", "symbol": "ETHUSDT", "direction": "LONG", "entry": 100},
+            {"timestamp": "2026-06-01T00:00:00+00:00", "symbol": "ETHUSDT", "direction": "LONG", "entry": 100},
+        ]
+    )
+    findings = data_integrity_audit.audit_journal(journal) + data_integrity_audit.audit_entry_timing(entry, journal)
+    text = "\n".join(f"{item.check}: {item.detail}" for item in findings)
+    assert "duplicate signal identifiers" in text
+    assert "malformed timestamps" in text
+    assert "OPEN rows that already contain final hit targets" in text
+    assert "invalid numeric values" in text
+    assert "invalid status values" in text
+    assert "multiple Entry Timing rows" in text
+
+
+def test_data_integrity_safe_repair_preserves_outcomes() -> None:
+    path = Path(tempfile.gettempdir()) / "safe_repair_smoke.csv"
+    try:
+        pd.DataFrame(
+            [
+                {"symbol": "BTCUSDT", "result": "WIN", "hit_target": "TP2", "tp1_alert_sent": "1.0", "entry": 100},
+                {"symbol": "BTCUSDT", "result": "WIN", "hit_target": "TP2", "tp1_alert_sent": "1.0", "entry": 100},
+            ]
+        ).to_csv(path, index=False)
+        changed, backup = data_integrity_audit.repair_safe(path)
+        repaired = pd.read_csv(path)
+        assert changed >= 1
+        assert backup is not None and backup.exists()
+        assert len(repaired) == 1
+        assert repaired.loc[0, "result"] == "WIN"
+        assert repaired.loc[0, "hit_target"] == "TP2"
+        assert str(repaired.loc[0, "tp1_alert_sent"]) == "1"
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def test_backup_runtime_data_excludes_secrets() -> None:
+    temp_backup = Path(tempfile.gettempdir()) / "runtime_backup_smoke.zip"
+    try:
+        backup = backup_runtime_data.create_backup(temp_backup)
+        assert backup.exists()
+        import zipfile
+
+        with zipfile.ZipFile(backup) as archive:
+            names = archive.namelist()
+        assert "BACKUP_MANIFEST.txt" in names
+        assert ".env" not in names
+        assert "config.bat" not in names
+        assert not any("token" in name.lower() for name in names)
+    finally:
+        try:
+            temp_backup.unlink()
+        except OSError:
+            pass
+
+
+def test_entry_timing_readiness_thresholds_and_summary() -> None:
+    assert entry_timing_operational_summary.readiness_status(0) == "NOT ENOUGH DATA"
+    assert entry_timing_operational_summary.readiness_status(30) == "EARLY DATA"
+    assert entry_timing_operational_summary.readiness_status(99) == "EARLY DATA"
+    assert entry_timing_operational_summary.readiness_status(100) == "REVIEW READY"
+    entry = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-06-01T00:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "direction": "LONG",
+                "entry": 100,
+                "recommendation": "ENTER NOW",
+                "entry_quality_score": 80,
+                "market_session": "London",
+                "watchlist_tier": "A",
+            }
+        ]
+    )
+    journal = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-06-01T00:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "entry": 100,
+                "result": "WIN",
+            }
+        ]
+    )
+    summary = entry_timing_operational_summary.build_summary(entry, journal)
+    assert "Entry Timing Operational Summary" in summary
+    assert "Total evaluated candidates: 1" in summary
+    assert "Data readiness: NOT ENOUGH DATA" in summary
+    assert "Recommendation Counts:" in summary
+
+
+def test_update_script_validation_before_restart_protection() -> None:
+    script = (Path(__file__).resolve().parents[1] / "scripts" / "update_production.sh").read_text(encoding="utf-8")
+    validation_index = script.index("tests/smoke_test.py")
+    restart_index = script.index("systemctl restart \"$SCANNER_SERVICE\"")
+    backup_index = script.index("backup_runtime_data.py")
+    pull_index = script.index("git pull --ff-only origin main")
+    assert backup_index < pull_index < validation_index < restart_index
+    assert "fail \"smoke tests failed\"" in script
+    assert "Tracked local modifications detected" in script
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -3738,6 +3906,12 @@ def main() -> int:
     test_position_watcher_cornix_breakeven_formats()
     test_position_watcher_cornix_test_command()
     test_velahub_watchdog_threshold_recovery_and_report()
+    test_production_health_exit_codes_and_no_telegram_send()
+    test_data_integrity_audit_detects_duplicates_and_malformed_rows()
+    test_data_integrity_safe_repair_preserves_outcomes()
+    test_backup_runtime_data_excludes_secrets()
+    test_entry_timing_readiness_thresholds_and_summary()
+    test_update_script_validation_before_restart_protection()
     print("smoke tests passed")
     return 0
 

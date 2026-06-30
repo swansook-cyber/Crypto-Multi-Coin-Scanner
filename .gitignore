@@ -13,6 +13,7 @@ logs/
 journal/
 charts/
 reports/
+backups/
 signal_state.json
 
 *.bak

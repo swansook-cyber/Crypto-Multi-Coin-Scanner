@@ -28,6 +28,48 @@ Current systemd units:
 - `crypto-external-inbox.service`
 - `crypto-position-watcher.service`
 
+## RC1 Production Health
+
+Run these before and after updates:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python production_health.py
+.venv/bin/python data_integrity_audit.py
+.venv/bin/python entry_timing_operational_summary.py
+.venv/bin/python backup_runtime_data.py
+```
+
+Exact service checks:
+
+```bash
+systemctl status crypto-scanner --no-pager
+systemctl status crypto-position-watcher --no-pager
+systemctl status crypto-performance-report.timer --no-pager
+systemctl status crypto-performance-report.service --no-pager
+systemctl is-active crypto-scanner
+systemctl is-active crypto-position-watcher
+systemctl is-active crypto-performance-report.timer
+systemctl is-enabled crypto-performance-report.timer
+journalctl -u crypto-scanner -n 120 --no-pager
+journalctl -u crypto-position-watcher -n 120 --no-pager
+journalctl -u crypto-performance-report.service -n 120 --no-pager
+```
+
+Guarded update:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+./scripts/update_production.sh
+```
+
+Rollback tracked code only, preserving `.env`, logs, reports, backups, lock files, and runtime state:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+./scripts/rollback_production.sh <commit>
+```
+
 ## VPS Login
 
 Default Windows helper config is stored in:

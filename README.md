@@ -260,6 +260,37 @@ Executive Report V2 shows compact sections for Performance, Best, Watch, Product
 - `POOR TIMING`: skip recommendations are at least 60%.
 - `MIXED`: no dominant timing condition.
 
+## Production Readiness RC1
+
+RC1 freezes feature expansion and adds operational tools for stable daily use. These commands do not change scanner logic, scoring, routing, Cornix format, TP/SL, RR, or outcomes.
+
+```bat
+python production_health.py
+python data_integrity_audit.py
+python backup_runtime_data.py
+python entry_timing_operational_summary.py
+```
+
+- `production_health.py` checks environment, Telegram channel configuration, Binance Futures reachability, CSV read/write, report generation, web report generation, duplicate-alert locks, disk space, UTC clock sanity, imports, and systemd service health when available.
+- `data_integrity_audit.py` audits runtime CSVs read-only by default. `--repair-safe` only normalizes safe boolean values and removes exact duplicate analytics rows after backup; it never changes wins, losses, prices, TP/SL, or outcomes.
+- `backup_runtime_data.py` writes `backups/runtime_<UTC_TIMESTAMP>.zip` and excludes `.env`, tokens, passwords, private keys, and real config files.
+- `entry_timing_operational_summary.py` summarizes Entry Timing shadow rows and reports data readiness: `NOT ENOUGH DATA`, `EARLY DATA`, or `REVIEW READY`.
+
+Release snapshot and operations checklist:
+
+```text
+RELEASE_CANDIDATE_V1.md
+DAILY_OPERATIONS.md
+```
+
+Safe VPS update and rollback scripts:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+./scripts/update_production.sh
+./scripts/rollback_production.sh <commit>
+```
+
 ## Dashboard V3
 
 Run:

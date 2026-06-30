@@ -14,6 +14,7 @@
 - Execution model: Telegram signal assistant only
 - Auto trading: not implemented
 - Manual execution: required
+- Release marker: `SCANNER_RELEASE=RC1`
 
 ## Implemented
 
@@ -39,6 +40,12 @@
 - External Signal Refine V2 via `external_signal_analyzer.py`
 - External Signal Inbox polling via `telegram_external_inbox.py`
 - External inbox VPS listener loop via `telegram_external_inbox.py --loop`
+- Production Health command via `production_health.py`
+- Data Integrity Audit via `data_integrity_audit.py`
+- Runtime backup command via `backup_runtime_data.py`
+- Entry Timing operational summary via `entry_timing_operational_summary.py`
+- RC1 release snapshot via `RELEASE_CANDIDATE_V1.md`
+- Daily VPS operations checklist via `DAILY_OPERATIONS.md`
 
 ## Telegram Channels
 
@@ -98,6 +105,7 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 
 ## Pending / Next
 
+- Current priority: production readiness, observability, data integrity, and stable VPS operations
 - Position Exit Advisor: pending
 - Advanced TP Engine: pending
 - Dashboard V2 optimization views: implemented; ongoing work is deployment hardening and calibration after more outcomes
@@ -107,6 +115,8 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 
 - Runtime CSV/log/chart/dashboard output should stay out of Git
 - `.env` and real API/chat IDs must not be committed
+- Use `python production_health.py`, `python data_integrity_audit.py`, and `python backup_runtime_data.py` before production updates
+- Use `scripts/update_production.sh` for guarded VPS updates and `scripts/rollback_production.sh <commit>` for tracked-code rollback
 - External inbox messages must not affect scanner-generated signals
 - External analyzer approval must be explicit before routing to Signals/Cornix
 - Cornix channel receives clean production-ready signal text; breakeven command formats are selectable with `CORNIX_BREAKEVEN_FORMAT`
