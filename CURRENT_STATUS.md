@@ -8,6 +8,7 @@
 - Main scanner service: `crypto-scanner.service`
 - Outcome checker: `crypto-outcome-checker.service` run by `crypto-outcome-checker.timer`
 - Daily summary: `crypto-daily-summary.service` run by `crypto-daily-summary.timer`
+- Daily performance report: `crypto-performance-report.service` run by `crypto-performance-report.timer`
 - External inbox listener: `crypto-external-inbox.service`
 - Position watcher: `crypto-position-watcher.service`
 - Execution model: Telegram signal assistant only
@@ -59,7 +60,7 @@ External analyzer routing:
 
 Channel-specific chat IDs are required for production channel routing. This prevents Signals, Cornix, and Reports messages from mixing in one destination.
 
-Performance reports are routed to `TELEGRAM_REPORTS_CHAT_ID` only. They do not fall back to Signals or Cornix.
+Performance reports are routed to `TELEGRAM_REPORTS_CHAT_ID` only. They do not fall back to Signals or Cornix. Long reports are split into Telegram-safe chunks, and scheduled `--send` exits with failure if Telegram delivery fails so systemd/journal can surface the problem.
 
 ## Performance Analytics V1
 

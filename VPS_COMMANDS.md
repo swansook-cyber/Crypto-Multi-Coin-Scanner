@@ -23,6 +23,8 @@ Current systemd units:
 - `crypto-outcome-checker.timer`
 - `crypto-daily-summary.service`
 - `crypto-daily-summary.timer`
+- `crypto-performance-report.service`
+- `crypto-performance-report.timer`
 - `crypto-external-inbox.service`
 - `crypto-position-watcher.service`
 
@@ -107,6 +109,24 @@ systemctl list-timers crypto-daily-summary.timer --no-pager
 journalctl -u crypto-daily-summary.service -n 100 --no-pager
 ```
 
+Daily Performance Report:
+
+```bash
+systemctl status crypto-performance-report.timer --no-pager
+systemctl status crypto-performance-report.service --no-pager
+systemctl list-timers crypto-performance-report.timer --no-pager
+journalctl -u crypto-performance-report.service -n 140 --no-pager
+```
+
+If the timer has not been installed yet:
+
+```bash
+sudo cp /opt/Crypto-Multi-Coin-Scanner/deploy/systemd/crypto-performance-report.service /etc/systemd/system/
+sudo cp /opt/Crypto-Multi-Coin-Scanner/deploy/systemd/crypto-performance-report.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now crypto-performance-report.timer
+```
+
 External inbox listener:
 
 ```bash
@@ -159,6 +179,12 @@ Daily summary timer:
 sudo systemctl restart crypto-daily-summary.timer
 ```
 
+Daily Performance Report timer:
+
+```bash
+sudo systemctl restart crypto-performance-report.timer
+```
+
 External inbox listener:
 
 ```bash
@@ -171,6 +197,7 @@ Restart all production units after a code update:
 sudo systemctl restart crypto-scanner.service
 sudo systemctl restart crypto-outcome-checker.timer
 sudo systemctl restart crypto-daily-summary.timer
+sudo systemctl restart crypto-performance-report.timer
 sudo systemctl restart crypto-external-inbox.service
 ```
 
@@ -184,8 +211,10 @@ git pull origin main
 sudo systemctl restart crypto-scanner.service
 sudo systemctl restart crypto-outcome-checker.timer
 sudo systemctl restart crypto-daily-summary.timer
+sudo systemctl enable --now crypto-performance-report.timer
 sudo systemctl restart crypto-external-inbox.service
 systemctl status crypto-scanner.service --no-pager
+systemctl status crypto-performance-report.timer --no-pager
 ```
 
 Windows shortcut:
@@ -225,7 +254,10 @@ Daily Performance Report:
 cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python performance_report.py
 .venv/bin/python performance_report.py --send
+.venv/bin/python performance_report.py --test-report
 ```
+
+`--send` sends only to `TELEGRAM_REPORTS_CHAT_ID`. Long analytics reports are split into Telegram-safe chunks. If Telegram delivery fails, the command exits non-zero so `crypto-performance-report.service` shows failure in `journalctl`.
 
 Dashboard V2:
 

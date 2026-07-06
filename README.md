@@ -704,6 +704,38 @@ Unit=crypto-daily-summary.service
 WantedBy=timers.target
 ```
 
+Create `/etc/systemd/system/crypto-performance-report.service`:
+
+```ini
+[Unit]
+Description=Crypto Multi-Coin Scanner Performance Report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python /opt/Crypto-Multi-Coin-Scanner/performance_report.py --send
+StandardOutput=journal
+StandardError=journal
+```
+
+Create `/etc/systemd/system/crypto-performance-report.timer`:
+
+```ini
+[Unit]
+Description=Run Crypto Scanner Performance Report daily
+
+[Timer]
+OnCalendar=*-*-* 23:58:00
+Persistent=true
+Unit=crypto-performance-report.service
+
+[Install]
+WantedBy=timers.target
+```
+
 Create `/etc/systemd/system/crypto-external-inbox.service`:
 
 ```ini
@@ -756,6 +788,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now crypto-scanner.service
 sudo systemctl enable --now crypto-outcome-checker.timer
 sudo systemctl enable --now crypto-daily-summary.timer
+sudo systemctl enable --now crypto-performance-report.timer
 sudo systemctl enable --now crypto-external-inbox.service
 sudo systemctl enable --now crypto-position-watcher.service
 ```

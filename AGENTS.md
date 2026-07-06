@@ -70,6 +70,8 @@ Current systemd names:
 - `crypto-outcome-checker.timer`
 - `crypto-daily-summary.service`
 - `crypto-daily-summary.timer`
+- `crypto-performance-report.service`
+- `crypto-performance-report.timer`
 - `crypto-external-inbox.service`
 
 Common production checks:
@@ -77,7 +79,7 @@ Common production checks:
 ```bash
 systemctl status crypto-scanner.service --no-pager
 journalctl -u crypto-scanner.service -n 140 --no-pager
-systemctl list-timers crypto-outcome-checker.timer crypto-daily-summary.timer --no-pager
+systemctl list-timers crypto-outcome-checker.timer crypto-daily-summary.timer crypto-performance-report.timer --no-pager
 ```
 
 ## Validation

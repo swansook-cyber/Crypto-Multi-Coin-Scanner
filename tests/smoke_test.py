@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import argparse
 import importlib.util
 import json
 import tempfile
@@ -1699,6 +1700,103 @@ def test_performance_report_routes_to_reports_only() -> None:
                 os.environ[key] = value
 
 
+def test_scheduled_performance_report_reaches_reports_channel_path() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class FakeSession:
+        def post(self, _url, data=None, timeout=None):
+            calls.append((data["chat_id"], data["text"]))
+
+            class Response:
+                status_code = 200
+                text = "ok"
+
+            return Response()
+
+    temp_dir = Path(tempfile.gettempdir())
+    journal = temp_dir / "scheduled_performance_report_signals.csv"
+    history = temp_dir / "scheduled_performance_report_history.csv"
+    external = temp_dir / "scheduled_performance_report_external.csv"
+    entry_timing = temp_dir / "scheduled_performance_report_entry_timing.csv"
+    old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    old_legacy = os.environ.get("TELEGRAM_CHAT_ID")
+    old_signals = os.environ.get("TELEGRAM_SIGNALS_CHAT_ID")
+    old_cornix = os.environ.get("TELEGRAM_CORNIX_CHAT_ID")
+    old_reports = os.environ.get("TELEGRAM_REPORTS_CHAT_ID")
+    try:
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-06-01T00:00:00+00:00",
+                    "closed_at": "2026-06-01T01:00:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "stop_loss": 99,
+                    "tp1": 101,
+                    "tp2": 102,
+                    "risk_reward": 2.0,
+                    "result": "WIN",
+                    "hit_target": "TP2",
+                    "signal_status": "sent",
+                    "watchlist_tier": "A",
+                    "market_session": "London",
+                    "score": 88,
+                    "confidence": 88,
+                }
+            ]
+        ).to_csv(journal, index=False)
+        pd.DataFrame().to_csv(history, index=False)
+        pd.DataFrame().to_csv(external, index=False)
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-06-01T00:00:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "recommendation": "ENTER NOW",
+                    "entry_quality_score": 76,
+                }
+            ]
+        ).to_csv(entry_timing, index=False)
+        os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+        os.environ["TELEGRAM_CHAT_ID"] = "legacy"
+        os.environ["TELEGRAM_SIGNALS_CHAT_ID"] = "signals"
+        os.environ["TELEGRAM_CORNIX_CHAT_ID"] = "cornix"
+        os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports"
+        args = argparse.Namespace(
+            date="2026-06-01",
+            send=True,
+            test_report=False,
+            journal=journal,
+            history=history,
+            external=external,
+            entry_timing=entry_timing,
+        )
+        assert performance_report.run_report(args, session=FakeSession()) == 0
+        assert calls
+        assert all(chat_id == "reports" for chat_id, _text in calls)
+        assert not any(chat_id in {"legacy", "signals", "cornix"} for chat_id, _text in calls)
+        assert all(len(text) <= performance_report.TELEGRAM_MESSAGE_LIMIT for _chat_id, text in calls)
+    finally:
+        restore = {
+            "TELEGRAM_BOT_TOKEN": old_token,
+            "TELEGRAM_CHAT_ID": old_legacy,
+            "TELEGRAM_SIGNALS_CHAT_ID": old_signals,
+            "TELEGRAM_CORNIX_CHAT_ID": old_cornix,
+            "TELEGRAM_REPORTS_CHAT_ID": old_reports,
+        }
+        for key, value in restore.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        for path in [journal, history, external, entry_timing]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def test_complete_performance_analytics_v1_outputs() -> None:
     journal = pd.DataFrame(
         [
@@ -3376,6 +3474,7 @@ def main() -> int:
     test_analytics_report_and_journal_exports()
     test_daily_performance_report_metrics()
     test_performance_report_routes_to_reports_only()
+    test_scheduled_performance_report_reaches_reports_channel_path()
     test_complete_performance_analytics_v1_outputs()
     test_performance_analytics_production_mapping()
     test_performance_analytics_v2_tables_and_warnings()

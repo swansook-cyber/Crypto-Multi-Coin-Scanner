@@ -33,6 +33,7 @@ ENTRY_TIMING = BASE_DIR / "logs" / "entry_timing_engine.csv"
 LOGS_DIR = BASE_DIR / "logs"
 REPORTS_DIR = BASE_DIR / "reports"
 SMALL_SAMPLE_CLOSED_TRADES = 30
+TELEGRAM_MESSAGE_LIMIT = 3900
 
 logging.basicConfig(
     level=logging.INFO,
@@ -361,6 +362,55 @@ def send_telegram(message: str, session: requests.Session | None = None) -> bool
         LOGGER.warning("Performance report Telegram skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_REPORTS_CHAT_ID missing")
         return False
     client = session or requests.Session()
+    chunks = split_telegram_message(message)
+    LOGGER.info("Performance report Telegram chunks=%s", len(chunks))
+    for index, chunk in enumerate(chunks, start=1):
+        label = f"{index}/{len(chunks)}"
+        if not send_telegram_chunk(client, token, chat_id, chunk, label):
+            return False
+    return True
+
+
+def split_telegram_message(message: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    """Split large reports so Telegram does not reject them with message-too-long."""
+
+    text = str(message or "")
+    if not text:
+        return [""]
+    chunks: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        block = block.rstrip()
+        if not block:
+            continue
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(block) <= limit:
+            current = block
+            continue
+        for start in range(0, len(block), limit):
+            part = block[start : start + limit]
+            if len(part) == limit:
+                chunks.append(part)
+            else:
+                current = part
+    if current:
+        chunks.append(current)
+    return chunks or [text[:limit]]
+
+
+def send_telegram_chunk(
+    client: requests.Session,
+    token: str,
+    chat_id: str,
+    message: str,
+    chunk_label: str,
+) -> bool:
     try:
         response = client.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -368,12 +418,17 @@ def send_telegram(message: str, session: requests.Session | None = None) -> bool
             timeout=20,
         )
     except requests.RequestException as exc:
-        LOGGER.error("Performance report Telegram failed: %s", exc)
+        LOGGER.error("Performance report Telegram chunk %s failed: %s", chunk_label, exc)
         return False
     if response.status_code != 200:
-        LOGGER.error("Performance report Telegram failed: status=%s body=%s", response.status_code, response.text)
+        LOGGER.error(
+            "Performance report Telegram chunk %s failed: status=%s body=%s",
+            chunk_label,
+            response.status_code,
+            response.text,
+        )
         return False
-    LOGGER.info("Performance report Telegram send success: status=%s", response.status_code)
+    LOGGER.info("Performance report Telegram chunk %s send success: status=%s", chunk_label, response.status_code)
     return True
 
 
@@ -400,12 +455,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    load_dotenv(BASE_DIR / ".env")
-    args = parse_args()
-    log_startup_route()
-    if args.test_report:
-        return 0 if send_test_report() else 1
+def run_report(args: argparse.Namespace, session: requests.Session | None = None) -> int:
     journal = load_csv_safely(args.journal)
     history = load_csv_safely(args.history)
     external = load_csv_safely(args.external)
@@ -419,8 +469,17 @@ def main() -> int:
     message = format_report(report)
     print(message)
     if args.send:
-        send_telegram(message)
+        return 0 if send_telegram(message, session=session) else 1
     return 0
+
+
+def main() -> int:
+    load_dotenv(BASE_DIR / ".env")
+    args = parse_args()
+    log_startup_route()
+    if args.test_report:
+        return 0 if send_test_report() else 1
+    return run_report(args)
 
 
 if __name__ == "__main__":

@@ -6,5 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python /opt/Crypto-Multi-Coin-Scanner/performance_report.py --send
-
+StandardOutput=journal
+StandardError=journal
