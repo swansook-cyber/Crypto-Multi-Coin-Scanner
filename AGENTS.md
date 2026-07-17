@@ -42,7 +42,7 @@ Only APPROVED external analyzer results may be sent to Signals or Cornix. WAIT, 
 
 Cornix output is production-ready text. Do not add dry-run banners unless the user explicitly requests test output.
 
-Daily Performance Report output belongs in `TELEGRAM_REPORTS_CHAT_ID` only.
+Daily Performance Report Telegram output belongs in `TELEGRAM_REPORTS_CHAT_ID` only and must stay as a concise executive summary. Full analytics tables belong in the dashboard/web report and CSV exports.
 
 ## Analytics Outputs
 

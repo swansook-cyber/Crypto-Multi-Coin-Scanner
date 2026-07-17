@@ -773,6 +773,23 @@ def _streamlit_app() -> None:
     with st.expander("Closed Trades"):
         st.dataframe(recent_events(filtered, 50), use_container_width=True)
 
+    with st.expander("Full Analytics / CSV Exports"):
+        st.caption("Read-only generated analytics. Telegram sends only the executive summary.")
+        report_html = REPORTS_DIR / "report.html"
+        if report_html.exists():
+            st.write(f"Full static report: `{report_html}`")
+        analytics_files = sorted(LOGS_DIR.glob("*.csv"))
+        if not analytics_files:
+            st.info("No CSV exports found yet. Run performance_report.py first.")
+        for csv_path in analytics_files:
+            with st.container():
+                st.write(f"CSV: `{csv_path.name}`")
+                preview = load_csv_safely(csv_path)
+                if preview.empty:
+                    st.dataframe(preview, use_container_width=True)
+                else:
+                    st.dataframe(preview.tail(50), use_container_width=True)
+
 
 def _table_html(df: pd.DataFrame) -> str:
     if df.empty:

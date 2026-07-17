@@ -253,11 +253,12 @@ Daily Performance Report:
 ```bash
 cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python performance_report.py
+.venv/bin/python performance_report.py --executive
 .venv/bin/python performance_report.py --send
 .venv/bin/python performance_report.py --test-report
 ```
 
-`--send` sends only to `TELEGRAM_REPORTS_CHAT_ID`. Long analytics reports are split into Telegram-safe chunks. If Telegram delivery fails, the command exits non-zero so `crypto-performance-report.service` shows failure in `journalctl`.
+`performance_report.py` prints the complete detailed report and writes `reports/report.html`. `--executive` prints the concise mobile summary. `--send` sends only the executive summary to `TELEGRAM_REPORTS_CHAT_ID`; detailed analytics stay in the dashboard/web report. If Telegram delivery fails, the command exits non-zero so `crypto-performance-report.service` shows failure in `journalctl`.
 
 Dashboard V2:
 

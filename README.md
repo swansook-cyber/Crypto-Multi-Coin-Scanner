@@ -241,9 +241,16 @@ Run:
 ```bat
 python performance_report.py
 python performance_report.py --send
+python performance_report.py --executive
 ```
 
-This reads `logs/signals.csv` and focuses on closed outcomes, not just signal activity. It reports sent signals, closed/open counts, wins/losses, win rate, TP/SL hits, net R estimate, average win/loss percent, and best/worst symbol, tier, session, and direction performance.
+This reads `logs/signals.csv` and focuses on closed outcomes, not just signal activity.
+
+- `python performance_report.py` prints the complete detailed report, refreshes CSV exports, and writes `reports/report.html`.
+- `python performance_report.py --executive` prints the concise executive summary locally.
+- `python performance_report.py --send` sends only the executive summary to `TELEGRAM_REPORTS_CHAT_ID`.
+
+Detailed analytics such as score calibration, strategy simulator, production universe ranking, root-cause analytics, entry timing analytics, and CSV downloads belong in the dashboard/web report, not the Telegram message. Set `ANALYTICS_DASHBOARD_URL` to show a full analytics link in Telegram.
 
 ## Dashboard V3
 
@@ -254,6 +261,13 @@ streamlit run dashboard.py
 ```
 
 Dashboard V3 is a read-only Streamlit dashboard for optimization decisions. It reads existing CSV logs only and never sends Telegram messages, calls Binance, modifies logs, changes scanner strategy, or places trades.
+
+The full static analytics report is also written to:
+
+```bat
+reports\report.html
+reports\analytics.html
+```
 
 Sections include Executive Summary, Equity/PnL/Drawdown/Monthly Analytics, Win/Loss Analytics, Drawdown Analytics, Symbol/Tier/Session Analytics, Long vs Short Analytics, Score/Confidence Analytics, TP/SL Analytics, External VIP Signal Analytics, Position Manager Analytics, and Risk-Quality Views.
 

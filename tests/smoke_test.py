@@ -1723,6 +1723,8 @@ def test_scheduled_performance_report_reaches_reports_channel_path() -> None:
     old_signals = os.environ.get("TELEGRAM_SIGNALS_CHAT_ID")
     old_cornix = os.environ.get("TELEGRAM_CORNIX_CHAT_ID")
     old_reports = os.environ.get("TELEGRAM_REPORTS_CHAT_ID")
+    old_dashboard = os.environ.get("ANALYTICS_DASHBOARD_URL")
+    old_executive = os.environ.get("TELEGRAM_EXECUTIVE_REPORT_ONLY")
     try:
         pd.DataFrame(
             [
@@ -1763,9 +1765,12 @@ def test_scheduled_performance_report_reaches_reports_channel_path() -> None:
         os.environ["TELEGRAM_SIGNALS_CHAT_ID"] = "signals"
         os.environ["TELEGRAM_CORNIX_CHAT_ID"] = "cornix"
         os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports"
+        os.environ["ANALYTICS_DASHBOARD_URL"] = "https://scanner.velalab.net/report"
+        os.environ["TELEGRAM_EXECUTIVE_REPORT_ONLY"] = "1"
         args = argparse.Namespace(
             date="2026-06-01",
             send=True,
+            executive=False,
             test_report=False,
             journal=journal,
             history=history,
@@ -1776,13 +1781,106 @@ def test_scheduled_performance_report_reaches_reports_channel_path() -> None:
         assert calls
         assert all(chat_id == "reports" for chat_id, _text in calls)
         assert not any(chat_id in {"legacy", "signals", "cornix"} for chat_id, _text in calls)
+        assert len(calls) <= 2
         assert all(len(text) <= performance_report.TELEGRAM_MESSAGE_LIMIT for _chat_id, text in calls)
+        payload = "\n".join(text for _chat_id, text in calls)
+        assert "Daily Performance Summary" in payload
+        assert "Closed: 1" in payload
+        assert "Wins / Losses: 1 / 0" in payload
+        assert "Win Rate: 100.0%" in payload
+        assert "Net R: 2.00R" in payload
+        assert "Entry Timing Shadow" in payload
+        assert "Full analytics: https://scanner.velalab.net/report" in payload
+        assert "Score Deep Audit" not in payload
+        assert "Strategy Filter Simulator" not in payload
+        assert "Root Cause Analytics" not in payload
+
+        calls.clear()
+        os.environ["ANALYTICS_DASHBOARD_URL"] = ""
+        assert performance_report.run_report(args, session=FakeSession()) == 0
+        payload = "\n".join(text for _chat_id, text in calls)
+        assert "Daily Performance Summary" in payload
+        assert "Full analytics:" not in payload
     finally:
         restore = {
             "TELEGRAM_BOT_TOKEN": old_token,
             "TELEGRAM_CHAT_ID": old_legacy,
             "TELEGRAM_SIGNALS_CHAT_ID": old_signals,
             "TELEGRAM_CORNIX_CHAT_ID": old_cornix,
+            "TELEGRAM_REPORTS_CHAT_ID": old_reports,
+            "ANALYTICS_DASHBOARD_URL": old_dashboard,
+            "TELEGRAM_EXECUTIVE_REPORT_ONLY": old_executive,
+        }
+        for key, value in restore.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        for path in [journal, history, external, entry_timing]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def test_performance_report_send_failure_exits_nonzero() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class FailingSession:
+        def post(self, _url, data=None, timeout=None):
+            calls.append((data["chat_id"], data["text"]))
+
+            class Response:
+                status_code = 500
+                text = "telegram down"
+
+            return Response()
+
+    temp_dir = Path(tempfile.gettempdir())
+    journal = temp_dir / "scheduled_performance_report_fail_signals.csv"
+    history = temp_dir / "scheduled_performance_report_fail_history.csv"
+    external = temp_dir / "scheduled_performance_report_fail_external.csv"
+    entry_timing = temp_dir / "scheduled_performance_report_fail_entry_timing.csv"
+    old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    old_reports = os.environ.get("TELEGRAM_REPORTS_CHAT_ID")
+    try:
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-06-01T00:00:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "stop_loss": 99,
+                    "tp1": 101,
+                    "tp2": 102,
+                    "risk_reward": 2.0,
+                    "result": "WIN",
+                    "hit_target": "TP1",
+                    "signal_status": "sent",
+                }
+            ]
+        ).to_csv(journal, index=False)
+        pd.DataFrame().to_csv(history, index=False)
+        pd.DataFrame().to_csv(external, index=False)
+        pd.DataFrame().to_csv(entry_timing, index=False)
+        os.environ["TELEGRAM_BOT_TOKEN"] = "token"
+        os.environ["TELEGRAM_REPORTS_CHAT_ID"] = "reports"
+        args = argparse.Namespace(
+            date="2026-06-01",
+            send=True,
+            executive=False,
+            test_report=False,
+            journal=journal,
+            history=history,
+            external=external,
+            entry_timing=entry_timing,
+        )
+        assert performance_report.run_report(args, session=FailingSession()) == 1
+        assert calls and calls[0][0] == "reports"
+    finally:
+        restore = {
+            "TELEGRAM_BOT_TOKEN": old_token,
             "TELEGRAM_REPORTS_CHAT_ID": old_reports,
         }
         for key, value in restore.items():
@@ -3475,6 +3573,7 @@ def main() -> int:
     test_daily_performance_report_metrics()
     test_performance_report_routes_to_reports_only()
     test_scheduled_performance_report_reaches_reports_channel_path()
+    test_performance_report_send_failure_exits_nonzero()
     test_complete_performance_analytics_v1_outputs()
     test_performance_analytics_production_mapping()
     test_performance_analytics_v2_tables_and_warnings()

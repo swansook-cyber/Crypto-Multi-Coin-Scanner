@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import logging
 import os
 import sys
@@ -34,6 +35,7 @@ LOGS_DIR = BASE_DIR / "logs"
 REPORTS_DIR = BASE_DIR / "reports"
 SMALL_SAMPLE_CLOSED_TRADES = 30
 TELEGRAM_MESSAGE_LIMIT = 3900
+FULL_WEB_REPORT = REPORTS_DIR / "report.html"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -169,6 +171,13 @@ def build_full_report(
     date: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, pd.DataFrame]]:
     return build_complete_report(journal, history, external, date)
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def format_report(report: dict[str, Any]) -> str:
@@ -333,6 +342,178 @@ def format_report(report: dict[str, Any]) -> str:
     )
 
 
+def _compact_value(value: Any, max_chars: int = 120) -> str:
+    text = str(value or "").strip()
+    if not text or text == NA:
+        return NA
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    compact = " | ".join(lines[:2]) if lines else text
+    return compact[: max_chars - 3].rstrip() + "..." if len(compact) > max_chars else compact
+
+
+def _table_lines(value: Any, limit: int = 3) -> list[str]:
+    text = str(value or "").strip()
+    if not text or text == NA:
+        return []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+    return lines[1 : 1 + limit] if len(lines) > 1 else lines[:limit]
+
+
+def _entry_timing_counts(entry_timing: pd.DataFrame) -> dict[str, Any]:
+    recommendations = [
+        "ENTER NOW",
+        "WAIT FOR PULLBACK",
+        "WAIT FOR BREAKOUT",
+        "WAIT FOR BREAKOUT RETEST",
+        "SKIP (poor timing)",
+    ]
+    counts = {item: 0 for item in recommendations}
+    if entry_timing.empty or "recommendation" not in entry_timing.columns:
+        return {"total": 0, "counts": counts, "best": "Collecting data"}
+    rec = entry_timing["recommendation"].fillna("").astype(str)
+    for item in recommendations:
+        counts[item] = int((rec == item).sum())
+    return {"total": int(len(entry_timing)), "counts": counts, "best": "Collecting data"}
+
+
+def _better_direction(report: dict[str, Any]) -> str:
+    long_rate = report.get("long_win_rate")
+    short_rate = report.get("short_win_rate")
+    try:
+        long_value = float(long_rate)
+        short_value = float(short_rate)
+    except (TypeError, ValueError):
+        return NA
+    if long_value == short_value:
+        return f"Mixed ({format_value(long_value, '%')})"
+    if long_value > short_value:
+        return f"LONG ({format_value(long_value, '%')})"
+    return f"SHORT ({format_value(short_value, '%')})"
+
+
+def _executive_warnings(report: dict[str, Any], limit: int = 5) -> list[str]:
+    warnings: list[str] = []
+    for key in [
+        "performance_warnings",
+        "score_calibration_recommendations",
+        "strategy_filter_recommendations",
+        "root_cause_recommendations",
+        "recommended_actions",
+    ]:
+        for line in _table_lines(report.get(key), 2):
+            cleaned = " ".join(line.split())
+            if cleaned and cleaned not in warnings:
+                warnings.append(cleaned)
+            if len(warnings) >= limit:
+                return warnings
+    if report.get("small_sample_warning"):
+        warnings.append("Sample size is still small. Use for monitoring only.")
+    return warnings[:limit] or ["No critical warnings."]
+
+
+def format_executive_report(
+    report: dict[str, Any],
+    entry_timing: pd.DataFrame | None = None,
+    dashboard_url: str | None = None,
+) -> str:
+    timing = _entry_timing_counts(entry_timing if entry_timing is not None else pd.DataFrame())
+    counts = timing["counts"]
+    warnings = _executive_warnings(report, 5)
+    url = (dashboard_url or os.getenv("ANALYTICS_DASHBOARD_URL", "")).strip()
+    production_symbols = []
+    for label, key in [
+        ("Tier S", "production_universe_tier_s"),
+        ("Tier A", "production_universe_tier_a"),
+        ("Report Only", "production_universe_report_only"),
+    ]:
+        value = _compact_value(report.get(key), 90)
+        if value != NA:
+            production_symbols.append(f"- {label}: {value}")
+    if not production_symbols:
+        production_symbols.append("- Collecting production universe data")
+
+    lines = [
+        "Daily Performance Summary",
+        f"Date: {report.get('date', 'ALL')}",
+        "",
+        "Performance",
+        f"- Closed: {report.get('closed_signals', 0)}",
+        f"- Wins / Losses: {report.get('wins', 0)} / {report.get('losses', 0)}",
+        f"- Win Rate: {format_value(report.get('win_rate'), '%')}",
+        f"- Net R: {report.get('net_r_estimate', 0.0):.2f}R",
+        f"- TP1 / TP2: {report.get('tp1_hits', 0)} / {report.get('tp2_hits', 0)}",
+        f"- Avg time TP / SL: {format_minutes(report.get('avg_time_to_tp'))} / {format_minutes(report.get('avg_time_to_sl'))}",
+        "",
+        "Best Performance",
+        f"- Best symbol: {report.get('best_symbol', NA)}",
+        f"- Best tier: {report.get('best_tier', NA)}",
+        f"- Best session: {report.get('best_session', NA)}",
+        f"- Better direction: {_better_direction(report)}",
+        "",
+        "Warnings",
+        *[f"- {item}" for item in warnings[:5]],
+        "",
+        "Production Universe",
+        f"- Tier S + A performance: {_compact_value(report.get('production_universe_performance'), 120)}",
+        *production_symbols,
+        "",
+        "Entry Timing Shadow",
+        f"- Total evaluated: {timing['total']}",
+        f"- ENTER NOW: {counts['ENTER NOW']}",
+        f"- WAIT PULLBACK: {counts['WAIT FOR PULLBACK']}",
+        f"- WAIT BREAKOUT: {counts['WAIT FOR BREAKOUT']}",
+        f"- WAIT RETEST: {counts['WAIT FOR BREAKOUT RETEST']}",
+        f"- SKIP: {counts['SKIP (poor timing)']}",
+        f"- Best by WR: {timing['best']}",
+        "",
+        "Decision Summary",
+        "- KEEP: production-safe routing and analytics exports unchanged",
+        "- WATCH: weak warnings and entry timing shadow data",
+        "- INVESTIGATE: review full dashboard before changing filters",
+    ]
+    if url:
+        lines.extend(["", f"Full analytics: {url}"])
+    return "\n".join(lines)
+
+
+def write_full_web_report(full_message: str, path: Path = FULL_WEB_REPORT) -> Path:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    csv_links = []
+    for csv_path in sorted(LOGS_DIR.glob("*.csv")):
+        csv_links.append(f'<li><a href="../logs/{html.escape(csv_path.name)}">{html.escape(csv_path.name)}</a></li>')
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crypto Scanner Full Analytics Report</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; line-height: 1.45; background: #f8fafc; color: #0f172a; }}
+    main {{ max-width: 1120px; margin: 0 auto; }}
+    pre {{ white-space: pre-wrap; overflow-x: auto; background: white; border: 1px solid #e2e8f0; padding: 16px; border-radius: 8px; }}
+    a {{ color: #0369a1; }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Crypto Scanner Full Analytics Report</h1>
+  <p>Read-only report. No Telegram sends, no API calls, no trading execution.</p>
+  <h2>CSV Downloads</h2>
+  <ul>{''.join(csv_links) or '<li>No CSV exports found yet.</li>'}</ul>
+  <h2>Full Analytics</h2>
+  <pre>{html.escape(full_message)}</pre>
+</main>
+</body>
+</html>
+"""
+    path.write_text(body, encoding="utf-8")
+    alias = REPORTS_DIR / "analytics.html"
+    alias.write_text(body, encoding="utf-8")
+    return path
+
+
 def persist_report(report: dict[str, Any], path: Path | None = None) -> Path:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     output = path or REPORTS_DIR / "daily_performance_report.csv"
@@ -447,6 +628,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create a daily performance report from closed outcomes.")
     parser.add_argument("--date", help="UTC date YYYY-MM-DD. Defaults to latest signal date.")
     parser.add_argument("--send", action="store_true", help="Send the report to Telegram.")
+    parser.add_argument("--executive", action="store_true", help="Print the concise executive report without sending.")
     parser.add_argument("--test-report", action="store_true", help="Send a diagnostic message to TELEGRAM_REPORTS_CHAT_ID only.")
     parser.add_argument("--journal", type=Path, default=JOURNAL, help="Path to signals.csv.")
     parser.add_argument("--history", type=Path, default=HISTORY, help="Path to signals_history.csv.")
@@ -466,10 +648,14 @@ def run_report(args: argparse.Namespace, session: requests.Session | None = None
     export_v1_outputs(report, tables, LOGS_DIR)
     tables["entry_timing_shadow_summary"].to_csv(LOGS_DIR / "entry_timing_shadow_summary.csv", index=False)
     persist_report(report)
-    message = format_report(report)
+    full_message = format_report(report)
+    write_full_web_report(full_message)
+    executive_message = format_executive_report(report, entry_timing)
+    message = executive_message if getattr(args, "executive", False) else full_message
     print(message)
     if args.send:
-        return 0 if send_telegram(message, session=session) else 1
+        telegram_message = executive_message if env_bool("TELEGRAM_EXECUTIVE_REPORT_ONLY", True) else full_message
+        return 0 if send_telegram(telegram_message, session=session) else 1
     return 0
 
 
