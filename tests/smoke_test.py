@@ -6,7 +6,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import tempfile
 import sys
@@ -1879,6 +1881,85 @@ def test_scheduled_performance_report_reaches_reports_channel_path() -> None:
                 pass
 
 
+def test_executive_cli_prints_without_telegram_send() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class FakeSession:
+        def post(self, _url, data=None, timeout=None):
+            calls.append((data["chat_id"], data["text"]))
+
+            class Response:
+                status_code = 200
+                text = "ok"
+
+            return Response()
+
+    temp_dir = Path(tempfile.gettempdir())
+    journal = temp_dir / "executive_cli_print_signals.csv"
+    history = temp_dir / "executive_cli_print_history.csv"
+    external = temp_dir / "executive_cli_print_external.csv"
+    entry_timing = temp_dir / "executive_cli_print_entry_timing.csv"
+    try:
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-06-01T00:00:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "stop_loss": 99,
+                    "tp1": 101,
+                    "tp2": 102,
+                    "risk_reward": 2.0,
+                    "result": "WIN",
+                    "hit_target": "TP2",
+                    "signal_status": "sent",
+                    "watchlist_tier": "A",
+                    "market_session": "London",
+                    "score": 88,
+                    "confidence": 88,
+                }
+            ]
+        ).to_csv(journal, index=False)
+        pd.DataFrame().to_csv(history, index=False)
+        pd.DataFrame().to_csv(external, index=False)
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-06-01T00:00:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "recommendation": "ENTER NOW",
+                    "entry_quality_score": 76,
+                }
+            ]
+        ).to_csv(entry_timing, index=False)
+        args = argparse.Namespace(
+            date="2026-06-01",
+            send=True,
+            executive=True,
+            test_report=False,
+            journal=journal,
+            history=history,
+            external=external,
+            entry_timing=entry_timing,
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            assert performance_report.run_report(args, session=FakeSession()) == 0
+        payload = output.getvalue()
+        assert calls == []
+        assert "Daily Performance Summary" in payload
+        assert "Closed: 1" in payload
+        assert "Decision" in payload
+        assert "Score Deep Audit" not in payload
+    finally:
+        for path in [journal, history, external, entry_timing]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def test_performance_report_send_failure_exits_nonzero() -> None:
     calls: list[tuple[str, str]] = []
 
@@ -3630,6 +3711,7 @@ def main() -> int:
     test_performance_report_routes_to_reports_only()
     test_executive_report_v2_entry_timing_and_decisions()
     test_scheduled_performance_report_reaches_reports_channel_path()
+    test_executive_cli_prints_without_telegram_send()
     test_performance_report_send_failure_exits_nonzero()
     test_complete_performance_analytics_v1_outputs()
     test_performance_analytics_production_mapping()

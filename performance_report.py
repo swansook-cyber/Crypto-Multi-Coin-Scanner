@@ -736,8 +736,11 @@ def run_report(args: argparse.Namespace, session: requests.Session | None = None
     full_message = format_report(report)
     write_full_web_report(full_message)
     executive_message = format_executive_report(report, entry_timing)
-    message = executive_message if getattr(args, "executive", False) else full_message
-    print(message)
+    if getattr(args, "executive", False):
+        print(executive_message)
+        return 0
+
+    print(full_message)
     if args.send:
         telegram_message = executive_message if env_bool("TELEGRAM_EXECUTIVE_REPORT_ONLY", True) else full_message
         return 0 if send_telegram(telegram_message, session=session) else 1
@@ -747,7 +750,8 @@ def run_report(args: argparse.Namespace, session: requests.Session | None = None
 def main() -> int:
     load_dotenv(BASE_DIR / ".env")
     args = parse_args()
-    log_startup_route()
+    if not args.executive:
+        log_startup_route()
     if args.test_report:
         return 0 if send_test_report() else 1
     return run_report(args)
