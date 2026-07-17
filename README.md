@@ -247,10 +247,18 @@ python performance_report.py --executive
 This reads `logs/signals.csv` and focuses on closed outcomes, not just signal activity.
 
 - `python performance_report.py` prints the complete detailed report, refreshes CSV exports, and writes `reports/report.html`.
-- `python performance_report.py --executive` prints the concise executive summary locally.
-- `python performance_report.py --send` sends only the executive summary to `TELEGRAM_REPORTS_CHAT_ID`.
+- `python performance_report.py --executive` prints the Executive Report V2 summary locally.
+- `python performance_report.py --send` sends only the Executive Report V2 summary to `TELEGRAM_REPORTS_CHAT_ID`.
 
 Detailed analytics such as score calibration, strategy simulator, production universe ranking, root-cause analytics, entry timing analytics, and CSV downloads belong in the dashboard/web report, not the Telegram message. Set `ANALYTICS_DASHBOARD_URL` to show a full analytics link in Telegram.
+
+Executive Report V2 shows compact sections for Performance, Best, Watch, Production Universe, Entry Timing Shadow, Decision, and the full analytics link. Entry Timing market status is report-only:
+
+- `COLLECTING DATA`: fewer than 10 evaluated Entry Timing rows.
+- `ENTERABLE`: `ENTER NOW` is at least 40% of evaluated rows.
+- `WAITING`: pullback/breakout/retest wait recommendations are at least 60%.
+- `POOR TIMING`: skip recommendations are at least 60%.
+- `MIXED`: no dominant timing condition.
 
 ## Dashboard V3
 

@@ -1700,6 +1700,60 @@ def test_performance_report_routes_to_reports_only() -> None:
                 os.environ[key] = value
 
 
+def test_executive_report_v2_entry_timing_and_decisions() -> None:
+    base_report = {
+        "date": "2026-06-01",
+        "closed_signals": 12,
+        "wins": 7,
+        "losses": 5,
+        "win_rate": 58.3,
+        "net_r_estimate": 3.5,
+        "tp1_hits": 8,
+        "tp2_hits": 4,
+        "avg_time_to_tp": 95,
+        "avg_time_to_sl": 42,
+        "best_symbol": "BTCUSDT (66.7%, 6)",
+        "best_tier": "A (60.0%, 10)",
+        "best_session": "London (62.5%, 8)",
+        "long_win_rate": 60.0,
+        "short_win_rate": 50.0,
+        "performance_warnings": "warning\nSEIUSDT Trades 6 Win Rate 33.3",
+        "production_universe_tier_s": "BTCUSDT ETHUSDT",
+        "production_universe_tier_a": "SOLUSDT LINKUSDT",
+        "production_universe_report_only": "SEIUSDT WIFUSDT",
+        "production_universe_performance": "Pool Closed Trades Wins Losses Win Rate Net R\nTier S + Tier A 10 6 4 60.0 3.5",
+        "session_risk_report_count": 0,
+    }
+    collecting = pd.DataFrame({"recommendation": ["ENTER NOW", "WAIT FOR PULLBACK", "SKIP (poor timing)"]})
+    message = performance_report.format_executive_report(base_report, collecting, "https://scanner.velalab.net/report")
+    assert "Daily Performance Summary" in message
+    assert "Decision" in message
+    assert "Entry Timing Shadow" in message
+    assert "ENTER NOW: 1" in message
+    assert "WAIT PULLBACK: 1" in message
+    assert "SKIP: 1" in message
+    assert "Market Timing: COLLECTING DATA" in message
+    assert "Core WR: 60.0%" in message
+    assert "Core Net R: 3.50R" in message
+    assert "Full analytics: https://scanner.velalab.net/report" in message
+    assert "Score Deep Audit" not in message
+    assert "Strategy Filter Simulator" not in message
+    decision_lines = [line for line in message.splitlines() if line.startswith("- KEEP:") or line.startswith("- WATCH:") or line.startswith("- INVESTIGATE:") or line.startswith("- REPORT ONLY:")]
+    assert len(decision_lines) <= 3
+    assert len(performance_report.build_executive_decisions(base_report, performance_report._entry_timing_counts(collecting))) <= 3
+
+    poor = pd.DataFrame({"recommendation": ["SKIP (poor timing)"] * 6 + ["ENTER NOW"] * 4})
+    assert performance_report._entry_timing_counts(poor)["market_timing"] == "POOR TIMING"
+    waiting = pd.DataFrame({"recommendation": ["WAIT FOR PULLBACK"] * 3 + ["WAIT FOR BREAKOUT"] * 3 + ["WAIT FOR BREAKOUT RETEST"] * 2 + ["ENTER NOW"] * 2})
+    timing = performance_report._entry_timing_counts(waiting)
+    assert timing["counts"]["WAIT PULLBACK"] == 3
+    assert timing["counts"]["WAIT BREAKOUT"] == 3
+    assert timing["counts"]["WAIT RETEST"] == 2
+    assert timing["market_timing"] == "WAITING"
+    enterable = pd.DataFrame({"recommendation": ["ENTER NOW"] * 4 + ["WAIT FOR PULLBACK"] * 3 + ["SKIP (poor timing)"] * 3})
+    assert performance_report._entry_timing_counts(enterable)["market_timing"] == "ENTERABLE"
+
+
 def test_scheduled_performance_report_reaches_reports_channel_path() -> None:
     calls: list[tuple[str, str]] = []
 
@@ -1790,6 +1844,8 @@ def test_scheduled_performance_report_reaches_reports_channel_path() -> None:
         assert "Win Rate: 100.0%" in payload
         assert "Net R: 2.00R" in payload
         assert "Entry Timing Shadow" in payload
+        assert "Decision" in payload
+        assert "Market Timing: COLLECTING DATA" in payload
         assert "Full analytics: https://scanner.velalab.net/report" in payload
         assert "Score Deep Audit" not in payload
         assert "Strategy Filter Simulator" not in payload
@@ -3572,6 +3628,7 @@ def main() -> int:
     test_analytics_report_and_journal_exports()
     test_daily_performance_report_metrics()
     test_performance_report_routes_to_reports_only()
+    test_executive_report_v2_entry_timing_and_decisions()
     test_scheduled_performance_report_reaches_reports_channel_path()
     test_performance_report_send_failure_exits_nonzero()
     test_complete_performance_analytics_v1_outputs()

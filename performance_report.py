@@ -7,6 +7,7 @@ import argparse
 import html
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -362,20 +363,43 @@ def _table_lines(value: Any, limit: int = 3) -> list[str]:
 
 
 def _entry_timing_counts(entry_timing: pd.DataFrame) -> dict[str, Any]:
-    recommendations = [
-        "ENTER NOW",
-        "WAIT FOR PULLBACK",
-        "WAIT FOR BREAKOUT",
-        "WAIT FOR BREAKOUT RETEST",
-        "SKIP (poor timing)",
-    ]
-    counts = {item: 0 for item in recommendations}
+    canonical = {
+        "ENTER NOW": "ENTER NOW",
+        "WAIT FOR PULLBACK": "WAIT PULLBACK",
+        "WAIT PULLBACK": "WAIT PULLBACK",
+        "WAIT FOR BREAKOUT": "WAIT BREAKOUT",
+        "WAIT BREAKOUT": "WAIT BREAKOUT",
+        "WAIT FOR BREAKOUT RETEST": "WAIT RETEST",
+        "WAIT BREAKOUT RETEST": "WAIT RETEST",
+        "WAIT RETEST": "WAIT RETEST",
+        "SKIP (POOR TIMING)": "SKIP",
+        "SKIP": "SKIP",
+    }
+    counts = {
+        "ENTER NOW": 0,
+        "WAIT PULLBACK": 0,
+        "WAIT BREAKOUT": 0,
+        "WAIT RETEST": 0,
+        "SKIP": 0,
+    }
     if entry_timing.empty or "recommendation" not in entry_timing.columns:
-        return {"total": 0, "counts": counts, "best": "Collecting data"}
-    rec = entry_timing["recommendation"].fillna("").astype(str)
-    for item in recommendations:
-        counts[item] = int((rec == item).sum())
-    return {"total": int(len(entry_timing)), "counts": counts, "best": "Collecting data"}
+        return {"total": 0, "counts": counts, "market_timing": "COLLECTING DATA"}
+    rec = entry_timing["recommendation"].fillna("").astype(str).str.strip().str.upper()
+    normalized = rec.map(canonical).fillna(rec)
+    for item in counts:
+        counts[item] = int((normalized == item).sum())
+    total = int(sum(counts.values()))
+    if total < 10:
+        market_timing = "COLLECTING DATA"
+    elif counts["SKIP"] / total >= 0.60:
+        market_timing = "POOR TIMING"
+    elif (counts["WAIT PULLBACK"] + counts["WAIT BREAKOUT"] + counts["WAIT RETEST"]) / total >= 0.60:
+        market_timing = "WAITING"
+    elif counts["ENTER NOW"] / total >= 0.40:
+        market_timing = "ENTERABLE"
+    else:
+        market_timing = "MIXED"
+    return {"total": total, "counts": counts, "market_timing": market_timing}
 
 
 def _better_direction(report: dict[str, Any]) -> str:
@@ -413,6 +437,76 @@ def _executive_warnings(report: dict[str, Any], limit: int = 5) -> list[str]:
     return warnings[:limit] or ["No critical warnings."]
 
 
+def _extract_symbols(value: Any, limit: int = 8) -> str:
+    text = str(value or "").strip()
+    if not text or text == NA:
+        return NA
+    symbols: list[str] = []
+    for token in re.split(r"[\s,|:()]+", text):
+        token = token.strip().upper()
+        if token.endswith("USDT") and token not in symbols:
+            symbols.append(token)
+        if len(symbols) >= limit:
+            break
+    return ", ".join(symbols) if symbols else _compact_value(text, 90)
+
+
+def _core_universe_metrics(report: dict[str, Any]) -> tuple[str, str, str, str]:
+    table = str(report.get("production_universe_performance") or "")
+    core_wr = NA
+    core_net_r = NA
+    for line in table.splitlines():
+        if "Tier S + Tier A" in line:
+            parts = line.split()
+            numbers = [part for part in parts if re.fullmatch(r"-?\d+(?:\.\d+)?", part)]
+            if len(numbers) >= 4:
+                core_wr = f"{float(numbers[3]):.1f}%"
+            if len(numbers) >= 5:
+                core_net_r = f"{float(numbers[4]):.2f}R"
+            break
+    core_symbols = ", ".join(
+        item
+        for item in [
+            _extract_symbols(report.get("production_universe_tier_s"), 6),
+            _extract_symbols(report.get("production_universe_tier_a"), 6),
+        ]
+        if item != NA
+    ) or NA
+    report_only = _extract_symbols(report.get("production_universe_report_only"), 8)
+    return core_wr, core_net_r, core_symbols, report_only
+
+
+def build_executive_decisions(report: dict[str, Any], timing: dict[str, Any] | None = None) -> list[str]:
+    timing = timing or {"market_timing": "COLLECTING DATA"}
+    decisions: list[str] = []
+    try:
+        win_rate = float(report.get("win_rate") or 0)
+        net_r = float(report.get("net_r_estimate") or 0)
+    except (TypeError, ValueError):
+        win_rate = 0.0
+        net_r = 0.0
+    if win_rate >= 55 and net_r > 0:
+        decisions.append(f"KEEP: current production pool ({format_value(win_rate, '%')}, {net_r:.2f}R)")
+    else:
+        decisions.append("KEEP: analytics exports and routing unchanged")
+
+    warnings = _executive_warnings(report, 4)
+    if warnings and warnings[0] != "No critical warnings.":
+        decisions.append(f"WATCH: {warnings[0]}")
+    elif timing.get("market_timing") == "COLLECTING DATA":
+        decisions.append("WATCH: Entry Timing sample is still below 10 rows")
+    else:
+        decisions.append(f"WATCH: Entry Timing is {timing.get('market_timing')}")
+
+    if timing.get("market_timing") == "POOR TIMING":
+        decisions.append("INVESTIGATE: Entry Timing SKIP share is elevated")
+    elif str(report.get("session_risk_report_count", 0)) not in {"", "0"}:
+        decisions.append("REPORT ONLY: review session risk experiment outcomes")
+    else:
+        decisions.append("INVESTIGATE: full dashboard before changing filters")
+    return decisions[:3]
+
+
 def format_executive_report(
     report: dict[str, Any],
     entry_timing: pd.DataFrame | None = None,
@@ -420,19 +514,10 @@ def format_executive_report(
 ) -> str:
     timing = _entry_timing_counts(entry_timing if entry_timing is not None else pd.DataFrame())
     counts = timing["counts"]
-    warnings = _executive_warnings(report, 5)
+    warnings = _executive_warnings(report, 4)
     url = (dashboard_url or os.getenv("ANALYTICS_DASHBOARD_URL", "")).strip()
-    production_symbols = []
-    for label, key in [
-        ("Tier S", "production_universe_tier_s"),
-        ("Tier A", "production_universe_tier_a"),
-        ("Report Only", "production_universe_report_only"),
-    ]:
-        value = _compact_value(report.get(key), 90)
-        if value != NA:
-            production_symbols.append(f"- {label}: {value}")
-    if not production_symbols:
-        production_symbols.append("- Collecting production universe data")
+    core_wr, core_net_r, core_symbols, report_only_symbols = _core_universe_metrics(report)
+    decisions = build_executive_decisions(report, timing)
 
     lines = [
         "Daily Performance Summary",
@@ -444,34 +529,34 @@ def format_executive_report(
         f"- Win Rate: {format_value(report.get('win_rate'), '%')}",
         f"- Net R: {report.get('net_r_estimate', 0.0):.2f}R",
         f"- TP1 / TP2: {report.get('tp1_hits', 0)} / {report.get('tp2_hits', 0)}",
-        f"- Avg time TP / SL: {format_minutes(report.get('avg_time_to_tp'))} / {format_minutes(report.get('avg_time_to_sl'))}",
+        f"- Avg TP / SL time: {format_minutes(report.get('avg_time_to_tp'))} / {format_minutes(report.get('avg_time_to_sl'))}",
         "",
-        "Best Performance",
-        f"- Best symbol: {report.get('best_symbol', NA)}",
-        f"- Best tier: {report.get('best_tier', NA)}",
-        f"- Best session: {report.get('best_session', NA)}",
-        f"- Better direction: {_better_direction(report)}",
+        "Best",
+        f"- Symbol: {report.get('best_symbol', NA)}",
+        f"- Tier: {report.get('best_tier', NA)}",
+        f"- Session: {report.get('best_session', NA)}",
+        f"- Direction: {_better_direction(report)}",
         "",
-        "Warnings",
-        *[f"- {item}" for item in warnings[:5]],
+        "Watch",
+        *[f"- {item}" for item in warnings[:4]],
         "",
         "Production Universe",
-        f"- Tier S + A performance: {_compact_value(report.get('production_universe_performance'), 120)}",
-        *production_symbols,
+        f"- Core WR: {core_wr}",
+        f"- Core Net R: {core_net_r}",
+        f"- Core symbols: {core_symbols}",
+        f"- Report Only: {report_only_symbols}",
         "",
         "Entry Timing Shadow",
-        f"- Total evaluated: {timing['total']}",
+        f"- Evaluated: {timing['total']}",
         f"- ENTER NOW: {counts['ENTER NOW']}",
-        f"- WAIT PULLBACK: {counts['WAIT FOR PULLBACK']}",
-        f"- WAIT BREAKOUT: {counts['WAIT FOR BREAKOUT']}",
-        f"- WAIT RETEST: {counts['WAIT FOR BREAKOUT RETEST']}",
-        f"- SKIP: {counts['SKIP (poor timing)']}",
-        f"- Best by WR: {timing['best']}",
+        f"- WAIT PULLBACK: {counts['WAIT PULLBACK']}",
+        f"- WAIT BREAKOUT: {counts['WAIT BREAKOUT']}",
+        f"- WAIT RETEST: {counts['WAIT RETEST']}",
+        f"- SKIP: {counts['SKIP']}",
+        f"- Market Timing: {timing['market_timing']}",
         "",
-        "Decision Summary",
-        "- KEEP: production-safe routing and analytics exports unchanged",
-        "- WATCH: weak warnings and entry timing shadow data",
-        "- INVESTIGATE: review full dashboard before changing filters",
+        "Decision",
+        *[f"- {item}" for item in decisions],
     ]
     if url:
         lines.extend(["", f"Full analytics: {url}"])

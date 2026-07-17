@@ -60,7 +60,7 @@ External analyzer routing:
 
 Channel-specific chat IDs are required for production channel routing. This prevents Signals, Cornix, and Reports messages from mixing in one destination.
 
-Performance reports are routed to `TELEGRAM_REPORTS_CHAT_ID` only. They do not fall back to Signals or Cornix. Telegram receives a concise executive summary by default; complete analytics stay in `performance_report.py` console output, CSV exports, and `reports/report.html`. Scheduled `--send` exits with failure if Telegram delivery fails so systemd/journal can surface the problem.
+Performance reports are routed to `TELEGRAM_REPORTS_CHAT_ID` only. They do not fall back to Signals or Cornix. Telegram receives Executive Report V2 by default: compact Performance, Best, Watch, Production Universe, Entry Timing Shadow, and Decision sections. Entry Timing market status is reporting-only (`COLLECTING DATA`, `ENTERABLE`, `WAITING`, `POOR TIMING`, or `MIXED`) and does not affect production behavior. Complete analytics stay in `performance_report.py` console output, CSV exports, and `reports/report.html`. Scheduled `--send` exits with failure if Telegram delivery fails so systemd/journal can surface the problem.
 
 ## Performance Analytics V1
 
