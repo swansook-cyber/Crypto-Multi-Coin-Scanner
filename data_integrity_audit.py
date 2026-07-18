@@ -19,22 +19,37 @@ JOURNAL = LOGS_DIR / "signals.csv"
 ENTRY_TIMING = LOGS_DIR / "entry_timing_engine.csv"
 BACKUP_DIR = BASE_DIR / "backups"
 
-FINAL_STATUSES = {"WIN", "LOSS", "EXPIRED", "BREAKEVEN"}
-OPEN_STATUSES = {"", "OPEN"}
-VALID_RESULTS = FINAL_STATUSES | {"OPEN", "SKIPPED"}
+FINAL_STATUSES = {"WIN", "LOSS", "EXPIRED", "BREAKEVEN", "CLOSED"}
+OPEN_STATUSES = {"", "OPEN", "0"}
+VALID_RESULTS = FINAL_STATUSES | {"OPEN", "SKIPPED", "0"}
 VALID_SIGNAL_STATUSES = {
+    "open",
     "sent",
+    "closed",
+    "logged_quality_filter",
+    "skipped_quality_filter",
     "logged_quality_filter",
     "skipped_daily_risk_guard",
+    "skipped_losing_streak",
     "skipped_btc_regime",
     "skipped_loss_cooldown",
     "skipped_correlation",
     "skipped_not_top_candidate",
+    "skipped_not_top",
+    "skipped_position_management",
     "tier_c_report_only",
     "weak_symbol_report_only",
     "session_risk_report_only",
     "london_long_report_only",
 }
+APPROVED_FINAL_STATUSES = {
+    "sent",
+    "tier_c_report_only",
+    "weak_symbol_report_only",
+    "session_risk_report_only",
+    "london_long_report_only",
+}
+ENTRY_TIMING_FINAL_CANDIDATE_INTEGRATION_UTC = pd.Timestamp("2026-06-28T02:05:18Z")
 
 
 @dataclass
@@ -42,6 +57,29 @@ class AuditFinding:
     severity: str
     check: str
     detail: str
+
+
+@dataclass
+class EntryTimingClassification:
+    total: int
+    matched: int
+    legacy: int
+    orphan: int
+    duplicate: int
+
+    @property
+    def coverage_pct(self) -> float:
+        if self.total <= 0:
+            return 0.0
+        return round(self.matched / self.total * 100.0, 1)
+
+
+@dataclass
+class WatcherStateClassification:
+    historical_flags: int
+    active_stale_state: int
+    closed_treated_open: int
+    symbols: list[str]
 
 
 def _load_csv(path: Path) -> tuple[pd.DataFrame, AuditFinding | None]:
@@ -72,6 +110,15 @@ def signal_key_df(df: pd.DataFrame) -> pd.Series:
     for part in parts[1:]:
         key = key + "|" + part
     return key
+
+
+def signal_prefix_df(df: pd.DataFrame, side_column: str = "side") -> pd.Series:
+    timestamp = pd.to_datetime(_series(df, "timestamp"), utc=True, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M")
+    timestamp = timestamp.fillna(_series(df, "timestamp").fillna("").astype(str).str.slice(0, 16))
+    symbol = _series(df, "symbol").fillna("").astype(str).str.upper()
+    side = _series(df, side_column).fillna("").astype(str).str.upper()
+    entry = pd.to_numeric(_series(df, "entry"), errors="coerce").round(8).astype(str)
+    return timestamp + "|" + symbol + "|" + side + "|" + entry
 
 
 def audit_journal(df: pd.DataFrame) -> list[AuditFinding]:
@@ -119,7 +166,7 @@ def audit_journal(df: pd.DataFrame) -> list[AuditFinding]:
         findings.append(AuditFinding("WARNING", "OPEN rows that already contain final hit targets", f"{int(open_with_final.sum())} rows"))
 
     active_status = _series(df, "signal_status").fillna("").astype(str).str.lower()
-    closed_active = result.isin(FINAL_STATUSES) & active_status.isin(["open", "active"])
+    closed_active = result.isin(FINAL_STATUSES) & active_status.isin(["active"])
     if closed_active.any():
         findings.append(AuditFinding("WARNING", "closed rows incorrectly treated as active", f"{int(closed_active.sum())} rows"))
 
@@ -142,51 +189,99 @@ def audit_journal(df: pd.DataFrame) -> list[AuditFinding]:
     return findings
 
 
+def classify_entry_timing(entry: pd.DataFrame, journal: pd.DataFrame) -> EntryTimingClassification:
+    if entry.empty:
+        return EntryTimingClassification(0, 0, 0, 0, 0)
+    if journal.empty:
+        timestamps = pd.to_datetime(_series(entry, "timestamp"), utc=True, errors="coerce")
+        legacy = int(timestamps.lt(ENTRY_TIMING_FINAL_CANDIDATE_INTEGRATION_UTC).fillna(True).sum())
+        orphan = int(len(entry) - legacy)
+        duplicate = int(signal_prefix_df(entry, "direction").duplicated(keep=False).sum())
+        return EntryTimingClassification(len(entry), 0, legacy, orphan, duplicate)
+
+    approved = journal[_series(journal, "signal_status").fillna("").astype(str).str.lower().isin(APPROVED_FINAL_STATUSES)].copy()
+    approved_prefixes = set(signal_prefix_df(approved, "side").astype(str))
+    entry_key = signal_prefix_df(entry, "direction").astype(str)
+    timestamps = pd.to_datetime(_series(entry, "timestamp"), utc=True, errors="coerce")
+    matched_mask = entry_key.isin(approved_prefixes)
+    legacy_mask = ~matched_mask & timestamps.lt(ENTRY_TIMING_FINAL_CANDIDATE_INTEGRATION_UTC).fillna(True)
+    orphan_mask = ~matched_mask & ~legacy_mask
+    duplicate_mask = entry_key.duplicated(keep=False)
+    return EntryTimingClassification(
+        total=int(len(entry)),
+        matched=int(matched_mask.sum()),
+        legacy=int(legacy_mask.sum()),
+        orphan=int(orphan_mask.sum()),
+        duplicate=int(duplicate_mask.sum()),
+    )
+
+
 def audit_entry_timing(entry: pd.DataFrame, journal: pd.DataFrame) -> list[AuditFinding]:
     findings: list[AuditFinding] = []
     if entry.empty:
-        findings.append(AuditFinding("WARNING", "Entry Timing rows", "logs/entry_timing_engine.csv has no rows"))
+        findings.append(AuditFinding("INFO", "Entry Timing rows", "logs/entry_timing_engine.csv has no rows"))
         return findings
-    if journal.empty:
-        findings.append(AuditFinding("WARNING", "Entry Timing rows without a matching approved final candidate", "journal unavailable"))
-        return findings
-
-    approved = journal[_series(journal, "signal_status").fillna("").astype(str).str.lower().isin(["sent", "tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only", "london_long_report_only"])].copy()
-    approved_keys = set(signal_key_df(approved).astype(str))
-    entry_key = (
-        _series(entry, "timestamp").fillna("").astype(str)
-        + "|"
-        + _series(entry, "symbol").fillna("").astype(str).str.upper()
-        + "|"
-        + _series(entry, "direction").fillna("").astype(str).str.upper()
-        + "|"
-        + _series(entry, "entry").fillna("").astype(str)
+    classification = classify_entry_timing(entry, journal)
+    findings.append(
+        AuditFinding(
+            "PASS",
+            "Entry Timing classification summary",
+            (
+                f"total={classification.total}, matched={classification.matched}, "
+                f"legacy={classification.legacy}, orphan={classification.orphan}, "
+                f"duplicate={classification.duplicate}, coverage={classification.coverage_pct:.1f}%"
+            ),
+        )
     )
-    candidate_prefixes = {key.rsplit("|", 2)[0] for key in approved_keys}
-    unmatched = [key for key in entry_key.astype(str) if key.rsplit("|", 1)[0] not in candidate_prefixes]
-    if unmatched:
-        findings.append(AuditFinding("WARNING", "Entry Timing rows without a matching approved final candidate", f"{len(unmatched)} rows"))
-    duplicates = entry_key[entry_key.duplicated(keep=False)]
-    if not duplicates.empty:
-        findings.append(AuditFinding("WARNING", "multiple Entry Timing rows for one approved candidate", f"{duplicates.nunique()} duplicate keys"))
+    if classification.legacy:
+        findings.append(AuditFinding("INFO", "LEGACY_SHADOW_ROW", f"{classification.legacy} historical rows before final-candidate integration"))
+    if classification.orphan:
+        findings.append(AuditFinding("WARNING", "ORPHAN_ROW", f"{classification.orphan} post-integration Entry Timing rows without final candidate match"))
+    if classification.duplicate:
+        findings.append(AuditFinding("WARNING", "DUPLICATE_ROW", f"{classification.duplicate} duplicate Entry Timing rows"))
     return findings
 
 
-def audit_stale_watcher_state(journal: pd.DataFrame) -> list[AuditFinding]:
+def classify_watcher_state(journal: pd.DataFrame) -> WatcherStateClassification:
     if journal.empty:
-        return []
+        return WatcherStateClassification(0, 0, 0, [])
     result = _series(journal, "result", "OPEN").fillna("OPEN").astype(str).str.upper()
     stage = _series(journal, "position_management_stage").fillna("").astype(str)
-    stale = result.isin(FINAL_STATUSES) & stage.str.contains("TP1_REACHED", case=False, na=False)
-    if stale.any():
-        return [AuditFinding("WARNING", "stale position watcher state", f"{int(stale.sum())} closed rows still have TP1 management stage")]
-    return []
+    lock_file = _series(journal, "position_watcher_lock_file").fillna("").astype(str).str.strip()
+    alert_key = _series(journal, "position_watcher_alert_key").fillna("").astype(str).str.strip()
+    status = _series(journal, "signal_status").fillna("").astype(str).str.lower()
+    historical = result.isin(FINAL_STATUSES) & stage.str.contains("TP1_REACHED", case=False, na=False)
+    active_stale = result.isin(FINAL_STATUSES) & (lock_file.ne("") | alert_key.ne(""))
+    closed_open = result.isin(FINAL_STATUSES) & status.isin(["active"])
+    symbols = sorted(_series(journal.loc[active_stale], "symbol").fillna("").astype(str).str.upper().unique().tolist())
+    return WatcherStateClassification(
+        historical_flags=int(historical.sum()),
+        active_stale_state=int(active_stale.sum()),
+        closed_treated_open=int(closed_open.sum()),
+        symbols=symbols,
+    )
+
+
+def audit_stale_watcher_state(journal: pd.DataFrame) -> list[AuditFinding]:
+    state = classify_watcher_state(journal)
+    findings: list[AuditFinding] = []
+    if state.historical_flags:
+        findings.append(AuditFinding("INFO", "CLOSED_ROW_WITH_HISTORICAL_TP1_FLAG", f"{state.historical_flags} closed rows keep TP1 audit fields"))
+    if state.active_stale_state:
+        findings.append(AuditFinding("WARNING", "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE", f"{state.active_stale_state} rows; symbols={','.join(state.symbols) or '-'}"))
+    if state.closed_treated_open:
+        findings.append(AuditFinding("FAIL", "CLOSED_ROW_STILL_TREATED_AS_OPEN", f"{state.closed_treated_open} rows"))
+    if not findings:
+        findings.append(AuditFinding("PASS", "position watcher active state", "no stale active watcher state"))
+    return findings
 
 
 def audit_paths(journal_path: Path = JOURNAL, entry_path: Path = ENTRY_TIMING) -> list[AuditFinding]:
     journal, journal_error = _load_csv(journal_path)
     entry, entry_error = _load_csv(entry_path)
-    findings = [item for item in [journal_error, entry_error] if item is not None]
+    findings = [item for item in [journal_error] if item is not None]
+    if entry_error is not None:
+        findings.append(AuditFinding("INFO", "Entry Timing rows", f"{entry_path} missing; no shadow rows yet"))
     if journal_error is None:
         findings.extend(audit_journal(journal))
     if entry_error is None:

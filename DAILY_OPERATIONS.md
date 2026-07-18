@@ -19,6 +19,7 @@ Run health command:
 ```bash
 cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python production_health.py
+.venv/bin/python production_v1_readiness.py
 ```
 
 Check previous executive report delivery:
@@ -53,6 +54,7 @@ Verify Entry Timing rows are increasing:
 ```bash
 wc -l logs/entry_timing_engine.csv
 .venv/bin/python entry_timing_operational_summary.py
+.venv/bin/python position_watcher_state_cleanup.py
 ```
 
 ## Evening
@@ -70,7 +72,17 @@ Back up runtime data:
 
 ```bash
 .venv/bin/python backup_runtime_data.py
+.venv/bin/python data_integrity_audit.py
+.venv/bin/python position_watcher_state_cleanup.py
 ```
+
+Run cleanup apply only after reviewing dry-run output:
+
+```bash
+.venv/bin/python position_watcher_state_cleanup.py --apply
+```
+
+Never use `--apply` without reviewing the listed stale state keys.
 
 Check recent errors:
 

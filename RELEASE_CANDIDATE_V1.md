@@ -62,6 +62,7 @@ Report-only signals go to Reports only and are not sent to Signals or Cornix.
 - It can send a Reports advisory and optional Cornix breakeven command.
 - Persistent CSV fields and lock files prevent duplicate TP1/NEW STOP alerts.
 - Closed/report-only rows are not sent as Cornix breakeven commands.
+- `position_watcher_state_cleanup.py` is the maintenance tool for stale active runtime state. It is dry-run by default and preserves CSV history.
 
 ### Outcome Review
 
@@ -131,3 +132,22 @@ systemctl status crypto-performance-report.timer --no-pager
 ```
 
 Rollback preserves logs, reports, backups, `.env`, lock files, and runtime state.
+
+## V1 Readiness Commands
+
+Run these before promoting RC1 to Production V1:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python data_integrity_audit.py
+.venv/bin/python position_watcher_state_cleanup.py
+.venv/bin/python production_v1_readiness.py
+```
+
+If stale active Position Watcher state is listed, review the keys first. Apply cleanup only after review:
+
+```bash
+.venv/bin/python position_watcher_state_cleanup.py --apply
+```
+
+Never use `--apply` without reviewing the listed keys. Cleanup removes only active runtime lock files for confirmed closed positions and does not alter wins, losses, prices, TP/SL, signal status, or CSV history.

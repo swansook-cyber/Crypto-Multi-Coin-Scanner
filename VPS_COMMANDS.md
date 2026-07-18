@@ -37,8 +37,24 @@ cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python production_health.py
 .venv/bin/python data_integrity_audit.py
 .venv/bin/python entry_timing_operational_summary.py
+.venv/bin/python position_watcher_state_cleanup.py
+.venv/bin/python production_v1_readiness.py
 .venv/bin/python backup_runtime_data.py
 ```
+
+Position watcher stale-state cleanup is dry-run by default:
+
+```bash
+.venv/bin/python position_watcher_state_cleanup.py
+```
+
+Apply only after reviewing every listed key:
+
+```bash
+.venv/bin/python position_watcher_state_cleanup.py --apply
+```
+
+`--apply` preserves CSV history and removes only active runtime lock files tied to confirmed closed positions after creating a backup.
 
 Exact service checks:
 

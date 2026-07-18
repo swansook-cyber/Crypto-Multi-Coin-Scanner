@@ -22,6 +22,9 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+import data_integrity_audit
+import position_watcher_state_cleanup
+
 
 BASE_DIR = Path(__file__).resolve().parent
 LOGS_DIR = BASE_DIR / "logs"
@@ -159,6 +162,45 @@ def _check_locks() -> HealthCheck:
         return HealthCheck("duplicate-alert lock directory", FAIL, f"cannot create lock dir: {exc}")
 
 
+def _check_data_integrity() -> list[HealthCheck]:
+    try:
+        findings = data_integrity_audit.audit_paths(JOURNAL, ENTRY_TIMING)
+    except Exception as exc:
+        return [HealthCheck("Data Integrity Audit", FAIL, f"{type(exc).__name__}: {exc}")]
+    fail_count = sum(1 for item in findings if item.severity == "FAIL")
+    warning_count = sum(1 for item in findings if item.severity == "WARNING")
+    info_count = sum(1 for item in findings if item.severity == "INFO")
+    if fail_count:
+        status = FAIL
+    elif warning_count:
+        status = WARNING
+    else:
+        status = PASS
+    checks = [
+        HealthCheck(
+            "Data Integrity Audit",
+            status,
+            f"critical={fail_count}, warnings={warning_count}, info={info_count}",
+        )
+    ]
+    stale = [item for item in findings if item.check == "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE"]
+    if stale:
+        checks.append(HealthCheck("Position watcher active stale state", WARNING, "; ".join(item.detail for item in stale)))
+    else:
+        checks.append(HealthCheck("Position watcher active stale state", PASS, "no active stale state detected by audit"))
+    return checks
+
+
+def _check_position_watcher_cleanup_view() -> HealthCheck:
+    try:
+        items = position_watcher_state_cleanup.stale_state_items(JOURNAL)
+    except Exception as exc:
+        return HealthCheck("Position watcher cleanup dry-run view", WARNING, f"{type(exc).__name__}: {exc}")
+    if items:
+        return HealthCheck("Position watcher cleanup dry-run view", WARNING, f"{len(items)} stale active state keys")
+    return HealthCheck("Position watcher cleanup dry-run view", PASS, "0 stale active state keys")
+
+
 def _check_disk(min_free_gb: float = 1.0) -> HealthCheck:
     usage = shutil.disk_usage(BASE_DIR)
     free_gb = usage.free / (1024**3)
@@ -247,6 +289,8 @@ def run_checks(include_services: bool = True) -> list[HealthCheck]:
     checks.append(_check_csv_rw(ENTRY_TIMING, "Entry Timing CSV readability/writability"))
     checks.append(_check_outcome_data())
     checks.extend(_check_report_generation())
+    checks.extend(_check_data_integrity())
+    checks.append(_check_position_watcher_cleanup_view())
     checks.append(_check_locks())
     checks.append(_check_disk())
     checks.append(_check_clock())

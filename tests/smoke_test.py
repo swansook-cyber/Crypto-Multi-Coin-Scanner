@@ -29,7 +29,9 @@ import external_signal_analyzer
 import performance_report
 import position_manager
 import position_watcher
+import position_watcher_state_cleanup
 import production_health
+import production_v1_readiness
 import review_signals
 import stats_dashboard
 import telegram_external_inbox
@@ -3747,7 +3749,7 @@ def test_data_integrity_audit_detects_duplicates_and_malformed_rows() -> None:
     assert "OPEN rows that already contain final hit targets" in text
     assert "invalid numeric values" in text
     assert "invalid status values" in text
-    assert "multiple Entry Timing rows" in text
+    assert "DUPLICATE_ROW" in text
 
 
 def test_data_integrity_safe_repair_preserves_outcomes() -> None:
@@ -3842,6 +3844,172 @@ def test_update_script_validation_before_restart_protection() -> None:
     assert "Tracked local modifications detected" in script
 
 
+def test_data_audit_status_registry_accepts_current_skip_statuses() -> None:
+    valid_statuses = [
+        "open",
+        "sent",
+        "closed",
+        "skipped_quality_filter",
+        "skipped_daily_risk_guard",
+        "skipped_losing_streak",
+        "skipped_loss_cooldown",
+        "skipped_correlation",
+        "skipped_btc_regime",
+        "skipped_not_top",
+        "skipped_position_management",
+        "tier_c_report_only",
+        "weak_symbol_report_only",
+        "session_risk_report_only",
+        "london_long_report_only",
+    ]
+    rows = [
+        {
+            "timestamp": f"2026-06-01T{i % 24:02d}:00:00+00:00",
+            "symbol": f"BTC{i}USDT",
+            "side": "LONG",
+            "entry": 100,
+            "stop_loss": 99,
+            "tp1": 101,
+            "result": "SKIPPED" if status.startswith("skipped") else "OPEN",
+            "hit_target": "",
+            "signal_status": status,
+        }
+        for i, status in enumerate(valid_statuses)
+    ]
+    findings = data_integrity_audit.audit_journal(pd.DataFrame(rows))
+    assert not any(item.check == "invalid status values" and "signal_status" in item.detail for item in findings)
+    rows.append({**rows[0], "timestamp": "2026-06-02T00:00:00+00:00", "symbol": "BADUSDT", "signal_status": "unknown_status"})
+    findings = data_integrity_audit.audit_journal(pd.DataFrame(rows))
+    assert any(item.check == "invalid status values" and "unknown_status" in item.detail for item in findings)
+
+
+def test_entry_timing_audit_classifications() -> None:
+    journal = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-06-29T00:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "entry": 100,
+                "stop_loss": 99,
+                "tp1": 101,
+                "signal_status": "sent",
+            }
+        ]
+    )
+    entry = pd.DataFrame(
+        [
+            {"timestamp": "2026-06-27T00:00:00+00:00", "symbol": "LEGACYUSDT", "direction": "LONG", "entry": 1},
+            {"timestamp": "2026-06-29T00:00:00+00:00", "symbol": "BTCUSDT", "direction": "LONG", "entry": 100},
+            {"timestamp": "2026-06-29T01:00:00+00:00", "symbol": "ORPHANUSDT", "direction": "SHORT", "entry": 5},
+            {"timestamp": "2026-06-29T01:00:00+00:00", "symbol": "ORPHANUSDT", "direction": "SHORT", "entry": 5},
+        ]
+    )
+    classification = data_integrity_audit.classify_entry_timing(entry, journal)
+    assert classification.matched == 1
+    assert classification.legacy == 1
+    assert classification.orphan == 2
+    assert classification.duplicate == 2
+    findings = data_integrity_audit.audit_entry_timing(entry, journal)
+    assert any(item.severity == "INFO" and item.check == "LEGACY_SHADOW_ROW" for item in findings)
+    assert any(item.severity == "WARNING" and item.check == "ORPHAN_ROW" for item in findings)
+    assert any(item.severity == "WARNING" and item.check == "DUPLICATE_ROW" for item in findings)
+
+
+def test_position_watcher_state_audit_categories() -> None:
+    historical = pd.DataFrame(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "result": "WIN",
+                "signal_status": "sent",
+                "position_management_stage": "TP1_REACHED_BE_RECOMMENDED",
+                "position_watcher_alert_key": "",
+                "position_watcher_lock_file": "",
+            }
+        ]
+    )
+    findings = data_integrity_audit.audit_stale_watcher_state(historical)
+    assert any(item.severity == "INFO" and item.check == "CLOSED_ROW_WITH_HISTORICAL_TP1_FLAG" for item in findings)
+    assert not any(item.check == "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE" for item in findings)
+
+    active = historical.copy()
+    active.loc[0, "position_watcher_alert_key"] = "BTCUSDT|LONG|key"
+    findings = data_integrity_audit.audit_stale_watcher_state(active)
+    assert any(item.severity == "WARNING" and item.check == "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE" for item in findings)
+
+    critical = active.copy()
+    critical.loc[0, "signal_status"] = "active"
+    findings = data_integrity_audit.audit_stale_watcher_state(critical)
+    assert any(item.severity == "FAIL" and item.check == "CLOSED_ROW_STILL_TREATED_AS_OPEN" for item in findings)
+
+
+def test_position_watcher_state_cleanup_dry_run_and_apply() -> None:
+    temp_dir = Path(tempfile.gettempdir())
+    journal = temp_dir / "position_watcher_cleanup_smoke.csv"
+    lock = temp_dir / "position_watcher_cleanup_smoke.lock"
+    lock.write_text("created\nBTCUSDT|LONG|key\n", encoding="utf-8")
+    try:
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-06-01T00:00:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "tp1": 101,
+                    "stop_loss": 99,
+                    "result": "WIN",
+                    "signal_status": "sent",
+                    "position_watcher_alert_key": "BTCUSDT|LONG|key",
+                    "position_watcher_lock_file": str(lock),
+                },
+                {
+                    "timestamp": "2026-06-01T01:00:00+00:00",
+                    "symbol": "ETHUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "tp1": 101,
+                    "stop_loss": 99,
+                    "result": "OPEN",
+                    "signal_status": "sent",
+                    "position_watcher_alert_key": "ETHUSDT|LONG|key",
+                    "position_watcher_lock_file": str(temp_dir / "open_position.lock"),
+                },
+            ]
+        ).to_csv(journal, index=False)
+        items, backup, removed = position_watcher_state_cleanup.cleanup(journal, apply=False)
+        assert len(items) == 1
+        assert items[0].symbol == "BTCUSDT"
+        assert backup is None
+        assert removed == []
+        assert lock.exists()
+        items, backup, removed = position_watcher_state_cleanup.cleanup(journal, apply=True)
+        assert len(items) == 1
+        assert backup is not None and backup.exists()
+        assert removed == [lock]
+        assert not lock.exists()
+        saved = pd.read_csv(journal)
+        assert saved.loc[0, "result"] == "WIN"
+        assert saved.loc[0, "position_watcher_alert_key"] == "BTCUSDT|LONG|key"
+    finally:
+        for path in [journal, lock]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def test_production_v1_readiness_exit_codes() -> None:
+    ready = [production_v1_readiness.ReadinessItem("a", "PASS", "ok")]
+    warning = ready + [production_v1_readiness.ReadinessItem("b", "WARNING", "warn")]
+    fail = warning + [production_v1_readiness.ReadinessItem("c", "FAIL", "bad")]
+    assert production_v1_readiness.final_status(ready) == ("READY FOR V1", 0)
+    assert production_v1_readiness.final_status(warning) == ("READY WITH WARNINGS", 1)
+    assert production_v1_readiness.final_status(fail) == ("NOT READY", 2)
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -3912,6 +4080,11 @@ def main() -> int:
     test_backup_runtime_data_excludes_secrets()
     test_entry_timing_readiness_thresholds_and_summary()
     test_update_script_validation_before_restart_protection()
+    test_data_audit_status_registry_accepts_current_skip_statuses()
+    test_entry_timing_audit_classifications()
+    test_position_watcher_state_audit_categories()
+    test_position_watcher_state_cleanup_dry_run_and_apply()
+    test_production_v1_readiness_exit_codes()
     print("smoke tests passed")
     return 0
 
