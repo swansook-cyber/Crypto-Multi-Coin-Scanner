@@ -3043,6 +3043,10 @@ def test_scanner_final_candidate_writes_entry_timing_row() -> None:
         assert len(saved) == 2
         assert saved["symbol"].tolist() == ["BTCUSDT", "SUIUSDT"]
         assert saved["entry_quality_score"].between(0, 100).all()
+        assert saved["signal_status"].tolist() == ["sent", "session_risk_report_only"]
+        assert saved["normalized_symbol"].tolist() == ["BTCUSDT", "SUIUSDT"]
+        assert saved["normalized_direction"].tolist() == ["SHORT", "SHORT"]
+        assert saved["final_signal_timestamp"].fillna("").astype(str).str.len().gt(0).all()
         assert set(saved["recommendation"]).issubset(
             {
                 "ENTER NOW",
@@ -3910,11 +3914,90 @@ def test_entry_timing_audit_classifications() -> None:
     assert classification.matched == 1
     assert classification.legacy == 1
     assert classification.orphan == 2
+    assert classification.ambiguous == 0
     assert classification.duplicate == 2
     findings = data_integrity_audit.audit_entry_timing(entry, journal)
     assert any(item.severity == "INFO" and item.check == "LEGACY_SHADOW_ROW" for item in findings)
     assert any(item.severity == "WARNING" and item.check == "ORPHAN_ROW" for item in findings)
     assert any(item.severity == "WARNING" and item.check == "DUPLICATE_ROW" for item in findings)
+
+
+def test_entry_timing_audit_deterministic_matching() -> None:
+    journal = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-07-01T01:00:00+00:00",
+                "signal_id": "sig-1",
+                "symbol": "SUIUSDT",
+                "side": "SHORT",
+                "entry": 0.6960001,
+                "stop_loss": 0.72,
+                "tp1": 0.66,
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "2026-07-01T01:20:00+00:00",
+                "symbol": "BINANCE:SUIUSDT.P",
+                "side": "SHORT",
+                "entry": 0.6960002,
+                "stop_loss": 0.72,
+                "tp1": 0.66,
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "2026-07-01T03:00:00+00:00",
+                "symbol": "SUIUSDT",
+                "side": "SHORT",
+                "entry": 0.70,
+                "stop_loss": 0.73,
+                "tp1": 0.65,
+                "signal_status": "sent",
+            },
+        ]
+    )
+    entry = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-07-01T01:10:00+00:00",
+                "source_signal_id": "sig-1",
+                "symbol": "SUI/USDT",
+                "direction": "SELL",
+                "entry": 0.696,
+            },
+            {
+                "timestamp": "2026-07-01T01:05:00+00:00",
+                "symbol": "SUIUSDT.P",
+                "direction": "SHORT",
+                "entry": 0.6960003,
+            },
+            {
+                "timestamp": "2026-07-01T01:06:00+00:00",
+                "symbol": "SUIUSDT",
+                "direction": "SHORT",
+                "entry": 0.6960004,
+            },
+            {
+                "timestamp": "2026-07-01T12:00:00+00:00",
+                "symbol": "SUIUSDT",
+                "direction": "SHORT",
+                "entry": 0.696,
+            },
+            {
+                "timestamp": "2026-06-27T12:00:00+00:00",
+                "symbol": "OLDUSDT",
+                "direction": "LONG",
+                "entry": 1.0,
+            },
+        ]
+    )
+    classification = data_integrity_audit.classify_entry_timing(entry, journal)
+    assert classification.matched == 1
+    assert classification.ambiguous == 2
+    assert classification.orphan == 1
+    assert classification.legacy == 1
+    findings = data_integrity_audit.audit_entry_timing(entry, journal, verbose=True)
+    assert any(item.check == "AMBIGUOUS_MATCH" for item in findings)
+    assert any(item.check == "ENTRY_TIMING_SAMPLE" for item in findings)
 
 
 def test_position_watcher_state_audit_categories() -> None:
@@ -3936,14 +4019,25 @@ def test_position_watcher_state_audit_categories() -> None:
     assert not any(item.check == "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE" for item in findings)
 
     active = historical.copy()
-    active.loc[0, "position_watcher_alert_key"] = "BTCUSDT|LONG|key"
+    lock = Path(tempfile.gettempdir()) / "watcher_state_audit_smoke.lock"
+    lock.write_text("lock", encoding="utf-8")
+    active.loc[0, "position_watcher_lock_file"] = str(lock)
     findings = data_integrity_audit.audit_stale_watcher_state(active)
+    assert any(item.severity == "WARNING" and item.check == "STALE_LOCK_FILE" for item in findings)
     assert any(item.severity == "WARNING" and item.check == "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE" for item in findings)
+    lock.unlink()
 
     critical = active.copy()
     critical.loc[0, "signal_status"] = "active"
     findings = data_integrity_audit.audit_stale_watcher_state(critical)
     assert any(item.severity == "FAIL" and item.check == "CLOSED_ROW_STILL_TREATED_AS_OPEN" for item in findings)
+
+    nan_refs = historical.copy()
+    nan_refs.loc[0, "position_watcher_alert_key"] = float("nan")
+    nan_refs.loc[0, "position_watcher_lock_file"] = float("nan")
+    state = data_integrity_audit.classify_watcher_state(nan_refs)
+    assert state.active_stale_state == 0
+    assert state.removable_items == 0
 
 
 def test_position_watcher_state_cleanup_dry_run_and_apply() -> None:
@@ -3983,6 +4077,7 @@ def test_position_watcher_state_cleanup_dry_run_and_apply() -> None:
         items, backup, removed = position_watcher_state_cleanup.cleanup(journal, apply=False)
         assert len(items) == 1
         assert items[0].symbol == "BTCUSDT"
+        assert items[0].removable is True
         assert backup is None
         assert removed == []
         assert lock.exists()
@@ -3994,6 +4089,8 @@ def test_position_watcher_state_cleanup_dry_run_and_apply() -> None:
         saved = pd.read_csv(journal)
         assert saved.loc[0, "result"] == "WIN"
         assert saved.loc[0, "position_watcher_alert_key"] == "BTCUSDT|LONG|key"
+        classification = position_watcher_state_cleanup.classify_cleanup(journal)
+        assert classification.removable_items == 0
     finally:
         for path in [journal, lock]:
             try:
@@ -4195,6 +4292,7 @@ def main() -> int:
     test_update_script_validation_before_restart_protection()
     test_data_audit_status_registry_accepts_current_skip_statuses()
     test_entry_timing_audit_classifications()
+    test_entry_timing_audit_deterministic_matching()
     test_position_watcher_state_audit_categories()
     test_position_watcher_state_cleanup_dry_run_and_apply()
     test_production_v1_readiness_exit_codes()

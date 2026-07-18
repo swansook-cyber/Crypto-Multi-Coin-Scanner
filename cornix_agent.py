@@ -1722,6 +1722,10 @@ class AgentRunner:
     def evaluate_entry_timing_shadow(self, signal: TradeSignal, signal_status: str) -> None:
         try:
             result = self.entry_timing.evaluate(signal)
+            result.signal_status = signal_status
+            result.final_signal_timestamp = signal.timestamp.isoformat() if hasattr(signal.timestamp, "isoformat") else str(signal.timestamp)
+            result.normalized_symbol = SymbolFormatter.to_binance_symbol(signal.symbol)
+            result.normalized_direction = signal.direction.upper()
             self.entry_timing_logger.log(result)
             LOGGER.info(
                 "Entry Timing Engine shadow evaluated final candidate: symbol=%s status=%s recommendation=%s score=%s",

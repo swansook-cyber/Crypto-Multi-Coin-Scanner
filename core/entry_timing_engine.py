@@ -41,6 +41,12 @@ FIELDNAMES = [
     "market_regime",
     "volume_spike",
     "mfi_confirmed",
+    "source_signal_id",
+    "candidate_id",
+    "final_signal_timestamp",
+    "signal_status",
+    "normalized_symbol",
+    "normalized_direction",
 ]
 
 
@@ -69,6 +75,28 @@ class EntryTimingResult:
     market_regime: str
     volume_spike: str
     mfi_confirmed: str
+    source_signal_id: str = ""
+    candidate_id: str = ""
+    final_signal_timestamp: str = ""
+    signal_status: str = ""
+    normalized_symbol: str = ""
+    normalized_direction: str = ""
+
+
+def normalize_symbol(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if ":" in text:
+        text = text.split(":")[-1]
+    return text.replace("#", "").replace(".P", "").replace("/", "").replace("-", "").replace("_", "")
+
+
+def normalize_direction(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text == "BUY":
+        return "LONG"
+    if text == "SELL":
+        return "SHORT"
+    return text if text in {"LONG", "SHORT"} else ""
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -192,6 +220,12 @@ class EntryTimingEngine:
             market_regime=regime,
             volume_spike=_yes(volume_spike),
             mfi_confirmed=_yes(mfi_confirmed),
+            source_signal_id=str(getattr(signal, "source_signal_id", getattr(signal, "signal_id", "")) or ""),
+            candidate_id=str(getattr(signal, "candidate_id", "") or ""),
+            final_signal_timestamp=str(getattr(signal, "timestamp", "") or ""),
+            signal_status="",
+            normalized_symbol=normalize_symbol(getattr(signal, "symbol", "")),
+            normalized_direction=normalize_direction(direction),
         )
 
     @staticmethod
@@ -225,11 +259,25 @@ class EntryTimingLogger:
             with self.path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
                 writer.writeheader()
+        else:
+            self._ensure_header()
+
+    def _ensure_header(self) -> None:
+        try:
+            existing = pd.read_csv(self.path)
+        except Exception:
+            return
+        missing = [field for field in FIELDNAMES if field not in existing.columns]
+        if not missing:
+            return
+        for field in missing:
+            existing[field] = ""
+        existing.to_csv(self.path, index=False, columns=FIELDNAMES)
 
     def log(self, result: EntryTimingResult) -> None:
         with self.path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
-            writer.writerow(asdict(result))
+            writer.writerow({key: asdict(result).get(key, "") for key in FIELDNAMES})
 
     def log_many(self, results: list[EntryTimingResult]) -> None:
         for result in results:
