@@ -14,7 +14,7 @@
 - Execution model: Telegram signal assistant only
 - Auto trading: not implemented
 - Manual execution: required
-- Release marker: `SCANNER_RELEASE=RC1`
+- Release marker: `SCANNER_RELEASE=V1.0`
 
 ## Implemented
 
@@ -46,6 +46,8 @@
 - Entry Timing operational summary via `entry_timing_operational_summary.py`
 - Position Watcher stale-state cleanup via `position_watcher_state_cleanup.py`
 - Production V1 readiness summary via `production_v1_readiness.py`
+- Production V1 status console via `system_status.py`
+- Production V1 release record via `PRODUCTION_V1.md`
 - RC1 release snapshot via `RELEASE_CANDIDATE_V1.md`
 - Daily VPS operations checklist via `DAILY_OPERATIONS.md`
 
@@ -118,9 +120,16 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 - Runtime CSV/log/chart/dashboard output should stay out of Git
 - `.env` and real API/chat IDs must not be committed
 - Use `python production_health.py`, `python data_integrity_audit.py`, and `python backup_runtime_data.py` before production updates
+- Use `python system_status.py` for compact daily VPS status checks
 - Run `python position_watcher_state_cleanup.py` in dry-run mode before any cleanup; use `--apply` only after reviewing the listed stale keys
 - Use `python production_v1_readiness.py` for the final V1 readiness summary
 - Use `scripts/update_production.sh` for guarded VPS updates and `scripts/rollback_production.sh <commit>` for tracked-code rollback
 - External inbox messages must not affect scanner-generated signals
 - External analyzer approval must be explicit before routing to Signals/Cornix
 - Cornix channel receives clean production-ready signal text; breakeven command formats are selectable with `CORNIX_BREAKEVEN_FORMAT`
+
+## V1 Freeze Policy
+
+For 7 days after V1 deployment, bug fixes only. Do not change scoring, filters,
+routing, TP/SL/RR, Cornix signal format, or Entry Timing enforcement during the
+freeze window.

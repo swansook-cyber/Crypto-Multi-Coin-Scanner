@@ -34,6 +34,7 @@ import production_health
 import production_v1_readiness
 import review_signals
 import stats_dashboard
+import system_status
 import telegram_external_inbox
 from core.analytics_reporting import build_daily_performance_report, export_journal_csvs, journal_signal_export
 from core.btc_regime_filter import detect_btc_regime
@@ -4010,6 +4011,118 @@ def test_production_v1_readiness_exit_codes() -> None:
     assert production_v1_readiness.final_status(fail) == ("NOT READY", 2)
 
 
+def test_system_status_exit_codes_json_and_helpers() -> None:
+    assert system_status.final_status(["PASS"]) == ("READY FOR PRODUCTION", 0)
+    assert system_status.final_status(["PASS", "WARNING"]) == ("READY WITH WARNINGS", 1)
+    assert system_status.final_status(["FAIL"]) == ("NOT READY", 2)
+    assert system_status.final_status(["UNKNOWN"]) == ("READY WITH WARNINGS", 1)
+
+    status = {
+        "release": {"commit": "abc1234", "release": "V1.0", "utc_time": "2026-07-18T00:00:00+00:00"},
+        "services": {
+            "scanner": "RUNNING",
+            "position_watcher": "RUNNING",
+            "performance_timer": "ACTIVE",
+            "next_performance_report": "Sun 2026-07-19",
+        },
+        "runtime": {
+            "closed_signals": 3,
+            "open_signals": 1,
+            "win_rate": 66.6,
+            "net_r": 1.25,
+            "today_sent": 2,
+            "today_wins": 1,
+            "today_losses": 0,
+        },
+        "reporting": {
+            "executive_report": "PASS",
+            "full_report_html": "PASS",
+            "analytics_html": "PASS",
+            "reports_chat_configured": "YES",
+        },
+        "entry_timing": {
+            "mode": "SHADOW",
+            "evaluated": 10,
+            "latest_evaluation": "2026-07-18T00:00:00+00:00",
+            "readiness": "NOT ENOUGH DATA",
+            "dominant_recommendation": "ENTER NOW",
+        },
+        "production_universe": {
+            "tier_s": "BTCUSDT",
+            "tier_a": "ETHUSDT",
+            "watch": "SOLUSDT",
+            "report_only": "SEIUSDT",
+        },
+        "safety": {
+            "data_integrity": "PASS",
+            "active_stale_watcher_state": 0,
+            "duplicate_alert_protection": "PASS",
+            "latest_runtime_backup": "runtime_20260718.zip (1h ago)",
+            "disk_free_gb": 12.3,
+        },
+        "final_status": "READY FOR PRODUCTION",
+        "exit_code": 0,
+    }
+    text = system_status.format_status(status)
+    assert "Crypto Scanner Production V1" in text
+    assert "Release: V1.0" in text
+    assert "Reports Chat Configured: YES" in text
+    assert "READY FOR PRODUCTION" in text
+    assert json.loads(json.dumps(status))["release"]["release"] == "V1.0"
+
+
+def test_system_status_read_only_and_missing_optional_inputs() -> None:
+    before = {}
+    for path in [system_status.JOURNAL, system_status.ENTRY_TIMING]:
+        if path.exists():
+            before[path] = path.stat().st_mtime_ns
+
+    class NoTelegramSession:
+        def post(self, *_args, **_kwargs):
+            raise AssertionError("system_status must not send Telegram")
+
+    assert NoTelegramSession
+    status = system_status.build_status(include_services=False)
+    assert "final_status" in status
+    assert status["entry_timing"]["mode"] == "SHADOW"
+    assert status["release"]["release"]
+    for path, mtime in before.items():
+        assert path.stat().st_mtime_ns == mtime
+
+    missing = Path(tempfile.gettempdir()) / "missing_entry_timing_status_smoke.csv"
+    entry = system_status.entry_timing_status(missing, missing)
+    assert entry["evaluated"] == 0
+    assert entry["latest_evaluation"] == "N/A"
+    assert entry["readiness"] == "NOT ENOUGH DATA"
+
+
+def test_system_status_systemctl_backup_and_compaction() -> None:
+    def missing_systemctl(_command):
+        raise FileNotFoundError("systemctl")
+
+    assert system_status.service_state("crypto-scanner.service", runner=missing_systemctl) == "UNKNOWN"
+    assert system_status.timer_state("crypto-performance-report.timer", runner=missing_systemctl) == "UNKNOWN"
+
+    temp_dir = Path(tempfile.gettempdir()) / "system_status_backup_smoke"
+    temp_dir.mkdir(exist_ok=True)
+    backup = temp_dir / "runtime_20260718_000000.zip"
+    try:
+        backup.write_text("backup", encoding="utf-8")
+        latest = system_status.latest_backup(temp_dir)
+        assert latest.startswith("runtime_20260718_000000.zip")
+        symbols = ",".join(f"COIN{i}USDT" for i in range(20))
+        compact = system_status.compact_symbols(symbols, limit=4)
+        assert "COIN0USDT" in compact
+        assert "+16" in compact
+        assert len(compact) <= 58
+    finally:
+        try:
+            backup.unlink()
+            temp_dir.rmdir()
+        except OSError:
+            pass
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -4085,6 +4198,9 @@ def main() -> int:
     test_position_watcher_state_audit_categories()
     test_position_watcher_state_cleanup_dry_run_and_apply()
     test_production_v1_readiness_exit_codes()
+    test_system_status_exit_codes_json_and_helpers()
+    test_system_status_read_only_and_missing_optional_inputs()
+    test_system_status_systemctl_backup_and_compaction()
     print("smoke tests passed")
     return 0
 

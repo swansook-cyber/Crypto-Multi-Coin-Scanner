@@ -318,6 +318,23 @@ cd /opt/Crypto-Multi-Coin-Scanner
 
 `performance_report.py` prints the complete detailed report and writes `reports/report.html`. `--executive` previews Executive Report V2 locally. `--send` sends only Executive Report V2 to `TELEGRAM_REPORTS_CHAT_ID`; detailed analytics stay in the dashboard/web report. Entry Timing market status in the executive summary is reporting-only: `COLLECTING DATA`, `ENTERABLE`, `WAITING`, `POOR TIMING`, or `MIXED`. If Telegram delivery fails, the command exits non-zero so `crypto-performance-report.service` shows failure in `journalctl`.
 
+Production V1 status console:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python system_status.py
+.venv/bin/python system_status.py --json
+```
+
+Preferred daily shortcut:
+
+```bash
+alias scanner-status='cd /opt/Crypto-Multi-Coin-Scanner && .venv/bin/python system_status.py'
+```
+
+Do not modify the shell automatically. The status console is read-only and does
+not send Telegram, repair CSVs, restart services, or place trades.
+
 Dashboard V2:
 
 ```bash
@@ -415,6 +432,7 @@ date
 uptime
 df -h /
 cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python system_status.py
 test -f .env && echo ".env OK" || echo ".env MISSING"
 .venv/bin/python -m compileall -q . && echo "compile OK"
 .venv/bin/python tests/smoke_test.py

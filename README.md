@@ -260,11 +260,37 @@ Executive Report V2 shows compact sections for Performance, Best, Watch, Product
 - `POOR TIMING`: skip recommendations are at least 60%.
 - `MIXED`: no dominant timing condition.
 
-## Production Readiness RC1
+## Production V1 Status Console
 
-RC1 freezes feature expansion and adds operational tools for stable daily use. These commands do not change scanner logic, scoring, routing, Cornix format, TP/SL, RR, or outcomes.
+Preferred daily command on VPS:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python system_status.py
+```
+
+Optional JSON output:
+
+```bash
+.venv/bin/python system_status.py --json
+```
+
+Optional shell alias:
+
+```bash
+alias scanner-status='cd /opt/Crypto-Multi-Coin-Scanner && .venv/bin/python system_status.py'
+```
+
+Do not add the alias automatically in deployment scripts. The status console is
+read-only: it does not send Telegram, modify CSV logs, repair data, or restart
+services.
+
+## Production Readiness And V1 Operations
+
+V1 freezes feature expansion and adds operational tools for stable daily use. These commands do not change scanner logic, scoring, routing, Cornix format, TP/SL, RR, or outcomes.
 
 ```bat
+python system_status.py
 python production_health.py
 python data_integrity_audit.py
 python backup_runtime_data.py
@@ -279,6 +305,7 @@ python production_v1_readiness.py
 - `entry_timing_operational_summary.py` summarizes Entry Timing shadow rows and reports data readiness: `NOT ENOUGH DATA`, `EARLY DATA`, or `REVIEW READY`.
 - `position_watcher_state_cleanup.py` lists stale active Position Watcher state for already-closed rows. Default is dry-run only.
 - `production_v1_readiness.py` summarizes health, data integrity, backups, reports, Entry Timing status, duplicate-alert protection, and active stale state count.
+- `system_status.py` prints the compact V1 production status dashboard for mobile SSH.
 
 Safe cleanup flow:
 
@@ -289,9 +316,10 @@ python position_watcher_state_cleanup.py --apply
 
 Run dry-run first. Never use `--apply` without reviewing the listed stale state keys. Apply mode preserves CSV history and removes only active runtime lock files tied to confirmed closed positions after creating a backup.
 
-Release snapshot and operations checklist:
+Release record and operations checklist:
 
 ```text
+PRODUCTION_V1.md
 RELEASE_CANDIDATE_V1.md
 DAILY_OPERATIONS.md
 ```
