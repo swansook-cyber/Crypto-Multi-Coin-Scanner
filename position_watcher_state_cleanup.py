@@ -74,6 +74,14 @@ class CleanupClassification:
     affected_symbols: list[str] | None = None
 
 
+@dataclass
+class WatcherRuntimeIndex:
+    open_identity_keys: set[str]
+    closed_identity_counts: dict[str, int]
+    canonical_lock_keys: dict[str, Path]
+    path_cache: dict[str, tuple[bool, str, Path | None]]
+
+
 def _series(df: pd.DataFrame, column: str, default: str = "") -> pd.Series:
     if column in df.columns:
         return df[column]
@@ -245,6 +253,28 @@ def canonical_lock_keys(journal_path: Path = JOURNAL) -> dict[str, Path]:
     return keys
 
 
+def build_runtime_index(df: pd.DataFrame, journal_path: Path = JOURNAL) -> WatcherRuntimeIndex:
+    return WatcherRuntimeIndex(
+        open_identity_keys=_open_identity_keys(df),
+        closed_identity_counts=_closed_identity_counts(df),
+        canonical_lock_keys=canonical_lock_keys(journal_path),
+        path_cache={},
+    )
+
+
+def cached_path_safety(
+    lock_file: Path,
+    journal_path: Path,
+    runtime_index: WatcherRuntimeIndex | None,
+) -> tuple[bool, str, Path | None]:
+    if runtime_index is None:
+        return path_safety(lock_file, journal_path)
+    cache_key = str(lock_file)
+    if cache_key not in runtime_index.path_cache:
+        runtime_index.path_cache[cache_key] = path_safety(lock_file, journal_path)
+    return runtime_index.path_cache[cache_key]
+
+
 def make_item(
     symbol: str,
     side: str,
@@ -283,7 +313,13 @@ def make_item(
     )
 
 
-def evaluate_row(row: pd.Series, df: pd.DataFrame, journal_path: Path = JOURNAL) -> StaleStateItem:
+def evaluate_row(
+    row: pd.Series,
+    df: pd.DataFrame,
+    journal_path: Path = JOURNAL,
+    runtime_index: WatcherRuntimeIndex | None = None,
+) -> StaleStateItem:
+    runtime_index = runtime_index or build_runtime_index(df, journal_path)
     symbol = normalize_symbol(row.get("symbol", ""))
     side = normalize_side(row.get("side", row.get("direction", "")))
     timestamp = "" if is_blank(row.get("timestamp", "")) else str(row.get("timestamp", "")).strip()
@@ -300,11 +336,11 @@ def evaluate_row(row: pd.Series, df: pd.DataFrame, journal_path: Path = JOURNAL)
     )
     position_closed = terminal_result(result)
     row_identity = identity_key(row)
-    active_runtime_state = bool(row_identity and row_identity in _open_identity_keys(df))
-    closed_counts = _closed_identity_counts(df)
+    active_runtime_state = bool(row_identity and row_identity in runtime_index.open_identity_keys)
+    closed_counts = runtime_index.closed_identity_counts
     lock_exists = bool(not lock_blank and lock_file.exists())
-    path_ok, path_reason, safe_path = path_safety(lock_file, journal_path) if not lock_blank else (False, "blank lock path", None)
-    canonical_active = bool(alert_key and alert_key.upper() in canonical_lock_keys(journal_path))
+    path_ok, path_reason, safe_path = cached_path_safety(lock_file, journal_path, runtime_index) if not lock_blank else (False, "blank lock path", None)
+    canonical_active = bool(alert_key and alert_key.upper() in runtime_index.canonical_lock_keys)
     identity_confidence = "deterministic" if row_identity and closed_counts.get(row_identity, 0) == 1 else "ambiguous" if row_identity else "missing"
 
     category = "HISTORICAL_CLOSED_ROW"
@@ -340,6 +376,7 @@ def all_state_items(journal_path: Path = JOURNAL) -> list[StaleStateItem]:
     df = load_journal(journal_path)
     if df.empty:
         return []
+    runtime_index = build_runtime_index(df, journal_path)
     rows = []
     for _, row in df.iterrows():
         watcher_columns = [
@@ -354,7 +391,7 @@ def all_state_items(journal_path: Path = JOURNAL) -> list[StaleStateItem]:
         has_active_watcher_values = any(column in row.index and audit_field_present(row.get(column)) for column in watcher_columns)
         has_watcher_fields = has_active_watcher_values or (terminal_result(row.get("result", "")) and has_watcher_columns)
         if has_watcher_fields:
-            rows.append(evaluate_row(row, df, journal_path))
+            rows.append(evaluate_row(row, df, journal_path, runtime_index))
     return rows
 
 

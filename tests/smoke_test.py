@@ -14,6 +14,7 @@ import tempfile
 import sys
 import os
 import shutil
+import time
 
 import pandas as pd
 
@@ -4048,6 +4049,74 @@ def test_entry_timing_truth_layer_sources_and_coverage() -> None:
             pass
 
 
+def test_data_integrity_entry_timing_indexed_benchmark() -> None:
+    temp_dir = Path(tempfile.gettempdir()) / "entry_timing_indexed_benchmark_smoke"
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(exist_ok=True)
+    candidate_path = temp_dir / "scanner_candidates.csv"
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "SUIUSDT", "INJUSDT"]
+    base = pd.Timestamp("2026-07-02T00:00:00Z")
+    journal_rows = []
+    candidate_rows = []
+    for index in range(5000):
+        side = "LONG" if index % 2 == 0 else "SHORT"
+        entry_price = 100 + (index % 50) * 0.1
+        row = {
+            "signal_id": f"sig-{index}",
+            "timestamp": (base + pd.Timedelta(minutes=15 * index)).isoformat(),
+            "symbol": symbols[index % len(symbols)],
+            "side": side,
+            "entry": entry_price,
+            "stop_loss": entry_price - 1 if side == "LONG" else entry_price + 1,
+            "tp1": entry_price + 2 if side == "LONG" else entry_price - 2,
+            "signal_status": "sent",
+            "result": "OPEN",
+        }
+        if index % 10 == 0:
+            candidate_rows.append(row.copy())
+        else:
+            journal_rows.append(row)
+    try:
+        pd.DataFrame(candidate_rows).to_csv(candidate_path, index=False)
+        entry_rows = []
+        for index, source in enumerate(journal_rows[:196]):
+            entry_rows.append(
+                {
+                    "source_signal_id": source["signal_id"],
+                    "final_signal_timestamp": source["timestamp"],
+                    "symbol": source["symbol"],
+                    "direction": source["side"],
+                    "entry": source["entry"],
+                    "sl": source["stop_loss"],
+                    "tp1": source["tp1"],
+                }
+            )
+        for source in candidate_rows[:2]:
+            entry_rows.append(
+                {
+                    "final_signal_timestamp": source["timestamp"],
+                    "symbol": source["symbol"],
+                    "direction": source["side"],
+                    "entry": source["entry"],
+                    "sl": source["stop_loss"],
+                    "tp1": source["tp1"],
+                }
+            )
+        entry_rows.append({"final_signal_timestamp": "2026-08-01T00:00:00+00:00", "symbol": "ORPHANUSDT", "direction": "LONG", "entry": 1, "sl": 0.9, "tp1": 1.1})
+        entry_rows.append(entry_rows[-1].copy())
+        started = time.perf_counter()
+        provenances = data_integrity_audit.classify_entry_timing_rows(pd.DataFrame(entry_rows), pd.DataFrame(journal_rows), logs_dir=temp_dir)
+        elapsed = time.perf_counter() - started
+        summary = data_integrity_audit.summarize_entry_timing_truth(provenances)
+        assert summary.total == 200
+        assert summary.counts["MATCHED_SENT_SIGNAL"] == 196
+        assert summary.counts["MATCHED_PRE_FINAL_CANDIDATE"] == 2
+        assert summary.counts["DUPLICATE_ROW"] == 2
+        assert elapsed < 10.0
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def test_position_watcher_state_audit_categories() -> None:
     temp_dir = Path(tempfile.gettempdir())
     journal_path = temp_dir / "watcher_state_audit_smoke.csv"
@@ -4556,6 +4625,7 @@ def main() -> int:
     test_entry_timing_audit_classifications()
     test_entry_timing_audit_deterministic_matching()
     test_entry_timing_truth_layer_sources_and_coverage()
+    test_data_integrity_entry_timing_indexed_benchmark()
     test_position_watcher_state_audit_categories()
     test_position_watcher_state_cleanup_dry_run_and_apply()
     test_position_watcher_state_cleanup_safety_verdicts()

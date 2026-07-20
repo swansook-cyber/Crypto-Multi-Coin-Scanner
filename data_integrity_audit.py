@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -127,6 +130,55 @@ class EntryTimingTruthSummary:
     samples: list[EntryTimingProvenance]
 
 
+@dataclass(frozen=True)
+class CandidateRecord:
+    index: int
+    source_key: str
+    source_name: str
+    provenance: str
+    ids: frozenset[str]
+    symbol: str
+    direction: str
+    timestamp: pd.Timestamp | pd.NaT
+    entry: float | None
+    sl: float | None
+    tp1: float | None
+
+
+@dataclass
+class SourceIndex:
+    source_key: str
+    source_name: str
+    provenance: str
+    records: list[CandidateRecord]
+    by_id: dict[str, list[CandidateRecord]]
+    by_pair: dict[tuple[str, str], list[CandidateRecord]]
+
+
+class AuditProfiler:
+    def __init__(self) -> None:
+        self.timings: list[tuple[str, float]] = []
+
+    def stage(self, name: str):
+        profiler = self
+
+        class _Stage:
+            def __enter__(self) -> None:
+                self.start = time.perf_counter()
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                profiler.timings.append((name, time.perf_counter() - self.start))
+
+        return _Stage()
+
+    def print(self) -> None:
+        total = sum(seconds for _, seconds in self.timings)
+        width = max([len(name) for name, _ in self.timings] + [5])
+        for name, seconds in self.timings:
+            print(f"{name:<{width}} .... {seconds:.3f}s")
+        print(f"{'Total':<{width}} .... {total:.3f}s")
+
+
 @dataclass
 class WatcherStateClassification:
     historical_flags: int
@@ -165,10 +217,17 @@ def is_blank(value: Any) -> bool:
     return str(value).strip().lower() in {"", "nan", "none", "null", "<na>"}
 
 
-def normalize_symbol(value: Any) -> str:
+def _cache_key(value: Any) -> str:
     if is_blank(value):
         return ""
-    text = str(value).strip().upper()
+    return str(value).strip()
+
+
+@lru_cache(maxsize=20000)
+def _normalize_symbol_cached(text: str) -> str:
+    if not text:
+        return ""
+    text = text.strip().upper()
     if ":" in text:
         text = text.split(":")[-1]
     text = text.replace("#", "").replace(".P", "").replace("PERP", "")
@@ -176,8 +235,13 @@ def normalize_symbol(value: Any) -> str:
     return "".join(ch for ch in text if ch.isalnum())
 
 
-def normalize_direction(value: Any) -> str:
-    text = "" if is_blank(value) else str(value).strip().upper()
+def normalize_symbol(value: Any) -> str:
+    return _normalize_symbol_cached(_cache_key(value))
+
+
+@lru_cache(maxsize=1000)
+def _normalize_direction_cached(text: str) -> str:
+    text = text.strip().upper()
     if text == "BUY":
         return "LONG"
     if text == "SELL":
@@ -185,19 +249,33 @@ def normalize_direction(value: Any) -> str:
     return text if text in {"LONG", "SHORT"} else ""
 
 
-def parse_utc(value: Any) -> pd.Timestamp | pd.NaT:
-    if is_blank(value):
+def normalize_direction(value: Any) -> str:
+    return _normalize_direction_cached(_cache_key(value))
+
+
+@lru_cache(maxsize=50000)
+def _parse_utc_cached(text: str) -> pd.Timestamp | pd.NaT:
+    if not text:
         return pd.NaT
-    return pd.to_datetime(value, utc=True, errors="coerce")
+    return pd.to_datetime(text, utc=True, errors="coerce")
 
 
-def numeric_value(value: Any) -> float | None:
-    if is_blank(value):
+def parse_utc(value: Any) -> pd.Timestamp | pd.NaT:
+    return _parse_utc_cached(_cache_key(value))
+
+
+@lru_cache(maxsize=50000)
+def _numeric_value_cached(text: str) -> float | None:
+    if not text:
         return None
-    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    numeric = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
     if pd.isna(numeric):
         return None
     return float(numeric)
+
+
+def numeric_value(value: Any) -> float | None:
+    return _numeric_value_cached(_cache_key(value))
 
 
 def price_close(left: Any, right: Any, rel_tol: float = 0.0005) -> bool:
@@ -273,7 +351,18 @@ def _source_frame(df: pd.DataFrame, source_name: str, provenance: str) -> pd.Dat
     return frame
 
 
-def load_entry_timing_sources(journal: pd.DataFrame, logs_dir: Path = LOGS_DIR) -> dict[str, pd.DataFrame]:
+def load_entry_timing_sources(journal: pd.DataFrame, logs_dir: Path = LOGS_DIR, profiler: AuditProfiler | None = None) -> dict[str, pd.DataFrame]:
+    stage = profiler.stage("Load sources") if profiler else None
+    if stage:
+        stage.__enter__()
+    try:
+        return _load_entry_timing_sources_impl(journal, logs_dir)
+    finally:
+        if stage:
+            stage.__exit__(None, None, None)
+
+
+def _load_entry_timing_sources_impl(journal: pd.DataFrame, logs_dir: Path = LOGS_DIR) -> dict[str, pd.DataFrame]:
     sources: dict[str, pd.DataFrame] = {}
     if not journal.empty:
         status = _series(journal, "signal_status").fillna("").astype(str).str.lower()
@@ -304,45 +393,103 @@ def load_entry_timing_sources(journal: pd.DataFrame, logs_dir: Path = LOGS_DIR) 
     return sources
 
 
-def _source_matches(entry_row: pd.Series, source: pd.DataFrame) -> tuple[list[int], str]:
-    if source.empty:
+def _candidate_timestamp(row: pd.Series) -> pd.Timestamp | pd.NaT:
+    return _journal_timestamp(row)
+
+
+def build_source_indexes(sources: dict[str, pd.DataFrame], profiler: AuditProfiler | None = None) -> dict[str, SourceIndex]:
+    with profiler.stage("Build indexes") if profiler else _nullcontext():
+        indexes: dict[str, SourceIndex] = {}
+        for source_key, source_df in sources.items():
+            if source_df.empty:
+                indexes[source_key] = SourceIndex(source_key, "", "", [], {}, {})
+                continue
+            source_name = str(source_df["_source_name"].iloc[0]) if "_source_name" in source_df.columns else source_key
+            provenance = str(source_df["_provenance"].iloc[0]) if "_provenance" in source_df.columns else ""
+            records: list[CandidateRecord] = []
+            by_id: dict[str, list[CandidateRecord]] = {}
+            by_pair: dict[tuple[str, str], list[CandidateRecord]] = {}
+            for index, row in source_df.iterrows():
+                symbol = normalize_symbol(row.get("normalized_symbol", row.get("symbol", "")))
+                direction = normalize_direction(row.get("normalized_direction", row.get("side", row.get("direction", ""))))
+                ids = frozenset(_identity_values(row))
+                record = CandidateRecord(
+                    int(index),
+                    source_key,
+                    source_name,
+                    provenance,
+                    ids,
+                    symbol,
+                    direction,
+                    _candidate_timestamp(row),
+                    numeric_value(row.get("entry", "")),
+                    numeric_value(row.get("stop_loss", row.get("sl", ""))),
+                    numeric_value(row.get("tp1", "")),
+                )
+                records.append(record)
+                for identity in ids:
+                    by_id.setdefault(identity, []).append(record)
+                if symbol and direction:
+                    by_pair.setdefault((symbol, direction), []).append(record)
+            indexes[source_key] = SourceIndex(source_key, source_name, provenance, records, by_id, by_pair)
+        return indexes
+
+
+class _nullcontext:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+def _record_matches(entry_identity: dict[str, Any], timestamp: pd.Timestamp | pd.NaT, record: CandidateRecord) -> tuple[bool, str]:
+    if not _timestamp_close(timestamp, record.timestamp):
+        return False, "timestamp outside tolerance"
+    if not price_close(entry_identity.get("entry"), record.entry):
+        return False, "price mismatch"
+    entry_tp1 = entry_identity.get("tp1")
+    entry_sl = entry_identity.get("sl")
+    if entry_tp1 is not None and not price_close(entry_tp1, record.tp1):
+        return False, "price mismatch"
+    if entry_sl is not None and not price_close(entry_sl, record.sl):
+        return False, "price mismatch"
+    return True, "symbol/direction/time/price"
+
+
+def _source_matches_indexed(entry_row: pd.Series, source_index: SourceIndex, entry_identity: dict[str, Any] | None = None) -> tuple[list[CandidateRecord], str]:
+    if not source_index.records:
         return [], "source empty"
     entry_ids = _identity_values(entry_row)
     if entry_ids:
-        id_matches = [int(index) for index, row in source.iterrows() if entry_ids & _identity_values(row)]
+        id_matches: list[CandidateRecord] = []
+        seen: set[tuple[str, int]] = set()
+        for identity in entry_ids:
+            for record in source_index.by_id.get(identity, []):
+                key = (record.source_key, record.index)
+                if key not in seen:
+                    id_matches.append(record)
+                    seen.add(key)
         if id_matches:
             return id_matches, "explicit id"
 
-    identity = _row_identity(entry_row)
+    identity = entry_identity or _row_identity(entry_row)
     if not _identity_complete(identity):
         return [], "missing identity fields"
 
     timestamp = _entry_timestamp(entry_row)
-    possible: list[int] = []
+    candidates = source_index.by_pair.get((identity["symbol"], identity["direction"]), [])
+    possible: list[CandidateRecord] = []
     rejected_by_time = 0
     rejected_by_price = 0
-    for index, signal_row in source.iterrows():
-        signal_symbol = normalize_symbol(signal_row.get("normalized_symbol", signal_row.get("symbol", "")))
-        signal_direction = normalize_direction(signal_row.get("normalized_direction", signal_row.get("side", signal_row.get("direction", ""))))
-        if not signal_symbol or not signal_direction:
-            continue
-        if identity["symbol"] != signal_symbol or identity["direction"] != signal_direction:
-            continue
-        if not _timestamp_close(timestamp, _journal_timestamp(signal_row)):
+    for record in candidates:
+        matched, reason = _record_matches(identity, timestamp, record)
+        if matched:
+            possible.append(record)
+        elif reason == "timestamp outside tolerance":
             rejected_by_time += 1
-            continue
-        if not price_close(identity["entry"], signal_row.get("entry")):
+        elif reason == "price mismatch":
             rejected_by_price += 1
-            continue
-        entry_tp1 = identity.get("tp1")
-        entry_sl = identity.get("sl")
-        if entry_tp1 is not None and not price_close(entry_tp1, signal_row.get("tp1")):
-            rejected_by_price += 1
-            continue
-        if entry_sl is not None and not price_close(entry_sl, signal_row.get("stop_loss", signal_row.get("sl"))):
-            rejected_by_price += 1
-            continue
-        possible.append(int(index))
     if possible:
         return possible, "symbol/direction/time/price"
     if rejected_by_time:
@@ -352,56 +499,63 @@ def _source_matches(entry_row: pd.Series, source: pd.DataFrame) -> tuple[list[in
     return [], "no candidate in source"
 
 
-def classify_entry_timing_rows(entry: pd.DataFrame, journal: pd.DataFrame, logs_dir: Path = LOGS_DIR) -> list[EntryTimingProvenance]:
+def classify_entry_timing_rows(
+    entry: pd.DataFrame,
+    journal: pd.DataFrame,
+    logs_dir: Path = LOGS_DIR,
+    profiler: AuditProfiler | None = None,
+) -> list[EntryTimingProvenance]:
     if entry.empty:
         return []
-    duplicate_mask = _entry_duplicate_mask(entry)
-    timestamp_source = _series(entry, "final_signal_timestamp") if "final_signal_timestamp" in entry.columns else _series(entry, "timestamp")
-    timestamps = pd.to_datetime(timestamp_source, utc=True, errors="coerce")
-    sources = load_entry_timing_sources(journal, logs_dir=logs_dir)
-    provenances: list[EntryTimingProvenance] = []
-    for index, row in entry.iterrows():
-        identity = _row_identity(row)
-        if bool(duplicate_mask.loc[index]):
-            category = "DUPLICATE_ROW"
-            provenances.append(EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], "duplicate Entry Timing identity", identity=identity))
-            continue
+    with profiler.stage("Normalize records") if profiler else _nullcontext():
+        duplicate_mask = _entry_duplicate_mask(entry)
+        timestamp_source = _series(entry, "final_signal_timestamp") if "final_signal_timestamp" in entry.columns else _series(entry, "timestamp")
+        timestamps = pd.to_datetime(timestamp_source, utc=True, errors="coerce")
+        entry_records = [(index, row, _row_identity(row)) for index, row in entry.iterrows()]
+    sources = load_entry_timing_sources(journal, logs_dir=logs_dir, profiler=profiler)
+    indexes = build_source_indexes(sources, profiler=profiler)
+    with profiler.stage("Entry Timing match") if profiler else _nullcontext():
+        provenances: list[EntryTimingProvenance] = []
+        for index, row, identity in entry_records:
+            if bool(duplicate_mask.loc[index]):
+                category = "DUPLICATE_ROW"
+                provenances.append(EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], "duplicate Entry Timing identity", identity=identity))
+                continue
 
-        source_results: list[tuple[str, str, list[int], str]] = []
-        search_counts: dict[str, int] = {}
-        for source_key, source_df in sources.items():
-            matches, reason = _source_matches(row, source_df)
-            provenance = str(source_df["_provenance"].iloc[0]) if not source_df.empty and "_provenance" in source_df.columns else ""
-            search_counts[source_key] = len(matches)
-            if matches and provenance:
-                source_results.append((source_key, provenance, matches, reason))
+            source_results: list[tuple[str, str, list[CandidateRecord], str]] = []
+            search_counts: dict[str, int] = {}
+            for source_key, source_index in indexes.items():
+                matches, reason = _source_matches_indexed(row, source_index, identity)
+                search_counts[source_key] = len(matches)
+                if matches and source_index.provenance:
+                    source_results.append((source_key, source_index.provenance, matches, reason))
 
-        if len(source_results) == 1 and len(source_results[0][2]) == 1:
-            source_key, category, matches, reason = source_results[0]
-            provenances.append(
-                EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], reason, source_key, len(matches), search_counts, identity)
-            )
-            continue
-        if source_results:
-            category = "AMBIGUOUS_PROVENANCE"
-            match_count = sum(len(item[2]) for item in source_results)
-            provenances.append(
-                EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], "duplicate candidates across sources", ",".join(item[0] for item in source_results), match_count, search_counts, identity)
-            )
-            continue
+            if len(source_results) == 1 and len(source_results[0][2]) == 1:
+                source_key, category, matches, reason = source_results[0]
+                provenances.append(
+                    EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], reason, source_key, len(matches), search_counts, identity)
+                )
+                continue
+            if source_results:
+                category = "AMBIGUOUS_PROVENANCE"
+                match_count = sum(len(item[2]) for item in source_results)
+                provenances.append(
+                    EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], "duplicate candidates across sources", ",".join(item[0] for item in source_results), match_count, search_counts, identity)
+                )
+                continue
 
-        row_timestamp = timestamps.loc[index]
-        if pd.isna(row_timestamp) or row_timestamp < ENTRY_TIMING_FINAL_CANDIDATE_INTEGRATION_UTC:
-            category = "LEGACY_SHADOW_ROW"
-            reason = "unsupported legacy schema" if pd.isna(row_timestamp) else "row before final-candidate integration"
-        elif not _identity_complete(identity):
-            category = "TRUE_ORPHAN"
-            reason = "missing identity fields"
-        else:
-            category = "TRUE_ORPHAN"
-            reason = "no candidate in any source"
-        provenances.append(EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], reason, "", 0, search_counts, identity))
-    return provenances
+            row_timestamp = timestamps.loc[index]
+            if pd.isna(row_timestamp) or row_timestamp < ENTRY_TIMING_FINAL_CANDIDATE_INTEGRATION_UTC:
+                category = "LEGACY_SHADOW_ROW"
+                reason = "unsupported legacy schema" if pd.isna(row_timestamp) else "row before final-candidate integration"
+            elif not _identity_complete(identity):
+                category = "TRUE_ORPHAN"
+                reason = "missing identity fields"
+            else:
+                category = "TRUE_ORPHAN"
+                reason = "no candidate in any source"
+            provenances.append(EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], reason, "", 0, search_counts, identity))
+        return provenances
 
 
 def summarize_entry_timing_truth(provenances: list[EntryTimingProvenance]) -> EntryTimingTruthSummary:
@@ -615,13 +769,13 @@ def classify_entry_timing(entry: pd.DataFrame, journal: pd.DataFrame) -> EntryTi
     )
 
 
-def audit_entry_timing(entry: pd.DataFrame, journal: pd.DataFrame, verbose: bool = False) -> list[AuditFinding]:
+def audit_entry_timing(entry: pd.DataFrame, journal: pd.DataFrame, verbose: bool = False, profiler: AuditProfiler | None = None) -> list[AuditFinding]:
     findings: list[AuditFinding] = []
     if entry.empty:
         findings.append(AuditFinding("INFO", "Entry Timing rows", "logs/entry_timing_engine.csv has no rows"))
         return findings
-    classification = classify_entry_timing(entry, journal)
-    truth = summarize_entry_timing_truth(classify_entry_timing_rows(entry, journal))
+    provenances = classify_entry_timing_rows(entry, journal, profiler=profiler)
+    truth = summarize_entry_timing_truth(provenances)
     findings.append(
         AuditFinding(
             "PASS",
@@ -644,9 +798,9 @@ def audit_entry_timing(entry: pd.DataFrame, journal: pd.DataFrame, verbose: bool
     for category, count in truth.counts.items():
         if count and category != "MATCHED_SENT_SIGNAL":
             findings.append(AuditFinding(ENTRY_PROVENANCE_SEVERITY[category], category, f"{count} Entry Timing rows"))
-    if verbose and classification.samples:
-        for sample in classification.samples:
-            findings.append(AuditFinding("INFO", "ENTRY_TIMING_SAMPLE", sample))
+    if verbose and truth.samples:
+        for item in truth.samples[:5]:
+            findings.append(AuditFinding("INFO", "ENTRY_TIMING_SAMPLE", _sample_entry(pd.Series(item.identity or {}), item.reason)))
     return findings
 
 
@@ -705,17 +859,20 @@ def audit_stale_watcher_state(journal: pd.DataFrame, journal_path: Path = JOURNA
     return findings
 
 
-def audit_paths(journal_path: Path = JOURNAL, entry_path: Path = ENTRY_TIMING, verbose: bool = False) -> list[AuditFinding]:
-    journal, journal_error = _load_csv(journal_path)
-    entry, entry_error = _load_csv(entry_path)
+def audit_paths(journal_path: Path = JOURNAL, entry_path: Path = ENTRY_TIMING, verbose: bool = False, profiler: AuditProfiler | None = None) -> list[AuditFinding]:
+    with profiler.stage("Load runtime CSV") if profiler else _nullcontext():
+        journal, journal_error = _load_csv(journal_path)
+        entry, entry_error = _load_csv(entry_path)
     findings = [item for item in [journal_error] if item is not None]
     if entry_error is not None:
         findings.append(AuditFinding("INFO", "Entry Timing rows", f"{entry_path} missing; no shadow rows yet"))
     if journal_error is None:
-        findings.extend(audit_journal(journal))
+        with profiler.stage("Journal audit") if profiler else _nullcontext():
+            findings.extend(audit_journal(journal))
     if entry_error is None:
-        findings.extend(audit_entry_timing(entry, journal, verbose=verbose))
-    findings.extend(audit_stale_watcher_state(journal, journal_path=journal_path))
+        findings.extend(audit_entry_timing(entry, journal, verbose=verbose, profiler=profiler))
+    with profiler.stage("Watcher audit") if profiler else _nullcontext():
+        findings.extend(audit_stale_watcher_state(journal, journal_path=journal_path))
     if not findings:
         findings.append(AuditFinding("PASS", "data integrity audit", "no issues detected"))
     return findings
@@ -824,6 +981,98 @@ def entry_timing_summary_dict(summary: EntryTimingTruthSummary) -> dict[str, Any
     }
 
 
+def _benchmark_frames(rows: int = 5000, entry_rows: int = 200) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "LINKUSDT", "AVAXUSDT", "SUIUSDT", "INJUSDT"]
+    journal_rows: list[dict[str, Any]] = []
+    candidate_rows: list[dict[str, Any]] = []
+    base = pd.Timestamp("2026-07-01T00:00:00Z")
+    for index in range(rows):
+        symbol = symbols[index % len(symbols)]
+        side = "LONG" if index % 2 == 0 else "SHORT"
+        timestamp = (base + pd.Timedelta(minutes=15 * index)).isoformat()
+        entry = round(100 + (index % 100) * 0.25, 6)
+        tp1 = round(entry + 1.0 if side == "LONG" else entry - 1.0, 6)
+        stop = round(entry - 0.75 if side == "LONG" else entry + 0.75, 6)
+        row = {
+            "signal_id": f"sig-{index}",
+            "timestamp": timestamp,
+            "symbol": symbol,
+            "side": side,
+            "entry": entry,
+            "stop_loss": stop,
+            "tp1": tp1,
+            "signal_status": "sent" if index % 3 else "skipped_quality_filter",
+            "result": "OPEN",
+        }
+        if index % 5 == 0:
+            candidate_rows.append(row.copy())
+        else:
+            journal_rows.append(row)
+
+    entry_data: list[dict[str, Any]] = []
+    sent_rows = [row for row in journal_rows if row["signal_status"] == "sent"]
+    for index in range(entry_rows):
+        if index < entry_rows - 4:
+            source = sent_rows[index % len(sent_rows)]
+            entry_data.append(
+                {
+                    "source_signal_id": source["signal_id"],
+                    "final_signal_timestamp": source["timestamp"],
+                    "symbol": source["symbol"],
+                    "direction": source["side"],
+                    "entry": source["entry"],
+                    "sl": source["stop_loss"],
+                    "tp1": source["tp1"],
+                }
+            )
+        elif index < entry_rows - 2:
+            source = candidate_rows[index % len(candidate_rows)]
+            entry_data.append(
+                {
+                    "final_signal_timestamp": source["timestamp"],
+                    "symbol": source["symbol"],
+                    "direction": source["side"],
+                    "entry": source["entry"],
+                    "sl": source["stop_loss"],
+                    "tp1": source["tp1"],
+                }
+            )
+        else:
+            entry_data.append(
+                {
+                    "final_signal_timestamp": (base + pd.Timedelta(days=30, minutes=index)).isoformat(),
+                    "symbol": f"ORPHAN{index}USDT",
+                    "direction": "LONG",
+                    "entry": 1.0,
+                    "sl": 0.9,
+                    "tp1": 1.1,
+                }
+            )
+    return pd.DataFrame(journal_rows), pd.DataFrame(candidate_rows), pd.DataFrame(entry_data)
+
+
+def run_benchmark(rows: int = 5000, entry_rows: int = 200) -> int:
+    journal, candidates, entry = _benchmark_frames(rows=rows, entry_rows=entry_rows)
+    with tempfile.TemporaryDirectory(prefix="crypto_audit_benchmark_") as tmp:
+        logs_dir = Path(tmp)
+        candidates.to_csv(logs_dir / "scanner_candidates.csv", index=False)
+        profiler = AuditProfiler()
+        started = time.perf_counter()
+        provenances = classify_entry_timing_rows(entry, journal, logs_dir=logs_dir, profiler=profiler)
+        elapsed = time.perf_counter() - started
+        summary = summarize_entry_timing_truth(provenances)
+    print("Data Integrity Audit Benchmark")
+    print(f"Source rows: {rows}")
+    print(f"Entry Timing rows: {entry_rows}")
+    print(f"Elapsed: {elapsed:.3f}s")
+    print(f"Matched approved/sent: {summary.counts.get('MATCHED_SENT_SIGNAL', 0) + summary.counts.get('MATCHED_APPROVED_SIGNAL', 0)}")
+    print(f"Pre-final matches: {summary.counts.get('MATCHED_PRE_FINAL_CANDIDATE', 0)}")
+    print(f"True orphans: {summary.counts.get('TRUE_ORPHAN', 0)}")
+    print("")
+    profiler.print()
+    return 0
+
+
 def exit_code(findings: list[AuditFinding]) -> int:
     if any(item.severity == "FAIL" for item in findings):
         return 2
@@ -841,16 +1090,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--entry-timing-diagnostics", action="store_true", help="Explain TRUE_ORPHAN and AMBIGUOUS Entry Timing rows.")
     parser.add_argument("--limit", type=int, default=20, help="Limit diagnostic samples.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON summary.")
+    parser.add_argument("--profile", action="store_true", help="Print compact stage timings for the read-only audit.")
+    parser.add_argument("--benchmark", action="store_true", help="Run a synthetic Entry Timing provenance benchmark without touching runtime logs.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.benchmark:
+        return run_benchmark()
     if args.repair_safe:
         for path in [args.journal, args.entry_timing]:
             changed, backup = repair_safe(path)
             if changed:
                 print(f"SAFE_REPAIR | {path} | changes={changed} | backup={backup}")
+    if args.profile:
+        profiler = AuditProfiler()
+        findings = audit_paths(args.journal, args.entry_timing, verbose=args.verbose, profiler=profiler)
+        print_findings(findings)
+        print("")
+        print("Audit Profile")
+        profiler.print()
+        return exit_code(findings)
     journal, journal_error = _load_csv(args.journal)
     entry, entry_error = _load_csv(args.entry_timing)
     if args.entry_timing_diagnostics:

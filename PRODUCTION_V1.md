@@ -19,6 +19,9 @@ exchange positions.
 - `performance_report.py`: Executive Telegram summary and full analytics report.
 - `dashboard.py`: read-only local analytics dashboard.
 - `system_status.py`: compact read-only production status console.
+- `data_integrity_audit.py --profile`: compact read-only audit timing report.
+- `data_integrity_audit.py --benchmark`: synthetic provenance benchmark that does
+  not touch runtime logs.
 
 ## Active Services
 
@@ -50,6 +53,8 @@ These modes are report-only experiments and must not change scanner scoring:
 - Entry Timing recommendations are not enforced in production.
 - Cornix breakeven command format may require live channel validation.
 - Dashboard and reports are read-only and depend on journal data quality.
+- Audit performance diagnostics are observability-only and do not alter
+  historical CSV values.
 
 ## Backup And Rollback
 

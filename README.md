@@ -293,6 +293,8 @@ V1 freezes feature expansion and adds operational tools for stable daily use. Th
 python system_status.py
 python production_health.py
 python data_integrity_audit.py
+python data_integrity_audit.py --profile
+python data_integrity_audit.py --benchmark
 python backup_runtime_data.py
 python entry_timing_operational_summary.py
 python position_watcher_state_cleanup.py
@@ -300,7 +302,7 @@ python production_v1_readiness.py
 ```
 
 - `production_health.py` checks environment, Telegram channel configuration, Binance Futures reachability, CSV read/write, report generation, web report generation, duplicate-alert locks, disk space, UTC clock sanity, imports, and systemd service health when available.
-- `data_integrity_audit.py` audits runtime CSVs read-only by default. `--repair-safe` only normalizes safe boolean values and removes exact duplicate analytics rows after backup; it never changes wins, losses, prices, TP/SL, or outcomes.
+- `data_integrity_audit.py` audits runtime CSVs read-only by default. `--profile` shows stage timings, and `--benchmark` runs a synthetic provenance benchmark without touching runtime logs. `--repair-safe` only normalizes safe boolean values and removes exact duplicate analytics rows after backup; it never changes wins, losses, prices, TP/SL, or outcomes.
 - `backup_runtime_data.py` writes `backups/runtime_<UTC_TIMESTAMP>.zip` and excludes `.env`, tokens, passwords, private keys, and real config files.
 - `entry_timing_operational_summary.py` summarizes Entry Timing shadow rows and reports data readiness: `NOT ENOUGH DATA`, `EARLY DATA`, or `REVIEW READY`.
 - `position_watcher_state_cleanup.py` lists stale active Position Watcher state for already-closed rows. Default is dry-run only.

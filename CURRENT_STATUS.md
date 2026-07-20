@@ -50,6 +50,7 @@
 - Production V1 release record via `PRODUCTION_V1.md`
 - RC1 release snapshot via `RELEASE_CANDIDATE_V1.md`
 - Daily VPS operations checklist via `DAILY_OPERATIONS.md`
+- RC1.4 audit performance optimization: `data_integrity_audit.py --profile` and `--benchmark` are available; stale watcher cleanup now builds runtime indexes once per run.
 
 ## Telegram Channels
 
@@ -120,6 +121,7 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 - Runtime CSV/log/chart/dashboard output should stay out of Git
 - `.env` and real API/chat IDs must not be committed
 - Use `python production_health.py`, `python data_integrity_audit.py`, and `python backup_runtime_data.py` before production updates
+- Use `python data_integrity_audit.py --profile` when audit runtime needs diagnosis; use `--benchmark` only for synthetic local performance checks
 - Use `python system_status.py` for compact daily VPS status checks
 - Run `python position_watcher_state_cleanup.py` in dry-run mode before any cleanup; use `--apply` only after reviewing the listed stale keys
 - Use `python production_v1_readiness.py` for the final V1 readiness summary

@@ -433,6 +433,7 @@ uptime
 df -h /
 cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python system_status.py
+.venv/bin/python data_integrity_audit.py --profile
 test -f .env && echo ".env OK" || echo ".env MISSING"
 .venv/bin/python -m compileall -q . && echo "compile OK"
 .venv/bin/python tests/smoke_test.py
@@ -505,3 +506,14 @@ cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python performance_report.py
 .venv/bin/streamlit run dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
+
+Slow data integrity audit:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python data_integrity_audit.py --profile
+.venv/bin/python data_integrity_audit.py --benchmark
+```
+
+`--profile` uses real runtime CSVs and prints compact stage timings. `--benchmark`
+uses synthetic temporary data only and does not modify `logs/`.
