@@ -4043,7 +4043,9 @@ def test_position_watcher_state_audit_categories() -> None:
 def test_position_watcher_state_cleanup_dry_run_and_apply() -> None:
     temp_dir = Path(tempfile.gettempdir())
     journal = temp_dir / "position_watcher_cleanup_smoke.csv"
-    lock = temp_dir / "position_watcher_cleanup_smoke.lock"
+    lock_dir = temp_dir / "position_watcher_cleanup_smoke_position_watcher_locks"
+    lock_dir.mkdir(exist_ok=True)
+    lock = lock_dir / "position_watcher_cleanup_smoke.lock"
     lock.write_text("created\nBTCUSDT|LONG|key\n", encoding="utf-8")
     try:
         pd.DataFrame(
@@ -4074,18 +4076,26 @@ def test_position_watcher_state_cleanup_dry_run_and_apply() -> None:
                 },
             ]
         ).to_csv(journal, index=False)
-        items, backup, removed = position_watcher_state_cleanup.cleanup(journal, apply=False)
+        items, backup, removed, verification = position_watcher_state_cleanup.cleanup(journal, apply=False)
         assert len(items) == 1
         assert items[0].symbol == "BTCUSDT"
+        assert items[0].verdict == position_watcher_state_cleanup.SAFE_TO_REMOVE
         assert items[0].removable is True
         assert backup is None
         assert removed == []
+        assert verification == "NOT_RUN"
         assert lock.exists()
-        items, backup, removed = position_watcher_state_cleanup.cleanup(journal, apply=True)
+
+        items, backup, removed, verification = position_watcher_state_cleanup.cleanup(journal, apply=True, confirm_count=0)
+        assert verification == "ABORT_CONFIRM_COUNT_MISMATCH"
+        assert lock.exists()
+
+        items, backup, removed, verification = position_watcher_state_cleanup.cleanup(journal, apply=True, confirm_count=1)
         assert len(items) == 1
         assert backup is not None and backup.exists()
         assert removed == [lock]
         assert not lock.exists()
+        assert verification == "PASS"
         saved = pd.read_csv(journal)
         assert saved.loc[0, "result"] == "WIN"
         assert saved.loc[0, "position_watcher_alert_key"] == "BTCUSDT|LONG|key"
@@ -4097,6 +4107,183 @@ def test_position_watcher_state_cleanup_dry_run_and_apply() -> None:
                 path.unlink()
             except OSError:
                 pass
+        try:
+            lock_dir.rmdir()
+        except OSError:
+            pass
+
+
+def test_position_watcher_state_cleanup_safety_verdicts() -> None:
+    temp_dir = Path(tempfile.gettempdir())
+    journal = temp_dir / "position_watcher_safety_smoke.csv"
+    lock_dir = position_watcher_state_cleanup.approved_lock_dir(journal)
+    lock_dir.mkdir(exist_ok=True)
+    safe_lock = lock_dir / "safe.lock"
+    safe_lock.write_text("safe", encoding="utf-8")
+    outside_lock = temp_dir / "outside.lock"
+    outside_lock.write_text("outside", encoding="utf-8")
+    missing_lock = lock_dir / "missing.lock"
+    symlink_lock = lock_dir / "escape.lock"
+    target = temp_dir / "escape_target.lock"
+    target.write_text("target", encoding="utf-8")
+    try:
+        try:
+            symlink_lock.symlink_to(target)
+        except (OSError, NotImplementedError):
+            symlink_lock.write_text("regular", encoding="utf-8")
+            symlink_expected_block = False
+        else:
+            symlink_expected_block = True
+        rows = [
+            {
+                "timestamp": "2026-06-01T00:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "entry": 100,
+                "tp1": 101,
+                "result": "WIN",
+                "position_watcher_lock_file": str(safe_lock),
+                "position_watcher_alert_key": "BTCUSDT|LONG|2026-06-01T00:00:00+00:00|100|101|100",
+            },
+            {
+                "timestamp": "2026-06-01T00:00:00+00:00",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "entry": 100,
+                "tp1": 101,
+                "result": "OPEN",
+                "position_watcher_lock_file": "",
+                "position_watcher_alert_key": "",
+            },
+            {
+                "timestamp": "2026-06-02T00:00:00+00:00",
+                "symbol": "ETHUSDT",
+                "side": "SHORT",
+                "entry": 50,
+                "tp1": 49,
+                "result": "LOSS",
+                "position_watcher_lock_file": str(outside_lock),
+                "position_watcher_alert_key": "ETHUSDT|SHORT|2026-06-02T00:00:00+00:00|50|49|50",
+            },
+            {
+                "timestamp": "2026-06-03T00:00:00+00:00",
+                "symbol": "SOLUSDT",
+                "side": "LONG",
+                "entry": 20,
+                "tp1": 21,
+                "result": "WIN",
+                "position_watcher_lock_file": str(missing_lock),
+                "position_watcher_alert_key": "SOLUSDT|LONG|2026-06-03T00:00:00+00:00|20|21|20",
+            },
+            {
+                "timestamp": "2026-06-04T00:00:00+00:00",
+                "symbol": "XRPUSDT",
+                "side": "LONG",
+                "entry": 1,
+                "tp1": 1.1,
+                "result": "WIN",
+                "position_watcher_lock_file": float("nan"),
+                "position_watcher_alert_key": float("nan"),
+                "tp1_alert_sent": 1,
+            },
+        ]
+        if symlink_expected_block:
+            rows.append(
+                {
+                    "timestamp": "2026-06-05T00:00:00+00:00",
+                    "symbol": "ADAUSDT",
+                    "side": "LONG",
+                    "entry": 1,
+                    "tp1": 1.1,
+                    "result": "WIN",
+                    "position_watcher_lock_file": str(symlink_lock),
+                    "position_watcher_alert_key": "ADAUSDT|LONG|2026-06-05T00:00:00+00:00|1|1.1|1",
+                }
+            )
+        pd.DataFrame(rows).to_csv(journal, index=False)
+        items = position_watcher_state_cleanup.all_state_items(journal)
+        by_symbol = {item.symbol: item for item in items if item.symbol}
+        assert by_symbol["BTCUSDT"].verdict == position_watcher_state_cleanup.DO_NOT_REMOVE_ACTIVE_RUNTIME
+        assert by_symbol["ETHUSDT"].verdict == position_watcher_state_cleanup.DO_NOT_REMOVE_UNCONFIRMED
+        assert by_symbol["SOLUSDT"].verdict == position_watcher_state_cleanup.HISTORICAL_ONLY
+        assert by_symbol["XRPUSDT"].verdict == position_watcher_state_cleanup.HISTORICAL_ONLY
+        if symlink_expected_block:
+            assert by_symbol["ADAUSDT"].verdict == position_watcher_state_cleanup.DO_NOT_REMOVE_UNCONFIRMED
+
+        # Different timestamp for the same symbol is unrelated and can be removed.
+        df = pd.read_csv(journal)
+        df.loc[1, "timestamp"] = "2026-06-01T02:00:00+00:00"
+        df.to_csv(journal, index=False)
+        items = position_watcher_state_cleanup.stale_state_items(journal)
+        assert len(items) == 1
+        assert items[0].symbol == "BTCUSDT"
+    finally:
+        for path in [journal, safe_lock, outside_lock, target, symlink_lock]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            lock_dir.rmdir()
+        except OSError:
+            pass
+
+
+def test_position_watcher_state_cleanup_apply_aborts_when_state_changes() -> None:
+    temp_dir = Path(tempfile.gettempdir())
+    journal = temp_dir / "position_watcher_state_change_smoke.csv"
+    lock_dir = position_watcher_state_cleanup.approved_lock_dir(journal)
+    lock_dir.mkdir(exist_ok=True)
+    first_lock = lock_dir / "first.lock"
+    second_lock = lock_dir / "second.lock"
+    first_lock.write_text("first", encoding="utf-8")
+    second_lock.write_text("second", encoding="utf-8")
+    rows = [
+        {
+            "timestamp": "2026-06-01T00:00:00+00:00",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "entry": 100,
+            "tp1": 101,
+            "result": "WIN",
+            "position_watcher_lock_file": str(first_lock),
+            "position_watcher_alert_key": "BTCUSDT|LONG|2026-06-01T00:00:00+00:00|100|101|100",
+        }
+    ]
+    try:
+        pd.DataFrame(rows).to_csv(journal, index=False)
+        assert len(position_watcher_state_cleanup.stale_state_items(journal)) == 1
+
+        rows.append(
+            {
+                "timestamp": "2026-06-02T00:00:00+00:00",
+                "symbol": "ETHUSDT",
+                "side": "SHORT",
+                "entry": 50,
+                "tp1": 49,
+                "result": "LOSS",
+                "position_watcher_lock_file": str(second_lock),
+                "position_watcher_alert_key": "ETHUSDT|SHORT|2026-06-02T00:00:00+00:00|50|49|50",
+            }
+        )
+        pd.DataFrame(rows).to_csv(journal, index=False)
+        items, backup, removed, verification = position_watcher_state_cleanup.cleanup(journal, apply=True, confirm_count=1)
+        assert verification == "ABORT_CONFIRM_COUNT_MISMATCH"
+        assert backup is None
+        assert removed == []
+        assert len(items) == 2
+        assert first_lock.exists()
+        assert second_lock.exists()
+    finally:
+        for path in [journal, first_lock, second_lock]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            lock_dir.rmdir()
+        except OSError:
+            pass
 
 
 def test_production_v1_readiness_exit_codes() -> None:
@@ -4295,6 +4482,8 @@ def main() -> int:
     test_entry_timing_audit_deterministic_matching()
     test_position_watcher_state_audit_categories()
     test_position_watcher_state_cleanup_dry_run_and_apply()
+    test_position_watcher_state_cleanup_safety_verdicts()
+    test_position_watcher_state_cleanup_apply_aborts_when_state_changes()
     test_production_v1_readiness_exit_codes()
     test_system_status_exit_codes_json_and_helpers()
     test_system_status_read_only_and_missing_optional_inputs()
