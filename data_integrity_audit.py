@@ -30,6 +30,17 @@ OPTIONAL_CANDIDATE_LOGS = [
     LOGS_DIR / "candidates.csv",
     LOGS_DIR / "candidate_signals.csv",
 ]
+SOURCE_PRIORITY = {
+    "sent": 10,
+    "report_only": 20,
+    "approved_history": 30,
+    "journal_rejected": 40,
+    "rejected": 50,
+    "scanner_candidates.csv": 60,
+    "signal_candidates.csv": 70,
+    "candidates.csv": 80,
+    "candidate_signals.csv": 90,
+}
 
 FINAL_STATUSES = {"WIN", "LOSS", "EXPIRED", "BREAKEVEN", "CLOSED", "TP", "SL", "TAKE_PROFIT", "STOP_LOSS"}
 OPEN_STATUSES = {"", "OPEN", "0"}
@@ -140,6 +151,8 @@ class CandidateRecord:
     symbol: str
     direction: str
     timestamp: pd.Timestamp | pd.NaT
+    timestamp_bucket: int | None
+    canonical_identity: str
     entry: float | None
     sl: float | None
     tp1: float | None
@@ -153,6 +166,7 @@ class SourceIndex:
     records: list[CandidateRecord]
     by_id: dict[str, list[CandidateRecord]]
     by_pair: dict[tuple[str, str], list[CandidateRecord]]
+    by_pair_hour: dict[tuple[str, str, int], list[CandidateRecord]]
 
 
 class AuditProfiler:
@@ -278,6 +292,25 @@ def numeric_value(value: Any) -> float | None:
     return _numeric_value_cached(_cache_key(value))
 
 
+def canonical_numeric(value: Any) -> str:
+    number = numeric_value(value)
+    if number is None:
+        return ""
+    return f"{number:.8f}".rstrip("0").rstrip(".")
+
+
+def timestamp_bucket(timestamp: pd.Timestamp | pd.NaT, seconds: int = 3600) -> int | None:
+    if pd.isna(timestamp):
+        return None
+    return int(timestamp.timestamp() // seconds)
+
+
+def canonical_timestamp(timestamp: pd.Timestamp | pd.NaT) -> str:
+    if pd.isna(timestamp):
+        return ""
+    return timestamp.floor("min").isoformat()
+
+
 def price_close(left: Any, right: Any, rel_tol: float = 0.0005) -> bool:
     left_num = numeric_value(left)
     right_num = numeric_value(right)
@@ -397,22 +430,66 @@ def _candidate_timestamp(row: pd.Series) -> pd.Timestamp | pd.NaT:
     return _journal_timestamp(row)
 
 
+def _record_canonical_identity(
+    symbol: str,
+    direction: str,
+    timestamp: pd.Timestamp | pd.NaT,
+    entry: float | None,
+    sl: float | None,
+    tp1: float | None,
+) -> str:
+    parts = [
+        symbol,
+        direction,
+        canonical_timestamp(timestamp),
+        canonical_numeric(entry),
+        canonical_numeric(sl),
+        canonical_numeric(tp1),
+    ]
+    return "|".join(parts)
+
+
+def _source_priority(source_key: str) -> int:
+    return SOURCE_PRIORITY.get(source_key, 100)
+
+
+def _best_record(records: list[CandidateRecord]) -> CandidateRecord:
+    return sorted(records, key=lambda record: (_source_priority(record.source_key), record.index))[0]
+
+
 def build_source_indexes(sources: dict[str, pd.DataFrame], profiler: AuditProfiler | None = None) -> dict[str, SourceIndex]:
     with profiler.stage("Build indexes") if profiler else _nullcontext():
         indexes: dict[str, SourceIndex] = {}
         for source_key, source_df in sources.items():
             if source_df.empty:
-                indexes[source_key] = SourceIndex(source_key, "", "", [], {}, {})
+                indexes[source_key] = SourceIndex(source_key, "", "", [], {}, {}, {})
                 continue
             source_name = str(source_df["_source_name"].iloc[0]) if "_source_name" in source_df.columns else source_key
             provenance = str(source_df["_provenance"].iloc[0]) if "_provenance" in source_df.columns else ""
             records: list[CandidateRecord] = []
             by_id: dict[str, list[CandidateRecord]] = {}
             by_pair: dict[tuple[str, str], list[CandidateRecord]] = {}
-            for index, row in source_df.iterrows():
-                symbol = normalize_symbol(row.get("normalized_symbol", row.get("symbol", "")))
-                direction = normalize_direction(row.get("normalized_direction", row.get("side", row.get("direction", ""))))
+            by_pair_hour: dict[tuple[str, str, int], list[CandidateRecord]] = {}
+            symbol_column = "normalized_symbol" if "normalized_symbol" in source_df.columns else "symbol"
+            direction_column = "normalized_direction" if "normalized_direction" in source_df.columns else "side" if "side" in source_df.columns else "direction"
+            stop_column = "stop_loss" if "stop_loss" in source_df.columns else "sl"
+            timestamp_column = "final_signal_timestamp" if "final_signal_timestamp" in source_df.columns else "timestamp"
+            symbols = _series(source_df, symbol_column).map(normalize_symbol).tolist()
+            directions = _series(source_df, direction_column).map(normalize_direction).tolist()
+            timestamps = [_parse_utc_cached(value) for value in _series(source_df, timestamp_column).fillna("").astype(str).str.strip().tolist()]
+            entries = [numeric_value(value) for value in _series(source_df, "entry").tolist()]
+            stops = [numeric_value(value) for value in _series(source_df, stop_column).tolist()]
+            tp1_values = [numeric_value(value) for value in _series(source_df, "tp1").tolist()]
+            rows = list(source_df.iterrows())
+            for position, (index, row) in enumerate(rows):
+                symbol = symbols[position]
+                direction = directions[position]
                 ids = frozenset(_identity_values(row))
+                candidate_timestamp = timestamps[position]
+                entry = entries[position]
+                sl = stops[position]
+                tp1 = tp1_values[position]
+                bucket = timestamp_bucket(candidate_timestamp)
                 record = CandidateRecord(
                     int(index),
                     source_key,
@@ -421,17 +498,21 @@ def build_source_indexes(sources: dict[str, pd.DataFrame], profiler: AuditProfil
                     ids,
                     symbol,
                     direction,
-                    _candidate_timestamp(row),
-                    numeric_value(row.get("entry", "")),
-                    numeric_value(row.get("stop_loss", row.get("sl", ""))),
-                    numeric_value(row.get("tp1", "")),
+                    candidate_timestamp,
+                    bucket,
+                    _record_canonical_identity(symbol, direction, candidate_timestamp, entry, sl, tp1),
+                    entry,
+                    sl,
+                    tp1,
                 )
                 records.append(record)
                 for identity in ids:
                     by_id.setdefault(identity, []).append(record)
                 if symbol and direction:
                     by_pair.setdefault((symbol, direction), []).append(record)
-            indexes[source_key] = SourceIndex(source_key, source_name, provenance, records, by_id, by_pair)
+                    if bucket is not None:
+                        by_pair_hour.setdefault((symbol, direction, bucket), []).append(record)
+            indexes[source_key] = SourceIndex(source_key, source_name, provenance, records, by_id, by_pair, by_pair_hour)
         return indexes
 
 
@@ -478,7 +559,13 @@ def _source_matches_indexed(entry_row: pd.Series, source_index: SourceIndex, ent
         return [], "missing identity fields"
 
     timestamp = _entry_timestamp(entry_row)
-    candidates = source_index.by_pair.get((identity["symbol"], identity["direction"]), [])
+    bucket = timestamp_bucket(timestamp)
+    if bucket is None:
+        candidates = source_index.by_pair.get((identity["symbol"], identity["direction"]), [])
+    else:
+        candidates = []
+        for nearby_bucket in range(bucket - 2, bucket + 3):
+            candidates.extend(source_index.by_pair_hour.get((identity["symbol"], identity["direction"], nearby_bucket), []))
     possible: list[CandidateRecord] = []
     rejected_by_time = 0
     rejected_by_price = 0
@@ -497,6 +584,27 @@ def _source_matches_indexed(entry_row: pd.Series, source_index: SourceIndex, ent
     if rejected_by_price:
         return [], "price mismatch"
     return [], "no candidate in source"
+
+
+def resolve_canonical_source(
+    source_results: list[tuple[str, str, list[CandidateRecord], str]]
+) -> tuple[str, str, list[CandidateRecord], str] | None:
+    if not source_results:
+        return None
+    records: list[CandidateRecord] = []
+    reasons: list[str] = []
+    for _source_key, _provenance, matches, reason in source_results:
+        records.extend(matches)
+        reasons.append(reason)
+    canonical_groups: dict[str, list[CandidateRecord]] = {}
+    for record in records:
+        key = record.canonical_identity or f"{record.source_key}:{record.index}"
+        canonical_groups.setdefault(key, []).append(record)
+    if len(canonical_groups) != 1:
+        return None
+    best = _best_record(canonical_groups[next(iter(canonical_groups))])
+    reason = "canonical candidate identity; source priority" if len(records) > 1 else reasons[0]
+    return best.source_key, best.provenance, [best], reason
 
 
 def classify_entry_timing_rows(
@@ -530,8 +638,9 @@ def classify_entry_timing_rows(
                 if matches and source_index.provenance:
                     source_results.append((source_key, source_index.provenance, matches, reason))
 
-            if len(source_results) == 1 and len(source_results[0][2]) == 1:
-                source_key, category, matches, reason = source_results[0]
+            resolved = resolve_canonical_source(source_results)
+            if resolved is not None:
+                source_key, category, matches, reason = resolved
                 provenances.append(
                     EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], reason, source_key, len(matches), search_counts, identity)
                 )

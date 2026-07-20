@@ -22,6 +22,9 @@ exchange positions.
 - `data_integrity_audit.py --profile`: compact read-only audit timing report.
 - `data_integrity_audit.py --benchmark`: synthetic provenance benchmark that does
   not touch runtime logs.
+- Entry Timing provenance audit uses canonical candidate identity and
+  deterministic source priority to collapse duplicate records copied across
+  source CSVs while preserving warnings for genuinely competing candidates.
 
 ## Active Services
 
@@ -55,6 +58,8 @@ These modes are report-only experiments and must not change scanner scoring:
 - Dashboard and reports are read-only and depend on journal data quality.
 - Audit performance diagnostics are observability-only and do not alter
   historical CSV values.
+- Canonical provenance resolution changes only audit explanation quality; it
+  does not change signal generation, scoring, routing, TP/SL, RR, or outcomes.
 
 ## Backup And Rollback
 

@@ -4049,6 +4049,51 @@ def test_entry_timing_truth_layer_sources_and_coverage() -> None:
             pass
 
 
+def test_entry_timing_canonical_source_priority_reduces_cross_source_ambiguity() -> None:
+    temp_dir = Path(tempfile.gettempdir()) / "entry_timing_canonical_priority"
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(exist_ok=True)
+    history_path = temp_dir / "signals_history.csv"
+    candidate_path = temp_dir / "scanner_candidates.csv"
+    row = {
+        "timestamp": "2026-07-03T00:00:00+00:00",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "entry": 100,
+        "stop_loss": 99,
+        "tp1": 101,
+        "signal_status": "sent",
+    }
+    try:
+        journal = pd.DataFrame([row])
+        pd.DataFrame([row]).to_csv(history_path, index=False)
+        pd.DataFrame([row]).to_csv(candidate_path, index=False)
+        entry = pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-07-03T00:00:30+00:00",
+                    "symbol": "BINANCE:BTCUSDT.P",
+                    "direction": "BUY",
+                    "entry": 100,
+                    "sl": 99,
+                    "tp1": 101,
+                }
+            ]
+        )
+        provenances = data_integrity_audit.classify_entry_timing_rows(entry, journal, logs_dir=temp_dir)
+        assert len(provenances) == 1
+        assert provenances[0].category == "MATCHED_SENT_SIGNAL"
+        assert provenances[0].match_source == "sent"
+        assert provenances[0].reason == "canonical candidate identity; source priority"
+
+        competing = {**row, "timestamp": "2026-07-03T00:45:00+00:00", "entry": 100.01}
+        pd.DataFrame([row, competing]).to_csv(candidate_path, index=False)
+        ambiguous = data_integrity_audit.classify_entry_timing_rows(entry, journal, logs_dir=temp_dir)
+        assert ambiguous[0].category == "AMBIGUOUS_PROVENANCE"
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def test_data_integrity_entry_timing_indexed_benchmark() -> None:
     temp_dir = Path(tempfile.gettempdir()) / "entry_timing_indexed_benchmark_smoke"
     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -4625,6 +4670,7 @@ def main() -> int:
     test_entry_timing_audit_classifications()
     test_entry_timing_audit_deterministic_matching()
     test_entry_timing_truth_layer_sources_and_coverage()
+    test_entry_timing_canonical_source_priority_reduces_cross_source_ambiguity()
     test_data_integrity_entry_timing_indexed_benchmark()
     test_position_watcher_state_audit_categories()
     test_position_watcher_state_cleanup_dry_run_and_apply()

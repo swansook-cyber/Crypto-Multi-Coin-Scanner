@@ -326,6 +326,14 @@ RELEASE_CANDIDATE_V1.md
 DAILY_OPERATIONS.md
 ```
 
+Entry Timing provenance resolution:
+
+- Runtime sources are normalized once and indexed in memory.
+- Matching first uses explicit IDs, then symbol/direction/time/price.
+- Cross-source duplicates are collapsed by canonical candidate identity.
+- Source priority is deterministic: sent signal, report-only signal, approved history, rejected logs, then raw candidate logs.
+- Rows remain `AMBIGUOUS_PROVENANCE` only when multiple distinct candidate identities still match.
+
 Safe VPS update and rollback scripts:
 
 ```bash

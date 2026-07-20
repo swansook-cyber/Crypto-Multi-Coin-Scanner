@@ -517,3 +517,17 @@ cd /opt/Crypto-Multi-Coin-Scanner
 
 `--profile` uses real runtime CSVs and prints compact stage timings. `--benchmark`
 uses synthetic temporary data only and does not modify `logs/`.
+
+Entry Timing provenance audit flow:
+
+```text
+Entry Timing row
+-> explicit ID match when available
+-> canonical symbol/direction/time/price match
+-> deterministic source priority
+-> true ambiguity only when distinct candidate identities remain
+```
+
+If `Build indexes` is slow, run `--profile` first and compare with
+`--benchmark`. On the local RC1.5/RC1.6 test set, the synthetic benchmark
+processed 5,000 source rows and 200 Entry Timing rows in about 1.7 seconds.
