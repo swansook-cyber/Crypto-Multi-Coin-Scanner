@@ -193,12 +193,17 @@ def _check_data_integrity() -> list[HealthCheck]:
 
 def _check_position_watcher_cleanup_view() -> HealthCheck:
     try:
-        items = position_watcher_state_cleanup.stale_state_items(JOURNAL)
+        state = position_watcher_state_cleanup.classify_cleanup(JOURNAL)
     except Exception as exc:
         return HealthCheck("Position watcher cleanup dry-run view", WARNING, f"{type(exc).__name__}: {exc}")
-    if items:
-        return HealthCheck("Position watcher cleanup dry-run view", WARNING, f"{len(items)} stale active state keys")
-    return HealthCheck("Position watcher cleanup dry-run view", PASS, "0 stale active state keys")
+    warning_count = state.stale_canonical_active_entries + state.safe_to_remove + state.blocked_unsafe_path + state.blocked_identity_ambiguous
+    if warning_count:
+        return HealthCheck(
+            "Position watcher cleanup dry-run view",
+            WARNING,
+            f"safe={state.safe_to_remove}, stale_active={state.stale_canonical_active_entries}, unsafe={state.blocked_unsafe_path}, ambiguous={state.blocked_identity_ambiguous}",
+        )
+    return HealthCheck("Position watcher cleanup dry-run view", PASS, "0 safe removable or blocked runtime items")
 
 
 def _check_disk(min_free_gb: float = 1.0) -> HealthCheck:

@@ -3913,12 +3913,12 @@ def test_entry_timing_audit_classifications() -> None:
     classification = data_integrity_audit.classify_entry_timing(entry, journal)
     assert classification.matched == 1
     assert classification.legacy == 1
-    assert classification.orphan == 2
+    assert classification.orphan == 0
     assert classification.ambiguous == 0
     assert classification.duplicate == 2
     findings = data_integrity_audit.audit_entry_timing(entry, journal)
     assert any(item.severity == "INFO" and item.check == "LEGACY_SHADOW_ROW" for item in findings)
-    assert any(item.severity == "WARNING" and item.check == "ORPHAN_ROW" for item in findings)
+    assert not any(item.check == "TRUE_ORPHAN" for item in findings)
     assert any(item.severity == "WARNING" and item.check == "DUPLICATE_ROW" for item in findings)
 
 
@@ -3996,16 +3996,71 @@ def test_entry_timing_audit_deterministic_matching() -> None:
     assert classification.orphan == 1
     assert classification.legacy == 1
     findings = data_integrity_audit.audit_entry_timing(entry, journal, verbose=True)
-    assert any(item.check == "AMBIGUOUS_MATCH" for item in findings)
+    assert any(item.check == "AMBIGUOUS_PROVENANCE" for item in findings)
     assert any(item.check == "ENTRY_TIMING_SAMPLE" for item in findings)
 
 
+def test_entry_timing_truth_layer_sources_and_coverage() -> None:
+    temp_dir = Path(tempfile.gettempdir()) / "entry_timing_truth_sources"
+    temp_dir.mkdir(exist_ok=True)
+    rejected_path = temp_dir / "rejected_signals.csv"
+    history_path = temp_dir / "signals_history.csv"
+    candidate_path = temp_dir / "scanner_candidates.csv"
+    try:
+        journal = pd.DataFrame(
+            [
+                {"timestamp": "2026-07-01T00:00:00+00:00", "symbol": "BTCUSDT", "side": "LONG", "entry": 100, "stop_loss": 99, "tp1": 101, "signal_status": "sent"},
+                {"timestamp": "2026-07-01T01:00:00+00:00", "symbol": "ETHUSDT", "side": "SHORT", "entry": 200, "stop_loss": 202, "tp1": 198, "signal_status": "tier_c_report_only"},
+            ]
+        )
+        pd.DataFrame([{"timestamp": "2026-07-01T02:00:00+00:00", "symbol": "SOLUSDT", "side": "LONG", "entry": 50, "tp1": 51, "signal_status": "skipped_quality_filter"}]).to_csv(rejected_path, index=False)
+        pd.DataFrame([{"timestamp": "2026-07-01T03:00:00+00:00", "symbol": "XRPUSDT", "side": "LONG", "entry": 1, "tp1": 1.1}]).to_csv(history_path, index=False)
+        pd.DataFrame([{"timestamp": "2026-07-01T04:00:00+00:00", "symbol": "ADAUSDT", "side": "SHORT", "entry": 2, "tp1": 1.9}]).to_csv(candidate_path, index=False)
+        entry = pd.DataFrame(
+            [
+                {"timestamp": "2026-07-01T00:00:10+00:00", "symbol": "BTC/USDT", "direction": "BUY", "entry": 100, "tp1": 101},
+                {"timestamp": "2026-07-01T01:00:10+00:00", "symbol": "ETHUSDT.P", "direction": "SHORT", "entry": 200, "tp1": 198},
+                {"timestamp": "2026-07-01T02:00:10+00:00", "symbol": "SOLUSDT", "direction": "LONG", "entry": 50, "tp1": 51},
+                {"timestamp": "2026-07-01T03:00:10+00:00", "symbol": "XRPUSDT", "direction": "LONG", "entry": 1, "tp1": 1.1},
+                {"timestamp": "2026-07-01T04:00:10+00:00", "symbol": "ADAUSDT", "direction": "SHORT", "entry": 2, "tp1": 1.9},
+                {"timestamp": "2026-07-01T05:00:00+00:00", "symbol": "ORPHANUSDT", "direction": "LONG", "entry": 9, "tp1": 10},
+            ]
+        )
+        provenances = data_integrity_audit.classify_entry_timing_rows(entry, journal, logs_dir=temp_dir)
+        counts = data_integrity_audit.summarize_entry_timing_truth(provenances).counts
+        assert counts["MATCHED_SENT_SIGNAL"] == 1
+        assert counts["MATCHED_REPORT_ONLY_SIGNAL"] == 1
+        assert counts["MATCHED_REJECTED_CANDIDATE"] == 1
+        assert counts["MATCHED_APPROVED_SIGNAL"] == 1
+        assert counts["MATCHED_PRE_FINAL_CANDIDATE"] == 1
+        assert counts["TRUE_ORPHAN"] == 1
+        summary = data_integrity_audit.summarize_entry_timing_truth(provenances)
+        assert summary.explained_coverage_pct == 83.3
+    finally:
+        for path in [rejected_path, history_path, candidate_path]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            temp_dir.rmdir()
+        except OSError:
+            pass
+
+
 def test_position_watcher_state_audit_categories() -> None:
+    temp_dir = Path(tempfile.gettempdir())
+    journal_path = temp_dir / "watcher_state_audit_smoke.csv"
+    lock_dir = position_watcher_state_cleanup.approved_lock_dir(journal_path)
+    lock_dir.mkdir(exist_ok=True)
     historical = pd.DataFrame(
         [
             {
+                "timestamp": "2026-06-01T00:00:00+00:00",
                 "symbol": "BTCUSDT",
                 "side": "LONG",
+                "entry": 100,
+                "tp1": 101,
                 "result": "WIN",
                 "signal_status": "sent",
                 "position_management_stage": "TP1_REACHED_BE_RECOMMENDED",
@@ -4014,30 +4069,50 @@ def test_position_watcher_state_audit_categories() -> None:
             }
         ]
     )
-    findings = data_integrity_audit.audit_stale_watcher_state(historical)
-    assert any(item.severity == "INFO" and item.check == "CLOSED_ROW_WITH_HISTORICAL_TP1_FLAG" for item in findings)
-    assert not any(item.check == "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE" for item in findings)
+    try:
+        historical.to_csv(journal_path, index=False)
+        findings = data_integrity_audit.audit_stale_watcher_state(historical, journal_path=journal_path)
+        assert any(item.severity == "INFO" and item.check == "CLOSED_ROW_WITH_HISTORICAL_TP1_FLAG" for item in findings)
+        assert not any(item.check == "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE" for item in findings)
 
-    active = historical.copy()
-    lock = Path(tempfile.gettempdir()) / "watcher_state_audit_smoke.lock"
-    lock.write_text("lock", encoding="utf-8")
-    active.loc[0, "position_watcher_lock_file"] = str(lock)
-    findings = data_integrity_audit.audit_stale_watcher_state(active)
-    assert any(item.severity == "WARNING" and item.check == "STALE_LOCK_FILE" for item in findings)
-    assert any(item.severity == "WARNING" and item.check == "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE" for item in findings)
-    lock.unlink()
+        active = historical.copy()
+        lock = lock_dir / "watcher_state_audit_smoke.lock"
+        lock.write_text("created\nBTCUSDT|LONG|2026-06-01T00:00:00+00:00|100|101|100\n", encoding="utf-8")
+        active.loc[0, "position_watcher_alert_key"] = "BTCUSDT|LONG|2026-06-01T00:00:00+00:00|100|101|100"
+        active.loc[0, "position_watcher_lock_file"] = str(lock)
+        active.to_csv(journal_path, index=False)
+        findings = data_integrity_audit.audit_stale_watcher_state(active, journal_path=journal_path)
+        assert any(item.severity == "WARNING" and item.check == "STALE_LOCK_FILE" for item in findings)
+        assert any(item.severity == "WARNING" and item.check == "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE" for item in findings)
 
-    critical = active.copy()
-    critical.loc[0, "signal_status"] = "active"
-    findings = data_integrity_audit.audit_stale_watcher_state(critical)
-    assert any(item.severity == "FAIL" and item.check == "CLOSED_ROW_STILL_TREATED_AS_OPEN" for item in findings)
+        critical = active.copy()
+        critical.loc[0, "signal_status"] = "active"
+        critical.to_csv(journal_path, index=False)
+        findings = data_integrity_audit.audit_stale_watcher_state(critical, journal_path=journal_path)
+        assert any(item.severity == "FAIL" and item.check == "CLOSED_ROW_STILL_TREATED_AS_OPEN" for item in findings)
 
-    nan_refs = historical.copy()
-    nan_refs.loc[0, "position_watcher_alert_key"] = float("nan")
-    nan_refs.loc[0, "position_watcher_lock_file"] = float("nan")
-    state = data_integrity_audit.classify_watcher_state(nan_refs)
-    assert state.active_stale_state == 0
-    assert state.removable_items == 0
+        nan_refs = historical.copy()
+        nan_refs.loc[0, "position_watcher_alert_key"] = float("nan")
+        nan_refs.loc[0, "position_watcher_lock_file"] = float("nan")
+        nan_refs.to_csv(journal_path, index=False)
+        state = data_integrity_audit.classify_watcher_state(nan_refs, journal_path=journal_path)
+        assert state.active_stale_state == 0
+        assert state.removable_items == 0
+    finally:
+        for path in [journal_path]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        for path in lock_dir.glob("*"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            lock_dir.rmdir()
+        except OSError:
+            pass
 
 
 def test_position_watcher_state_cleanup_dry_run_and_apply() -> None:
@@ -4204,11 +4279,11 @@ def test_position_watcher_state_cleanup_safety_verdicts() -> None:
         items = position_watcher_state_cleanup.all_state_items(journal)
         by_symbol = {item.symbol: item for item in items if item.symbol}
         assert by_symbol["BTCUSDT"].verdict == position_watcher_state_cleanup.DO_NOT_REMOVE_ACTIVE_RUNTIME
-        assert by_symbol["ETHUSDT"].verdict == position_watcher_state_cleanup.DO_NOT_REMOVE_UNCONFIRMED
+        assert by_symbol["ETHUSDT"].verdict == position_watcher_state_cleanup.DO_NOT_REMOVE_PATH_UNSAFE
         assert by_symbol["SOLUSDT"].verdict == position_watcher_state_cleanup.HISTORICAL_ONLY
         assert by_symbol["XRPUSDT"].verdict == position_watcher_state_cleanup.HISTORICAL_ONLY
         if symlink_expected_block:
-            assert by_symbol["ADAUSDT"].verdict == position_watcher_state_cleanup.DO_NOT_REMOVE_UNCONFIRMED
+            assert by_symbol["ADAUSDT"].verdict == position_watcher_state_cleanup.DO_NOT_REMOVE_PATH_UNSAFE
 
         # Different timestamp for the same symbol is unrelated and can be removed.
         df = pd.read_csv(journal)
@@ -4480,6 +4555,7 @@ def main() -> int:
     test_data_audit_status_registry_accepts_current_skip_statuses()
     test_entry_timing_audit_classifications()
     test_entry_timing_audit_deterministic_matching()
+    test_entry_timing_truth_layer_sources_and_coverage()
     test_position_watcher_state_audit_categories()
     test_position_watcher_state_cleanup_dry_run_and_apply()
     test_position_watcher_state_cleanup_safety_verdicts()

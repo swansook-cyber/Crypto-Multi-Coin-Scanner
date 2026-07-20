@@ -250,10 +250,11 @@ def disk_free_gb(path: Path = BASE_DIR) -> float:
 
 
 def safety_status() -> dict[str, Any]:
-    stale = position_watcher_state_cleanup.stale_state_items(JOURNAL)
+    watcher_state = position_watcher_state_cleanup.classify_cleanup(JOURNAL)
+    watcher_warnings = watcher_state.stale_canonical_active_entries + watcher_state.safe_to_remove + watcher_state.blocked_unsafe_path + watcher_state.blocked_identity_ambiguous
     return {
         "data_integrity": audit_status(),
-        "active_stale_watcher_state": len(stale),
+        "active_stale_watcher_state": watcher_warnings,
         "duplicate_alert_protection": duplicate_protection_status(),
         "latest_runtime_backup": latest_backup(),
         "disk_free_gb": disk_free_gb(),

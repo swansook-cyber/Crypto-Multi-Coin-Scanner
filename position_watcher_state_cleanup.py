@@ -9,6 +9,7 @@ CSV history is preserved.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,6 +29,8 @@ SAFE_TO_REMOVE = "SAFE_TO_REMOVE"
 DO_NOT_REMOVE_OPEN_POSITION = "DO_NOT_REMOVE_OPEN_POSITION"
 DO_NOT_REMOVE_ACTIVE_RUNTIME = "DO_NOT_REMOVE_ACTIVE_RUNTIME"
 DO_NOT_REMOVE_UNCONFIRMED = "DO_NOT_REMOVE_UNCONFIRMED"
+DO_NOT_REMOVE_PATH_UNSAFE = "DO_NOT_REMOVE_PATH_UNSAFE"
+DO_NOT_REMOVE_IDENTITY_AMBIGUOUS = "DO_NOT_REMOVE_IDENTITY_AMBIGUOUS"
 HISTORICAL_ONLY = "HISTORICAL_ONLY"
 
 
@@ -42,6 +45,9 @@ class StaleStateItem:
     position_closed: bool
     active_runtime_state: bool
     exists: bool
+    path_safe: bool
+    canonical_runtime_active: bool
+    identity_confidence: str
     category: str
     verdict: str
     removable: bool
@@ -52,6 +58,8 @@ class StaleStateItem:
 class CleanupClassification:
     confirmed_closed_rows: int = 0
     historical_closed_rows: int = 0
+    canonical_active_entries: int = 0
+    stale_canonical_active_entries: int = 0
     active_stale_state_entries: int = 0
     existing_stale_lock_files: int = 0
     empty_or_nan_references: int = 0
@@ -60,6 +68,8 @@ class CleanupClassification:
     blocked_open_positions: int = 0
     blocked_active_runtime: int = 0
     blocked_unconfirmed: int = 0
+    blocked_unsafe_path: int = 0
+    blocked_identity_ambiguous: int = 0
     removable_items: int = 0
     affected_symbols: list[str] | None = None
 
@@ -214,6 +224,65 @@ def service_snapshot() -> dict[str, str]:
     }
 
 
+def canonical_lock_files(journal_path: Path = JOURNAL) -> list[Path]:
+    lock_dir = approved_lock_dir(journal_path)
+    if not lock_dir.exists() or not lock_dir.is_dir():
+        return []
+    return sorted(path for path in lock_dir.iterdir() if path.is_file() or path.is_symlink())
+
+
+def canonical_lock_keys(journal_path: Path = JOURNAL) -> dict[str, Path]:
+    keys: dict[str, Path] = {}
+    for path in canonical_lock_files(journal_path):
+        if path.suffix != ".lock":
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        if len(lines) >= 2 and not is_blank(lines[1]):
+            keys[lines[1].strip().upper()] = path
+    return keys
+
+
+def make_item(
+    symbol: str,
+    side: str,
+    timestamp: str,
+    result: str,
+    alert_key: str,
+    lock_file: Path,
+    position_closed: bool,
+    active_runtime_state: bool,
+    exists: bool,
+    path_safe: bool,
+    canonical_runtime_active: bool,
+    identity_confidence: str,
+    category: str,
+    verdict: str,
+    removable: bool,
+    reason: str,
+) -> StaleStateItem:
+    return StaleStateItem(
+        symbol,
+        side,
+        timestamp,
+        result,
+        alert_key,
+        lock_file,
+        position_closed,
+        active_runtime_state,
+        exists,
+        path_safe,
+        canonical_runtime_active,
+        identity_confidence,
+        category,
+        verdict,
+        removable,
+        reason,
+    )
+
+
 def evaluate_row(row: pd.Series, df: pd.DataFrame, journal_path: Path = JOURNAL) -> StaleStateItem:
     symbol = normalize_symbol(row.get("symbol", ""))
     side = normalize_side(row.get("side", row.get("direction", "")))
@@ -235,6 +304,8 @@ def evaluate_row(row: pd.Series, df: pd.DataFrame, journal_path: Path = JOURNAL)
     closed_counts = _closed_identity_counts(df)
     lock_exists = bool(not lock_blank and lock_file.exists())
     path_ok, path_reason, safe_path = path_safety(lock_file, journal_path) if not lock_blank else (False, "blank lock path", None)
+    canonical_active = bool(alert_key and alert_key.upper() in canonical_lock_keys(journal_path))
+    identity_confidence = "deterministic" if row_identity and closed_counts.get(row_identity, 0) == 1 else "ambiguous" if row_identity else "missing"
 
     category = "HISTORICAL_CLOSED_ROW"
     verdict = HISTORICAL_ONLY
@@ -246,21 +317,23 @@ def evaluate_row(row: pd.Series, df: pd.DataFrame, journal_path: Path = JOURNAL)
         elif not position_closed:
             verdict = DO_NOT_REMOVE_OPEN_POSITION
             reason = "position not terminal"
-        return StaleStateItem(symbol, side, timestamp, result, alert_key, lock_file, position_closed, active_runtime_state, False, category, verdict, removable, reason)
+        return make_item(symbol, side, timestamp, result, alert_key, lock_file, position_closed, active_runtime_state, False, False, False, identity_confidence, category, verdict, removable, reason)
 
     if not position_closed:
-        return StaleStateItem(symbol, side, timestamp, result, alert_key, lock_file, False, active_runtime_state, lock_exists, "OPEN_OR_UNCONFIRMED", DO_NOT_REMOVE_OPEN_POSITION, False, "position not terminal")
-    if not deterministic_identity(row) or closed_counts.get(row_identity, 0) != 1:
-        return StaleStateItem(symbol, side, timestamp, result, alert_key, lock_file, position_closed, active_runtime_state, lock_exists, "UNCONFIRMED_IDENTITY", DO_NOT_REMOVE_UNCONFIRMED, False, "identity missing or ambiguous")
+        return make_item(symbol, side, timestamp, result, alert_key, lock_file, False, active_runtime_state, lock_exists, path_ok, canonical_active, identity_confidence, "OPEN_OR_UNCONFIRMED", DO_NOT_REMOVE_OPEN_POSITION, False, "position not terminal")
+    if not deterministic_identity(row):
+        return make_item(symbol, side, timestamp, result, alert_key, lock_file, position_closed, active_runtime_state, lock_exists, path_ok, canonical_active, identity_confidence, "UNCONFIRMED_IDENTITY", DO_NOT_REMOVE_UNCONFIRMED, False, "identity missing")
+    if closed_counts.get(row_identity, 0) != 1:
+        return make_item(symbol, side, timestamp, result, alert_key, lock_file, position_closed, active_runtime_state, lock_exists, path_ok, canonical_active, identity_confidence, "AMBIGUOUS_IDENTITY", DO_NOT_REMOVE_IDENTITY_AMBIGUOUS, False, "identity ambiguous")
     if active_runtime_state:
-        return StaleStateItem(symbol, side, timestamp, result, alert_key, lock_file, position_closed, True, lock_exists, "ACTIVE_RUNTIME_STATE", DO_NOT_REMOVE_ACTIVE_RUNTIME, False, "same identity still open")
+        return make_item(symbol, side, timestamp, result, alert_key, lock_file, position_closed, True, lock_exists, path_ok, canonical_active, identity_confidence, "ACTIVE_RUNTIME_STATE", DO_NOT_REMOVE_ACTIVE_RUNTIME, False, "same identity still open")
     if lock_blank:
-        return StaleStateItem(symbol, side, timestamp, result, alert_key, lock_file, position_closed, False, False, "HISTORICAL_CLOSED_ROW", HISTORICAL_ONLY, False, "key without lock path")
+        return make_item(symbol, side, timestamp, result, alert_key, lock_file, position_closed, False, False, False, False, identity_confidence, "HISTORICAL_CLOSED_ROW", HISTORICAL_ONLY, False, "key without lock path")
     if not lock_exists:
-        return StaleStateItem(symbol, side, timestamp, result, alert_key, lock_file, position_closed, False, False, "INVALID_LOCK_REFERENCE", HISTORICAL_ONLY, False, "lock reference does not exist")
+        return make_item(symbol, side, timestamp, result, alert_key, lock_file, position_closed, False, False, path_ok, False, identity_confidence, "INVALID_LOCK_REFERENCE", HISTORICAL_ONLY, False, "lock reference does not exist")
     if not path_ok or safe_path is None:
-        return StaleStateItem(symbol, side, timestamp, result, alert_key, lock_file, position_closed, False, lock_exists, "INVALID_LOCK_REFERENCE", DO_NOT_REMOVE_UNCONFIRMED, False, path_reason)
-    return StaleStateItem(symbol, side, timestamp, result, alert_key, safe_path, True, False, True, "STALE_LOCK_FILE", SAFE_TO_REMOVE, True, "confirmed closed stale lock")
+        return make_item(symbol, side, timestamp, result, alert_key, lock_file, position_closed, False, lock_exists, False, canonical_active, identity_confidence, "UNSAFE_LOCK_PATH", DO_NOT_REMOVE_PATH_UNSAFE, False, path_reason)
+    return make_item(symbol, side, timestamp, result, alert_key, safe_path, True, False, True, True, canonical_active, identity_confidence, "STALE_LOCK_FILE", SAFE_TO_REMOVE, True, "confirmed closed stale lock")
 
 
 def all_state_items(journal_path: Path = JOURNAL) -> list[StaleStateItem]:
@@ -293,6 +366,7 @@ def classify_cleanup(journal_path: Path = JOURNAL) -> CleanupClassification:
     items = all_state_items(journal_path)
     classification = CleanupClassification(affected_symbols=[])
     symbols: set[str] = set()
+    classification.canonical_active_entries = len(canonical_lock_files(journal_path))
     for item in items:
         if item.position_closed:
             classification.confirmed_closed_rows += 1
@@ -300,7 +374,9 @@ def classify_cleanup(journal_path: Path = JOURNAL) -> CleanupClassification:
             classification.historical_closed_rows += 1
         if item.category == "STALE_LOCK_FILE":
             classification.existing_stale_lock_files += 1
-        if item.category in {"STALE_LOCK_FILE", "ACTIVE_RUNTIME_STATE"}:
+        if item.category == "STALE_LOCK_FILE":
+            classification.stale_canonical_active_entries += 1
+        if item.category == "ACTIVE_RUNTIME_STATE":
             classification.active_stale_state_entries += 1
         if item.reason in {"blank watcher fields", "historical audit fields only"} or item.category == "HISTORICAL_CLOSED_ROW":
             classification.empty_or_nan_references += 1
@@ -317,6 +393,10 @@ def classify_cleanup(journal_path: Path = JOURNAL) -> CleanupClassification:
             classification.blocked_active_runtime += 1
         elif item.verdict == DO_NOT_REMOVE_UNCONFIRMED:
             classification.blocked_unconfirmed += 1
+        elif item.verdict == DO_NOT_REMOVE_PATH_UNSAFE:
+            classification.blocked_unsafe_path += 1
+        elif item.verdict == DO_NOT_REMOVE_IDENTITY_AMBIGUOUS:
+            classification.blocked_identity_ambiguous += 1
     classification.affected_symbols = sorted(symbols)
     return classification
 
@@ -360,14 +440,80 @@ def cleanup(
 
 def print_summary(classification: CleanupClassification) -> None:
     print("Position Watcher Cleanup Summary")
-    print(f"Confirmed closed rows: {classification.confirmed_closed_rows}")
+    print(f"Historical closed rows: {classification.confirmed_closed_rows}")
     print(f"Historical-only rows: {classification.historical_closed_rows}")
-    print(f"Existing stale locks: {classification.existing_stale_lock_files}")
-    print(f"Active stale state entries: {classification.active_stale_state_entries}")
-    print(f"Safe to remove: {classification.safe_to_remove}")
+    print(f"Canonical active entries: {classification.canonical_active_entries}")
+    print(f"Stale canonical active entries: {classification.stale_canonical_active_entries}")
+    print(f"Existing lock files: {classification.existing_stale_lock_files}")
+    print(f"Safe removable locks: {classification.safe_to_remove}")
     print(f"Blocked open positions: {classification.blocked_open_positions}")
     print(f"Blocked active runtime: {classification.blocked_active_runtime}")
+    print(f"Blocked ambiguous: {classification.blocked_identity_ambiguous}")
+    print(f"Blocked unsafe path: {classification.blocked_unsafe_path}")
     print(f"Blocked unconfirmed: {classification.blocked_unconfirmed}")
+
+
+def classification_to_dict(classification: CleanupClassification) -> dict[str, Any]:
+    return {
+        "historical_closed_rows": classification.confirmed_closed_rows,
+        "historical_only_rows": classification.historical_closed_rows,
+        "canonical_active_entries": classification.canonical_active_entries,
+        "stale_canonical_active_entries": classification.stale_canonical_active_entries,
+        "existing_lock_files": classification.existing_stale_lock_files,
+        "safe_removable_locks": classification.safe_to_remove,
+        "blocked_open_positions": classification.blocked_open_positions,
+        "blocked_active_runtime": classification.blocked_active_runtime,
+        "blocked_ambiguous": classification.blocked_identity_ambiguous,
+        "blocked_unsafe_path": classification.blocked_unsafe_path,
+        "blocked_unconfirmed": classification.blocked_unconfirmed,
+        "warning_reasons": [
+            reason
+            for reason, count in [
+                ("stale canonical active entries", classification.stale_canonical_active_entries),
+                ("safe removable existing stale lock", classification.safe_to_remove),
+                ("blocked unsafe path", classification.blocked_unsafe_path),
+                ("blocked ambiguous identity", classification.blocked_identity_ambiguous),
+            ]
+            if count
+        ],
+    }
+
+
+def item_to_dict(item: StaleStateItem) -> dict[str, Any]:
+    return {
+        "symbol": item.symbol,
+        "direction": item.side,
+        "timestamp": item.timestamp,
+        "signal_status": item.result,
+        "identity_confidence": item.identity_confidence,
+        "open_identity_match": item.active_runtime_state,
+        "canonical_runtime_active": item.canonical_runtime_active,
+        "lock_exists": item.exists,
+        "path_safe": item.path_safe,
+        "verdict": item.verdict,
+        "reason": item.reason,
+        "lock_file": str(item.lock_file) if item.lock_file else "",
+    }
+
+
+def print_diagnostics(journal_path: Path = JOURNAL) -> None:
+    print("Position Watcher Diagnostics")
+    print(f"Checked at UTC: {datetime.now(timezone.utc).isoformat()}")
+    print("")
+    items = all_state_items(journal_path)
+    for item in items:
+        print(f"{item.symbol or '-'} {item.side or '-'} {item.timestamp or '-'}")
+        print(f"Signal status: {item.result or '-'}")
+        print(f"Signal identity confidence: {item.identity_confidence}")
+        print(f"Open identity match: {'YES' if item.active_runtime_state else 'NO'}")
+        print(f"Canonical runtime active: {'YES' if item.canonical_runtime_active else 'NO'}")
+        print(f"Lock exists: {'YES' if item.exists else 'NO'}")
+        print(f"Path safe: {'YES' if item.path_safe else 'NO'}")
+        print(f"Verdict: {item.verdict}")
+        print(f"Reason: {item.reason}")
+        print("")
+    if not items:
+        print("No watcher state items found.")
 
 
 def print_result(
@@ -386,11 +532,14 @@ def print_result(
     print(f"Checked at UTC: {datetime.now(timezone.utc).isoformat()}")
     print(f"Confirmed closed rows: {classification.confirmed_closed_rows}")
     print(f"Historical-only rows: {classification.historical_closed_rows}")
-    print(f"Existing stale locks: {classification.existing_stale_lock_files}")
-    print(f"Active stale state entries: {classification.active_stale_state_entries}")
-    print(f"Safe to remove: {classification.safe_to_remove}")
+    print(f"Canonical active entries: {classification.canonical_active_entries}")
+    print(f"Stale canonical active entries: {classification.stale_canonical_active_entries}")
+    print(f"Existing lock files: {classification.existing_stale_lock_files}")
+    print(f"Safe removable locks: {classification.safe_to_remove}")
     print(f"Blocked open positions: {classification.blocked_open_positions}")
     print(f"Blocked active runtime: {classification.blocked_active_runtime}")
+    print(f"Blocked ambiguous: {classification.blocked_identity_ambiguous}")
+    print(f"Blocked unsafe path: {classification.blocked_unsafe_path}")
     print(f"Blocked unconfirmed: {classification.blocked_unconfirmed}")
     print(f"Empty/NaN references: {classification.empty_or_nan_references}")
     print(f"Invalid missing references: {classification.invalid_missing_references}")
@@ -408,7 +557,8 @@ def print_result(
             f"{item.symbol or '-'} {item.side or '-'} | timestamp={item.timestamp or '-'} | "
             f"final={item.result or '-'} | position_closed={'YES' if item.position_closed else 'NO'} | "
             f"active_runtime={'YES' if item.active_runtime_state else 'NO'} | "
-            f"lock_exists={'YES' if item.exists else 'NO'} | category={item.category} | "
+            f"canonical_runtime={'YES' if item.canonical_runtime_active else 'NO'} | "
+            f"lock_exists={'YES' if item.exists else 'NO'} | path_safe={'YES' if item.path_safe else 'NO'} | category={item.category} | "
             f"verdict={item.verdict} | lock={item.lock_file}"
         )
     if not items:
@@ -428,6 +578,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dry-run cleanup for stale Position Watcher runtime state.")
     parser.add_argument("--journal", type=Path, default=JOURNAL)
     parser.add_argument("--summary", action="store_true", help="Print compact safety counts only.")
+    parser.add_argument("--diagnostics", action="store_true", help="Print per-item watcher truth diagnostics.")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON for summary/diagnostics.")
     parser.add_argument("--apply", action="store_true", help="Remove SAFE_TO_REMOVE lock files after backup.")
     parser.add_argument("--confirm-count", type=int, default=None, help="Required SAFE_TO_REMOVE count confirmation for --apply.")
     return parser.parse_args()
@@ -436,7 +588,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.summary:
-        print_summary(classify_cleanup(args.journal))
+        classification = classify_cleanup(args.journal)
+        if args.json:
+            print(json.dumps(classification_to_dict(classification), indent=2))
+        else:
+            print_summary(classification)
+        return 0
+    if args.diagnostics:
+        if args.json:
+            items = [item_to_dict(item) for item in all_state_items(args.journal)]
+            print(json.dumps({"summary": classification_to_dict(classify_cleanup(args.journal)), "items": items}, indent=2))
+        else:
+            print_diagnostics(args.journal)
         return 0
     items, backup, removed, verification = cleanup(args.journal, apply=args.apply, confirm_count=args.confirm_count)
     print_result(items, backup, removed, apply=args.apply, journal_path=args.journal, verification=verification)

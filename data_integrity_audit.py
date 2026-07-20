@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,6 +19,14 @@ LOGS_DIR = BASE_DIR / "logs"
 JOURNAL = LOGS_DIR / "signals.csv"
 ENTRY_TIMING = LOGS_DIR / "entry_timing_engine.csv"
 BACKUP_DIR = BASE_DIR / "backups"
+REJECTED_SIGNALS = LOGS_DIR / "rejected_signals.csv"
+SIGNALS_HISTORY = LOGS_DIR / "signals_history.csv"
+OPTIONAL_CANDIDATE_LOGS = [
+    LOGS_DIR / "scanner_candidates.csv",
+    LOGS_DIR / "signal_candidates.csv",
+    LOGS_DIR / "candidates.csv",
+    LOGS_DIR / "candidate_signals.csv",
+]
 
 FINAL_STATUSES = {"WIN", "LOSS", "EXPIRED", "BREAKEVEN", "CLOSED", "TP", "SL", "TAKE_PROFIT", "STOP_LOSS"}
 OPEN_STATUSES = {"", "OPEN", "0"}
@@ -74,6 +83,48 @@ class EntryTimingClassification:
         if self.total <= 0:
             return 0.0
         return round(self.matched / self.total * 100.0, 1)
+
+    @property
+    def explained_coverage_pct(self) -> float:
+        if self.total <= 0:
+            return 0.0
+        explained = self.total - self.orphan - self.ambiguous - self.duplicate
+        return round(max(0, explained) / self.total * 100.0, 1)
+
+
+ENTRY_PROVENANCE_SEVERITY = {
+    "MATCHED_APPROVED_SIGNAL": "PASS",
+    "MATCHED_SENT_SIGNAL": "PASS",
+    "MATCHED_REPORT_ONLY_SIGNAL": "INFO",
+    "MATCHED_REJECTED_CANDIDATE": "INFO",
+    "MATCHED_PRE_FINAL_CANDIDATE": "INFO",
+    "LEGACY_SHADOW_ROW": "INFO",
+    "TRUE_ORPHAN": "WARNING",
+    "AMBIGUOUS_PROVENANCE": "WARNING",
+    "DUPLICATE_ROW": "WARNING",
+}
+
+
+@dataclass
+class EntryTimingProvenance:
+    index: int
+    category: str
+    severity: str
+    reason: str
+    match_source: str = ""
+    match_count: int = 0
+    search_counts: dict[str, int] | None = None
+    identity: dict[str, Any] | None = None
+
+
+@dataclass
+class EntryTimingTruthSummary:
+    total: int
+    counts: dict[str, int]
+    warning_count: int
+    explained_coverage_pct: float
+    approved_sent_coverage_pct: float
+    samples: list[EntryTimingProvenance]
 
 
 @dataclass
@@ -184,10 +235,187 @@ def signal_prefix_df(df: pd.DataFrame, side_column: str = "side") -> pd.Series:
 
 def _identity_values(row: pd.Series) -> set[str]:
     values: set[str] = set()
-    for column in ["source_signal_id", "candidate_id", "signal_id", "outcome_id"]:
+    for column in ["source_signal_id", "candidate_id", "final_candidate_id", "signal_id", "outcome_id"]:
         if column in row.index and not is_blank(row.get(column)):
             values.add(str(row.get(column)).strip())
     return values
+
+
+def _row_identity(row: pd.Series) -> dict[str, Any]:
+    return {
+        "source_signal_id": row.get("source_signal_id", ""),
+        "candidate_id": row.get("candidate_id", ""),
+        "final_candidate_id": row.get("final_candidate_id", ""),
+        "timestamp": str(_entry_timestamp(row)) if not pd.isna(_entry_timestamp(row)) else str(row.get("timestamp", row.get("final_signal_timestamp", ""))),
+        "symbol": normalize_symbol(row.get("normalized_symbol", row.get("symbol", ""))),
+        "direction": normalize_direction(row.get("normalized_direction", row.get("side", row.get("direction", "")))),
+        "entry": numeric_value(row.get("entry", "")),
+        "sl": numeric_value(row.get("sl", row.get("stop_loss", ""))),
+        "tp1": numeric_value(row.get("tp1", "")),
+    }
+
+
+def _identity_complete(identity: dict[str, Any]) -> bool:
+    return bool(
+        identity.get("symbol")
+        and identity.get("direction")
+        and identity.get("timestamp")
+        and identity.get("entry") is not None
+    )
+
+
+def _source_frame(df: pd.DataFrame, source_name: str, provenance: str) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    frame = df.copy()
+    frame["_source_name"] = source_name
+    frame["_provenance"] = provenance
+    return frame
+
+
+def load_entry_timing_sources(journal: pd.DataFrame, logs_dir: Path = LOGS_DIR) -> dict[str, pd.DataFrame]:
+    sources: dict[str, pd.DataFrame] = {}
+    if not journal.empty:
+        status = _series(journal, "signal_status").fillna("").astype(str).str.lower()
+        sent = journal[status.eq("sent")]
+        report_only = journal[status.isin({"tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only", "london_long_report_only"})]
+        rejected = journal[status.str.startswith("skipped_") | status.str.startswith("logged_")]
+        sources["sent"] = _source_frame(sent, "logs/signals.csv", "MATCHED_SENT_SIGNAL")
+        sources["report_only"] = _source_frame(report_only, "logs/signals.csv", "MATCHED_REPORT_ONLY_SIGNAL")
+        sources["journal_rejected"] = _source_frame(rejected, "logs/signals.csv", "MATCHED_REJECTED_CANDIDATE")
+
+    rejected_path = logs_dir / "rejected_signals.csv"
+    rejected_df, _ = _load_csv(rejected_path)
+    sources["rejected"] = _source_frame(rejected_df, str(rejected_path), "MATCHED_REJECTED_CANDIDATE")
+
+    history_path = logs_dir / "signals_history.csv"
+    history_df, _ = _load_csv(history_path)
+    sources["approved_history"] = _source_frame(history_df, str(history_path), "MATCHED_APPROVED_SIGNAL")
+
+    for candidate_path in [
+        logs_dir / "scanner_candidates.csv",
+        logs_dir / "signal_candidates.csv",
+        logs_dir / "candidates.csv",
+        logs_dir / "candidate_signals.csv",
+    ]:
+        candidate_df, _ = _load_csv(candidate_path)
+        if not candidate_df.empty:
+            sources[candidate_path.name] = _source_frame(candidate_df, str(candidate_path), "MATCHED_PRE_FINAL_CANDIDATE")
+    return sources
+
+
+def _source_matches(entry_row: pd.Series, source: pd.DataFrame) -> tuple[list[int], str]:
+    if source.empty:
+        return [], "source empty"
+    entry_ids = _identity_values(entry_row)
+    if entry_ids:
+        id_matches = [int(index) for index, row in source.iterrows() if entry_ids & _identity_values(row)]
+        if id_matches:
+            return id_matches, "explicit id"
+
+    identity = _row_identity(entry_row)
+    if not _identity_complete(identity):
+        return [], "missing identity fields"
+
+    timestamp = _entry_timestamp(entry_row)
+    possible: list[int] = []
+    rejected_by_time = 0
+    rejected_by_price = 0
+    for index, signal_row in source.iterrows():
+        signal_symbol = normalize_symbol(signal_row.get("normalized_symbol", signal_row.get("symbol", "")))
+        signal_direction = normalize_direction(signal_row.get("normalized_direction", signal_row.get("side", signal_row.get("direction", ""))))
+        if not signal_symbol or not signal_direction:
+            continue
+        if identity["symbol"] != signal_symbol or identity["direction"] != signal_direction:
+            continue
+        if not _timestamp_close(timestamp, _journal_timestamp(signal_row)):
+            rejected_by_time += 1
+            continue
+        if not price_close(identity["entry"], signal_row.get("entry")):
+            rejected_by_price += 1
+            continue
+        entry_tp1 = identity.get("tp1")
+        entry_sl = identity.get("sl")
+        if entry_tp1 is not None and not price_close(entry_tp1, signal_row.get("tp1")):
+            rejected_by_price += 1
+            continue
+        if entry_sl is not None and not price_close(entry_sl, signal_row.get("stop_loss", signal_row.get("sl"))):
+            rejected_by_price += 1
+            continue
+        possible.append(int(index))
+    if possible:
+        return possible, "symbol/direction/time/price"
+    if rejected_by_time:
+        return [], "timestamp outside tolerance"
+    if rejected_by_price:
+        return [], "price mismatch"
+    return [], "no candidate in source"
+
+
+def classify_entry_timing_rows(entry: pd.DataFrame, journal: pd.DataFrame, logs_dir: Path = LOGS_DIR) -> list[EntryTimingProvenance]:
+    if entry.empty:
+        return []
+    duplicate_mask = _entry_duplicate_mask(entry)
+    timestamp_source = _series(entry, "final_signal_timestamp") if "final_signal_timestamp" in entry.columns else _series(entry, "timestamp")
+    timestamps = pd.to_datetime(timestamp_source, utc=True, errors="coerce")
+    sources = load_entry_timing_sources(journal, logs_dir=logs_dir)
+    provenances: list[EntryTimingProvenance] = []
+    for index, row in entry.iterrows():
+        identity = _row_identity(row)
+        if bool(duplicate_mask.loc[index]):
+            category = "DUPLICATE_ROW"
+            provenances.append(EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], "duplicate Entry Timing identity", identity=identity))
+            continue
+
+        source_results: list[tuple[str, str, list[int], str]] = []
+        search_counts: dict[str, int] = {}
+        for source_key, source_df in sources.items():
+            matches, reason = _source_matches(row, source_df)
+            provenance = str(source_df["_provenance"].iloc[0]) if not source_df.empty and "_provenance" in source_df.columns else ""
+            search_counts[source_key] = len(matches)
+            if matches and provenance:
+                source_results.append((source_key, provenance, matches, reason))
+
+        if len(source_results) == 1 and len(source_results[0][2]) == 1:
+            source_key, category, matches, reason = source_results[0]
+            provenances.append(
+                EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], reason, source_key, len(matches), search_counts, identity)
+            )
+            continue
+        if source_results:
+            category = "AMBIGUOUS_PROVENANCE"
+            match_count = sum(len(item[2]) for item in source_results)
+            provenances.append(
+                EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], "duplicate candidates across sources", ",".join(item[0] for item in source_results), match_count, search_counts, identity)
+            )
+            continue
+
+        row_timestamp = timestamps.loc[index]
+        if pd.isna(row_timestamp) or row_timestamp < ENTRY_TIMING_FINAL_CANDIDATE_INTEGRATION_UTC:
+            category = "LEGACY_SHADOW_ROW"
+            reason = "unsupported legacy schema" if pd.isna(row_timestamp) else "row before final-candidate integration"
+        elif not _identity_complete(identity):
+            category = "TRUE_ORPHAN"
+            reason = "missing identity fields"
+        else:
+            category = "TRUE_ORPHAN"
+            reason = "no candidate in any source"
+        provenances.append(EntryTimingProvenance(int(index), category, ENTRY_PROVENANCE_SEVERITY[category], reason, "", 0, search_counts, identity))
+    return provenances
+
+
+def summarize_entry_timing_truth(provenances: list[EntryTimingProvenance]) -> EntryTimingTruthSummary:
+    total = len(provenances)
+    counts = {category: 0 for category in ENTRY_PROVENANCE_SEVERITY}
+    for item in provenances:
+        counts[item.category] = counts.get(item.category, 0) + 1
+    warning_count = sum(count for category, count in counts.items() if ENTRY_PROVENANCE_SEVERITY.get(category) == "WARNING")
+    explained = total - counts.get("TRUE_ORPHAN", 0) - counts.get("AMBIGUOUS_PROVENANCE", 0) - counts.get("DUPLICATE_ROW", 0)
+    approved_sent = counts.get("MATCHED_APPROVED_SIGNAL", 0) + counts.get("MATCHED_SENT_SIGNAL", 0)
+    explained_pct = round(explained / total * 100.0, 1) if total else 0.0
+    approved_sent_pct = round(approved_sent / total * 100.0, 1) if total else 0.0
+    samples = [item for item in provenances if item.category in {"TRUE_ORPHAN", "AMBIGUOUS_PROVENANCE"}]
+    return EntryTimingTruthSummary(total, counts, warning_count, explained_pct, approved_sent_pct, samples)
 
 
 def _entry_timestamp(row: pd.Series) -> pd.Timestamp | pd.NaT:
@@ -365,47 +593,24 @@ def audit_journal(df: pd.DataFrame) -> list[AuditFinding]:
 def classify_entry_timing(entry: pd.DataFrame, journal: pd.DataFrame) -> EntryTimingClassification:
     if entry.empty:
         return EntryTimingClassification(0, 0, 0, 0, 0, 0, [])
-    duplicate_mask = _entry_duplicate_mask(entry)
-    timestamp_source = _series(entry, "final_signal_timestamp") if "final_signal_timestamp" in entry.columns else _series(entry, "timestamp")
-    if journal.empty:
-        timestamps = pd.to_datetime(timestamp_source, utc=True, errors="coerce")
-        legacy = int(timestamps.lt(ENTRY_TIMING_FINAL_CANDIDATE_INTEGRATION_UTC).fillna(True).sum())
-        orphan = int(len(entry) - legacy)
-        duplicate = int(duplicate_mask.sum())
-        samples = [_sample_entry(row, "journal missing") for _, row in entry[~timestamps.lt(ENTRY_TIMING_FINAL_CANDIDATE_INTEGRATION_UTC).fillna(False)].head(5).iterrows()]
-        return EntryTimingClassification(len(entry), 0, legacy, orphan, 0, duplicate, samples)
-
-    approved = journal[_series(journal, "signal_status").fillna("").astype(str).str.lower().isin(APPROVED_FINAL_STATUSES)].copy()
-    timestamps = pd.to_datetime(timestamp_source, utc=True, errors="coerce")
-    matched = 0
-    orphan = 0
-    ambiguous = 0
-    legacy = 0
-    samples: list[str] = []
-    for index, row in entry.iterrows():
-        matches, reason = _candidate_matches(row, approved)
-        if len(matches) == 1:
-            matched += 1
-            continue
-        row_timestamp = timestamps.loc[index]
-        if (pd.isna(row_timestamp) or row_timestamp < ENTRY_TIMING_FINAL_CANDIDATE_INTEGRATION_UTC) and len(matches) == 0:
-            legacy += 1
-            continue
-        if len(matches) > 1:
-            ambiguous += 1
-            if len(samples) < 5:
-                samples.append(_sample_entry(row, f"ambiguous {len(matches)} matches via {reason}"))
-            continue
-        orphan += 1
-        if len(samples) < 5:
-            samples.append(_sample_entry(row, "no deterministic final candidate match"))
+    provenances = classify_entry_timing_rows(entry, journal)
+    truth = summarize_entry_timing_truth(provenances)
+    matched = truth.counts.get("MATCHED_APPROVED_SIGNAL", 0) + truth.counts.get("MATCHED_SENT_SIGNAL", 0)
+    legacy = truth.counts.get("LEGACY_SHADOW_ROW", 0)
+    orphan = truth.counts.get("TRUE_ORPHAN", 0)
+    ambiguous = truth.counts.get("AMBIGUOUS_PROVENANCE", 0)
+    duplicate = truth.counts.get("DUPLICATE_ROW", 0)
+    samples = [
+        _sample_entry(pd.Series(item.identity or {}), item.reason)
+        for item in truth.samples[:5]
+    ]
     return EntryTimingClassification(
         total=int(len(entry)),
         matched=int(matched),
         legacy=int(legacy),
         orphan=int(orphan),
         ambiguous=int(ambiguous),
-        duplicate=int(duplicate_mask.sum()),
+        duplicate=int(duplicate),
         samples=samples,
     )
 
@@ -416,79 +621,72 @@ def audit_entry_timing(entry: pd.DataFrame, journal: pd.DataFrame, verbose: bool
         findings.append(AuditFinding("INFO", "Entry Timing rows", "logs/entry_timing_engine.csv has no rows"))
         return findings
     classification = classify_entry_timing(entry, journal)
+    truth = summarize_entry_timing_truth(classify_entry_timing_rows(entry, journal))
     findings.append(
         AuditFinding(
             "PASS",
             "Entry Timing classification summary",
             (
-                f"total={classification.total}, matched={classification.matched}, "
-                f"legacy={classification.legacy}, orphan={classification.orphan}, "
-                f"ambiguous={classification.ambiguous}, duplicate={classification.duplicate}, "
-                f"coverage={classification.coverage_pct:.1f}%"
+                f"total={truth.total}, approved={truth.counts.get('MATCHED_APPROVED_SIGNAL', 0)}, "
+                f"sent={truth.counts.get('MATCHED_SENT_SIGNAL', 0)}, "
+                f"report_only={truth.counts.get('MATCHED_REPORT_ONLY_SIGNAL', 0)}, "
+                f"rejected={truth.counts.get('MATCHED_REJECTED_CANDIDATE', 0)}, "
+                f"pre_final={truth.counts.get('MATCHED_PRE_FINAL_CANDIDATE', 0)}, "
+                f"legacy={truth.counts.get('LEGACY_SHADOW_ROW', 0)}, "
+                f"true_orphan={truth.counts.get('TRUE_ORPHAN', 0)}, "
+                f"ambiguous={truth.counts.get('AMBIGUOUS_PROVENANCE', 0)}, "
+                f"duplicate={truth.counts.get('DUPLICATE_ROW', 0)}, "
+                f"explained_coverage={truth.explained_coverage_pct:.1f}%, "
+                f"approved_sent_coverage={truth.approved_sent_coverage_pct:.1f}%"
             ),
         )
     )
-    if classification.legacy:
-        findings.append(AuditFinding("INFO", "LEGACY_SHADOW_ROW", f"{classification.legacy} historical rows before final-candidate integration"))
-    if classification.orphan:
-        findings.append(AuditFinding("WARNING", "ORPHAN_ROW", f"{classification.orphan} post-integration Entry Timing rows without final candidate match"))
-    if classification.ambiguous:
-        findings.append(AuditFinding("WARNING", "AMBIGUOUS_MATCH", f"{classification.ambiguous} Entry Timing rows matched multiple possible final candidates"))
-    if classification.duplicate:
-        findings.append(AuditFinding("WARNING", "DUPLICATE_ROW", f"{classification.duplicate} duplicate Entry Timing rows"))
+    for category, count in truth.counts.items():
+        if count and category != "MATCHED_SENT_SIGNAL":
+            findings.append(AuditFinding(ENTRY_PROVENANCE_SEVERITY[category], category, f"{count} Entry Timing rows"))
     if verbose and classification.samples:
         for sample in classification.samples:
             findings.append(AuditFinding("INFO", "ENTRY_TIMING_SAMPLE", sample))
     return findings
 
 
-def classify_watcher_state(journal: pd.DataFrame) -> WatcherStateClassification:
-    if journal.empty:
-        return WatcherStateClassification(0, 0, 0, 0, 0, 0, 0, [])
-    result = _series(journal, "result", "OPEN").fillna("OPEN").astype(str).str.upper()
-    stage = _series(journal, "position_management_stage").fillna("").astype(str)
-    status = _series(journal, "signal_status").fillna("").astype(str).str.lower()
-    historical = result.isin(FINAL_STATUSES) & stage.str.contains("TP1_REACHED", case=False, na=False)
-    closed_open = result.isin(FINAL_STATUSES) & status.isin(["active"])
-    closed = journal[result.isin(FINAL_STATUSES)].copy()
-    active_stale = 0
-    existing_locks = 0
-    empty_refs = 0
-    invalid_missing = 0
-    symbols: set[str] = set()
-    for _, row in closed.iterrows():
-        lock_raw = row.get("position_watcher_lock_file", "")
-        key_raw = row.get("position_watcher_alert_key", "")
-        lock_blank = is_blank(lock_raw)
-        key_blank = is_blank(key_raw)
-        if lock_blank and key_blank:
-            if any(not is_blank(row.get(column, "")) for column in ["tp1_alert_sent", "breakeven_recommended", "breakeven_price", "position_management_stage"]):
-                empty_refs += 1
-            continue
-        lock_path = Path(str(lock_raw).strip()) if not lock_blank else None
-        if lock_path is not None and lock_path.exists():
-            existing_locks += 1
-            active_stale += 1
-            symbols.add(normalize_symbol(row.get("symbol", "")))
-        elif lock_path is not None:
-            invalid_missing += 1
-        else:
-            historical = historical.copy()
-    symbols_list = sorted(symbol for symbol in symbols if symbol)
+def classify_watcher_state(journal: pd.DataFrame, journal_path: Path = JOURNAL) -> WatcherStateClassification:
+    result = _series(journal, "result", "OPEN").fillna("OPEN").astype(str).str.upper() if not journal.empty else pd.Series(dtype=str)
+    status = _series(journal, "signal_status").fillna("").astype(str).str.lower() if not journal.empty else pd.Series(dtype=str)
+    closed_open = result.isin(FINAL_STATUSES) & status.isin(["active"]) if not journal.empty else pd.Series(dtype=bool)
+    try:
+        import position_watcher_state_cleanup
+
+        cleanup_state = position_watcher_state_cleanup.classify_cleanup(journal_path)
+        historical = cleanup_state.historical_closed_rows
+        active_stale = cleanup_state.stale_canonical_active_entries
+        existing_locks = cleanup_state.existing_stale_lock_files
+        empty_refs = cleanup_state.empty_or_nan_references
+        invalid_missing = cleanup_state.invalid_missing_references + cleanup_state.blocked_unsafe_path + cleanup_state.blocked_identity_ambiguous
+        removable = cleanup_state.safe_to_remove
+        symbols_list = cleanup_state.affected_symbols or []
+    except Exception:
+        historical = 0
+        active_stale = 0
+        existing_locks = 0
+        empty_refs = 0
+        invalid_missing = 0
+        removable = 0
+        symbols_list = []
     return WatcherStateClassification(
-        historical_flags=int(historical.sum()),
+        historical_flags=int(historical),
         active_stale_state=int(active_stale),
         existing_stale_locks=int(existing_locks),
         empty_or_nan_references=int(empty_refs),
         invalid_missing_references=int(invalid_missing),
-        removable_items=int(existing_locks),
+        removable_items=int(removable),
         closed_treated_open=int(closed_open.sum()),
         symbols=symbols_list,
     )
 
 
-def audit_stale_watcher_state(journal: pd.DataFrame) -> list[AuditFinding]:
-    state = classify_watcher_state(journal)
+def audit_stale_watcher_state(journal: pd.DataFrame, journal_path: Path = JOURNAL) -> list[AuditFinding]:
+    state = classify_watcher_state(journal, journal_path=journal_path)
     findings: list[AuditFinding] = []
     if state.historical_flags:
         findings.append(AuditFinding("INFO", "CLOSED_ROW_WITH_HISTORICAL_TP1_FLAG", f"{state.historical_flags} closed rows keep TP1 audit fields"))
@@ -497,9 +695,9 @@ def audit_stale_watcher_state(journal: pd.DataFrame) -> list[AuditFinding]:
     if state.invalid_missing_references:
         findings.append(AuditFinding("INFO", "INVALID_LOCK_REFERENCE", f"{state.invalid_missing_references} nonblank lock references do not exist"))
     if state.existing_stale_locks:
-        findings.append(AuditFinding("WARNING", "STALE_LOCK_FILE", f"{state.existing_stale_locks} existing stale lock files; symbols={','.join(state.symbols) or '-'}"))
+        findings.append(AuditFinding("WARNING", "STALE_LOCK_FILE", f"{state.existing_stale_locks} existing stale lock files; safe_to_remove={state.removable_items}; symbols={','.join(state.symbols) or '-'}"))
     if state.active_stale_state:
-        findings.append(AuditFinding("WARNING", "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE", f"{state.active_stale_state} active state entries; removable={state.removable_items}; symbols={','.join(state.symbols) or '-'}"))
+        findings.append(AuditFinding("WARNING", "CLOSED_ROW_IN_ACTIVE_WATCHER_STATE", f"{state.active_stale_state} canonical active state entries; symbols={','.join(state.symbols) or '-'}"))
     if state.closed_treated_open:
         findings.append(AuditFinding("FAIL", "CLOSED_ROW_STILL_TREATED_AS_OPEN", f"{state.closed_treated_open} rows"))
     if not findings:
@@ -517,7 +715,7 @@ def audit_paths(journal_path: Path = JOURNAL, entry_path: Path = ENTRY_TIMING, v
         findings.extend(audit_journal(journal))
     if entry_error is None:
         findings.extend(audit_entry_timing(entry, journal, verbose=verbose))
-    findings.extend(audit_stale_watcher_state(journal))
+    findings.extend(audit_stale_watcher_state(journal, journal_path=journal_path))
     if not findings:
         findings.append(AuditFinding("PASS", "data integrity audit", "no issues detected"))
     return findings
@@ -560,6 +758,72 @@ def print_findings(findings: list[AuditFinding]) -> None:
         print(f"{finding.severity:7} | {finding.check} | {finding.detail}")
 
 
+def print_entry_timing_summary(summary: EntryTimingTruthSummary) -> None:
+    print("Entry Timing Provenance Summary")
+    print(f"Total rows: {summary.total}")
+    print(f"Approved matches: {summary.counts.get('MATCHED_APPROVED_SIGNAL', 0)}")
+    print(f"Sent matches: {summary.counts.get('MATCHED_SENT_SIGNAL', 0)}")
+    print(f"Report-only matches: {summary.counts.get('MATCHED_REPORT_ONLY_SIGNAL', 0)}")
+    print(f"Rejected matches: {summary.counts.get('MATCHED_REJECTED_CANDIDATE', 0)}")
+    print(f"Pre-final matches: {summary.counts.get('MATCHED_PRE_FINAL_CANDIDATE', 0)}")
+    print(f"Legacy rows: {summary.counts.get('LEGACY_SHADOW_ROW', 0)}")
+    print(f"True orphans: {summary.counts.get('TRUE_ORPHAN', 0)}")
+    print(f"Ambiguous rows: {summary.counts.get('AMBIGUOUS_PROVENANCE', 0)}")
+    print(f"Duplicates: {summary.counts.get('DUPLICATE_ROW', 0)}")
+    print(f"Explained coverage: {summary.explained_coverage_pct:.1f}%")
+    print(f"Approved/sent coverage: {summary.approved_sent_coverage_pct:.1f}%")
+    print(f"Warning count: {summary.warning_count}")
+
+
+def print_entry_timing_diagnostics(entry: pd.DataFrame, journal: pd.DataFrame, limit: int, logs_dir: Path = LOGS_DIR) -> None:
+    provenances = classify_entry_timing_rows(entry, journal, logs_dir=logs_dir)
+    summary = summarize_entry_timing_truth(provenances)
+    print_entry_timing_summary(summary)
+    print("")
+    print("Entry Timing Diagnostic Samples")
+    samples = [item for item in provenances if item.category in {"TRUE_ORPHAN", "AMBIGUOUS_PROVENANCE"}][:limit]
+    if not samples:
+        print("-")
+        return
+    for item in samples:
+        identity = item.identity or {}
+        counts = item.search_counts or {}
+        print(f"Index: {item.index}")
+        print("Entry Timing identity")
+        print(f"- timestamp: {identity.get('timestamp') or '-'}")
+        print(f"- symbol: {identity.get('symbol') or '-'}")
+        print(f"- direction: {identity.get('direction') or '-'}")
+        print(f"- entry: {identity.get('entry') if identity.get('entry') is not None else '-'}")
+        print(f"- SL: {identity.get('sl') if identity.get('sl') is not None else '-'}")
+        print(f"- TP1: {identity.get('tp1') if identity.get('tp1') is not None else '-'}")
+        print(f"- source ID: {identity.get('source_signal_id') or identity.get('candidate_id') or identity.get('final_candidate_id') or '-'}")
+        print("Search result")
+        print(f"- approved matches: {counts.get('approved_history', 0)}")
+        print(f"- sent matches: {counts.get('sent', 0)}")
+        print(f"- report-only matches: {counts.get('report_only', 0)}")
+        print(f"- rejected matches: {counts.get('rejected', 0) + counts.get('journal_rejected', 0)}")
+        raw_candidates = sum(count for key, count in counts.items() if key.endswith('.csv') or 'candidate' in key)
+        print(f"- raw candidate matches: {raw_candidates}")
+        print("Reason")
+        print(f"- {item.reason}")
+        print("")
+
+
+def entry_timing_summary_dict(summary: EntryTimingTruthSummary) -> dict[str, Any]:
+    return {
+        "total_rows": summary.total,
+        "counts": summary.counts,
+        "explained_coverage_pct": summary.explained_coverage_pct,
+        "approved_sent_coverage_pct": summary.approved_sent_coverage_pct,
+        "warning_count": summary.warning_count,
+        "warning_reasons": [
+            category
+            for category in ["TRUE_ORPHAN", "AMBIGUOUS_PROVENANCE", "DUPLICATE_ROW"]
+            if summary.counts.get(category, 0)
+        ],
+    }
+
+
 def exit_code(findings: list[AuditFinding]) -> int:
     if any(item.severity == "FAIL" for item in findings):
         return 2
@@ -574,6 +838,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--entry-timing", type=Path, default=ENTRY_TIMING)
     parser.add_argument("--repair-safe", action="store_true", help="Apply safe normalization only after creating backups.")
     parser.add_argument("--verbose", action="store_true", help="Show sample Entry Timing mismatch reasons.")
+    parser.add_argument("--entry-timing-diagnostics", action="store_true", help="Explain TRUE_ORPHAN and AMBIGUOUS Entry Timing rows.")
+    parser.add_argument("--limit", type=int, default=20, help="Limit diagnostic samples.")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON summary.")
     return parser.parse_args()
 
 
@@ -584,6 +851,29 @@ def main() -> int:
             changed, backup = repair_safe(path)
             if changed:
                 print(f"SAFE_REPAIR | {path} | changes={changed} | backup={backup}")
+    journal, journal_error = _load_csv(args.journal)
+    entry, entry_error = _load_csv(args.entry_timing)
+    if args.entry_timing_diagnostics:
+        if entry_error is not None:
+            print(f"Entry Timing diagnostics unavailable: {entry_error.detail}")
+            return 0
+        print_entry_timing_diagnostics(entry, journal, max(0, args.limit))
+        return 0
+    if args.json:
+        findings = audit_paths(args.journal, args.entry_timing, verbose=args.verbose)
+        provenances = classify_entry_timing_rows(entry, journal) if entry_error is None else []
+        summary = summarize_entry_timing_truth(provenances)
+        print(
+            json.dumps(
+                {
+                    "findings": [finding.__dict__ for finding in findings],
+                    "entry_timing": entry_timing_summary_dict(summary),
+                    "exit_code": exit_code(findings),
+                },
+                indent=2,
+            )
+        )
+        return exit_code(findings)
     findings = audit_paths(args.journal, args.entry_timing, verbose=args.verbose)
     print_findings(findings)
     return exit_code(findings)

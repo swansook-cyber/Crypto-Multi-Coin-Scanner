@@ -90,8 +90,15 @@ def build_readiness(include_services: bool = True) -> list[ReadinessItem]:
     readiness = entry_timing_operational_summary.readiness_status(linked)
     items.append(ReadinessItem("Entry Timing data status", "PASS" if readiness == "REVIEW READY" else "WARNING", f"{readiness}; linked_closed={linked}"))
 
-    stale_items = position_watcher_state_cleanup.stale_state_items(JOURNAL)
-    items.append(ReadinessItem("active stale state count", "PASS" if not stale_items else "WARNING", str(len(stale_items))))
+    watcher_state = position_watcher_state_cleanup.classify_cleanup(JOURNAL)
+    watcher_warnings = watcher_state.stale_canonical_active_entries + watcher_state.safe_to_remove + watcher_state.blocked_unsafe_path + watcher_state.blocked_identity_ambiguous
+    items.append(
+        ReadinessItem(
+            "active stale state count",
+            "PASS" if not watcher_warnings else "WARNING",
+            f"canonical={watcher_state.canonical_active_entries}; safe={watcher_state.safe_to_remove}; stale_active={watcher_state.stale_canonical_active_entries}; unsafe={watcher_state.blocked_unsafe_path}; ambiguous={watcher_state.blocked_identity_ambiguous}",
+        )
+    )
     lock_check = [check for check in health_checks if check.name == "duplicate-alert lock directory"]
     items.append(ReadinessItem("duplicate-alert protection", lock_check[0].status if lock_check else "WARNING", lock_check[0].detail if lock_check else "not checked"))
     return items
