@@ -401,7 +401,7 @@ cd /opt/Crypto-Multi-Coin-Scanner
 ./scripts/rollback_production.sh <commit>
 ```
 
-## Dashboard V3
+## Dashboard V2
 
 Run:
 
@@ -409,7 +409,16 @@ Run:
 streamlit run dashboard.py
 ```
 
-Dashboard V3 is a read-only Streamlit dashboard for optimization decisions. It reads existing CSV logs only and never sends Telegram messages, calls Binance, modifies logs, changes scanner strategy, or places trades.
+Dashboard V2 is a read-only Production Season 1 control center. It shows scanner
+status, active positions, position reviews, signal funnel, source-separated
+performance, scanner health, logs timeline, and daily summary. The deeper V3
+analytics sections remain available below the production overview. It reads
+existing CSV/log files only and never sends Telegram messages, calls Binance,
+modifies logs, changes scanner strategy, or places trades.
+
+If process status cannot be confirmed from systemd, Dashboard V2 shows
+`UNKNOWN` or `DATA STALE` instead of guessing that the scanner is running.
+Missing `source` values are shown as `Unknown`, not assumed to be Scanner.
 
 The full static analytics report is also written to:
 
@@ -418,7 +427,15 @@ reports\report.html
 reports\analytics.html
 ```
 
-Sections include Executive Summary, Equity/PnL/Drawdown/Monthly Analytics, Win/Loss Analytics, Drawdown Analytics, Symbol/Tier/Session Analytics, Long vs Short Analytics, Score/Confidence Analytics, TP/SL Analytics, External VIP Signal Analytics, Position Manager Analytics, and Risk-Quality Views.
+Production sections include Production Overview, Active Positions, Position
+Review, Signal Funnel / Quality, Performance Today / 7 Days / 30 Days, Scanner
+Health, Logs Timeline, and Daily Summary.
+
+Analytics sections include Executive Summary, Equity/PnL/Drawdown/Monthly
+Analytics, Win/Loss Analytics, Drawdown Analytics, Symbol/Tier/Session
+Analytics, Long vs Short Analytics, Score/Confidence Analytics, TP/SL Analytics,
+External VIP Signal Analytics, Position Manager Analytics, and Risk-Quality
+Views.
 
 It shows KPI cards, equity curve/cumulative Net R, green/red daily PnL histogram, drawdown curve, max drawdown R, monthly performance summary, account growth simulator for 100/500/1000 USDT examples, daily wins/losses, daily net R, win rate and net R by symbol/tier/session/direction, score and confidence bucket performance, TP/SL distribution, external VIP approval/rejection summary, high-score losses, low-score wins, high-drawdown winners, fast SL trades, slow TP trades, repeated losses, Tier C risk review, recent signals, closed trades, open positions, and position manager history.
 
@@ -434,6 +451,9 @@ logs/source_performance.csv
 logs/position_management.csv
 logs/external_signals.csv
 ```
+
+See `DASHBOARD_V2.md` for data source mapping, N/A metrics, safety boundaries,
+and rollback notes.
 
 ## Position Management Advisor
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Streamlit Dashboard V3 for Crypto Multi-Coin Scanner performance.
+"""Streamlit Dashboard V2/V3 for Crypto Multi-Coin Scanner production monitoring.
 
 The dashboard is read-only: it reads local CSV logs and never sends Telegram,
 places trades, calls exchange APIs, or mutates log files.
@@ -7,22 +7,26 @@ places trades, calls exchange APIs, or mutates log files.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+import os
+import re
+import shutil
+import subprocess
 
 import pandas as pd
+from dotenv import load_dotenv
 
 from core.analytics_reporting import load_csv_safely
 from core.performance_analytics_v2 import build_performance_v2, generate_performance_warnings
 from performance_report import build_report, estimate_r, normalize, sent_signals
-from position_manager import latest_open_positions
-
 
 BASE_DIR = Path(__file__).resolve().parent
 LOGS_DIR = BASE_DIR / "logs"
 REPORTS_DIR = BASE_DIR / "reports"
 DASHBOARD_HTML = REPORTS_DIR / "dashboard.html"
+STALE_DATA_THRESHOLD_MINUTES = 90
 
 DATA_PATHS = {
     "signals": LOGS_DIR / "signals.csv",
@@ -38,6 +42,86 @@ DATA_PATHS = {
     "performance_warnings": LOGS_DIR / "performance_warnings.csv",
 }
 
+LOG_PATHS = [
+    LOGS_DIR / "cornix_agent.log",
+    BASE_DIR / "cornix_agent.log",
+]
+
+
+def _series(df: pd.DataFrame, column: str, default: Any = "") -> pd.Series:
+    if column in df.columns:
+        return df[column].fillna(default)
+    return pd.Series([default] * len(df), index=df.index)
+
+
+def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series([float("nan")] * len(df), index=df.index)
+    values = pd.to_numeric(df[column], errors="coerce")
+    return values.replace([float("inf"), float("-inf")], pd.NA)
+
+
+def _timestamp_series(df: pd.DataFrame, column: str = "timestamp") -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(pd.NaT, index=df.index)
+    return pd.to_datetime(df[column], utc=True, errors="coerce")
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _fmt_dt(value: Any) -> str:
+    parsed = pd.to_datetime(pd.Series([value]), utc=True, errors="coerce").iloc[0]
+    if pd.isna(parsed):
+        return "N/A"
+    return parsed.isoformat()
+
+
+def _fmt_percent(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric) or numeric in [float("inf"), float("-inf")]:
+        return "N/A"
+    return f"{float(numeric):.1f}%"
+
+
+def _fmt_price(value: Any) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric) or numeric in [float("inf"), float("-inf")]:
+        return "N/A"
+    return f"{float(numeric):.6g}"
+
+
+def _latest_file_time(paths: list[Path]) -> datetime | None:
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        return None
+    latest = max(path.stat().st_mtime for path in existing)
+    return datetime.fromtimestamp(latest, tz=timezone.utc)
+
+
+def _systemctl_state(service: str = "crypto-scanner.service") -> str | None:
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", service],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    state = (result.stdout or result.stderr or "").strip().lower()
+    if state == "active":
+        return "RUNNING"
+    if state in {"inactive", "failed", "deactivating"}:
+        return "STOPPED"
+    if state:
+        return state.upper()
+    return None
+
 
 def _ensure_columns(df: pd.DataFrame, defaults: dict[str, Any]) -> pd.DataFrame:
     data = df.copy()
@@ -47,13 +131,61 @@ def _ensure_columns(df: pd.DataFrame, defaults: dict[str, Any]) -> pd.DataFrame:
     return data
 
 
+def _report_safe_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a normalized signals frame that is safe for report builders."""
+    raw = df.copy()
+    source_missing = "source" not in raw.columns
+    defaults = {
+        "timestamp": "",
+        "symbol": "",
+        "side": "",
+        "source": "Unknown",
+        "watchlist_tier": "-",
+        "market_session": "Other",
+        "entry": "",
+        "stop_loss": "",
+        "tp1": "",
+        "tp2": "",
+        "tp3": "",
+        "risk_reward": "",
+        "result": "OPEN",
+        "hit_target": "",
+        "signal_status": "sent",
+        "pnl_percent": "",
+        "closed_at": "",
+        "max_profit_pct": "",
+        "max_drawdown_pct": "",
+        "raw_score": "",
+        "setup_strength": "",
+        "score_bucket": "-",
+        "current_price": "",
+        "tp1_alert_sent": 0,
+        "breakeven_recommended": 0,
+        "position_management_stage": "",
+        "position_recommendation": "",
+        "position_reason": "",
+        "signal_id": "",
+    }
+    data = _ensure_columns(raw, defaults)
+    data = normalize(data)
+    for column, default in defaults.items():
+        if column not in data.columns:
+            data[column] = default
+    if "source" in data.columns:
+        fallback = "Unknown" if source_missing else "Unknown"
+        data["source"] = data["source"].fillna(fallback).replace("", fallback).astype(str)
+        data.loc[data["source"].str.strip().eq(""), "source"] = fallback
+        data["source"] = data["source"].replace({"external": "External", "scanner": "Scanner", "refiner": "Refiner"})
+    return data
+
+
 def load_dashboard_data(paths: dict[str, Path] | None = None) -> dict[str, pd.DataFrame]:
     source_paths = paths or DATA_PATHS
     data = {name: load_csv_safely(path) for name, path in source_paths.items()}
-    signals = normalize(data.get("signals", pd.DataFrame()))
+    signals = _report_safe_signals(data.get("signals", pd.DataFrame()))
     if "source" not in signals.columns:
-        signals["source"] = "scanner"
-    signals["source"] = signals["source"].fillna("scanner").replace("", "scanner").astype(str).str.lower()
+        signals["source"] = "Unknown"
+    signals["source"] = signals["source"].fillna("Unknown").replace("", "Unknown").astype(str)
     if "score_bucket" not in signals.columns:
         signals["score_bucket"] = "-"
     if "setup_strength" not in signals.columns:
@@ -66,6 +198,464 @@ def load_dashboard_data(paths: dict[str, Path] | None = None) -> dict[str, pd.Da
     data["signals"] = signals
     data["sent"] = sent_signals(signals)
     return data
+
+
+def _empty_report() -> dict[str, Any]:
+    return {
+        "total_sent_signals": 0,
+        "closed_signals": 0,
+        "open_signals": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+        "tp1_hits": 0,
+        "tp2_hits": 0,
+        "tp3_hits": 0,
+        "sl_hits": 0,
+        "net_r_estimate": 0.0,
+    }
+
+
+def _safe_build_report(df: pd.DataFrame) -> dict[str, Any]:
+    if df.empty:
+        return _empty_report()
+    try:
+        report = build_report(df)
+    except (KeyError, ValueError, TypeError):
+        return _empty_report()
+    return {**_empty_report(), **report}
+
+
+def scanner_status_snapshot(paths: dict[str, Path] | None = None) -> dict[str, Any]:
+    source_paths = paths or DATA_PATHS
+    signals_path = source_paths.get("signals", DATA_PATHS["signals"])
+    latest = _latest_file_time([signals_path, *LOG_PATHS])
+    age_minutes = (_now_utc() - latest).total_seconds() / 60 if latest else None
+    service_state = _systemctl_state()
+    if service_state:
+        status = service_state
+    elif latest is None:
+        status = "UNKNOWN"
+    elif age_minutes is not None and age_minutes > STALE_DATA_THRESHOLD_MINUTES:
+        status = "DATA STALE"
+    else:
+        status = "UNKNOWN"
+    return {
+        "status": status,
+        "last_scan": latest.isoformat() if latest else "N/A",
+        "next_scan": (latest + timedelta(hours=1)).isoformat() if latest else "N/A",
+        "server_time": _now_utc().isoformat(),
+        "timezone": "UTC",
+        "data_age_minutes": round(age_minutes, 1) if age_minutes is not None else None,
+        "stale_warning": (
+            f"Latest scanner data is older than {STALE_DATA_THRESHOLD_MINUTES} minutes"
+            if age_minutes is not None and age_minutes > STALE_DATA_THRESHOLD_MINUTES
+            else "N/A"
+        ),
+    }
+
+
+def overview_metrics(data: dict[str, pd.DataFrame], paths: dict[str, Path] | None = None) -> dict[str, Any]:
+    sent = data.get("sent", pd.DataFrame())
+    active = active_positions(sent)
+    now = _now_utc()
+    ts = _timestamp_series(sent)
+    today = ts.dt.date == now.date() if len(sent) else pd.Series(dtype=bool)
+    last_7 = ts >= (now - timedelta(days=7)) if len(sent) else pd.Series(dtype=bool)
+    closed_7 = _closed(sent[last_7]) if len(sent) else pd.DataFrame()
+    wins_7 = int((_series(closed_7, "result").astype(str).str.upper() == "WIN").sum()) if not closed_7.empty else 0
+    rr = _numeric_series(sent, "risk_reward").dropna()
+    latest_regime = "N/A"
+    if "market_regime" in sent.columns and not sent.empty:
+        regimes = sent["market_regime"].dropna().astype(str)
+        regimes = regimes[regimes.str.strip() != ""]
+        if not regimes.empty:
+            latest_regime = regimes.iloc[-1]
+    snapshot = scanner_status_snapshot(paths)
+    return {
+        **snapshot,
+        "market_regime": latest_regime,
+        "active_positions": int(len(active)),
+        "signals_today": int(today.sum()) if len(sent) else 0,
+        "win_rate_7d": wins_7 / len(closed_7) * 100 if len(closed_7) else None,
+        "average_rr": float(rr.mean()) if not rr.empty else None,
+    }
+
+
+def _position_age_hours(row: pd.Series, now: datetime | None = None) -> float | None:
+    parsed = pd.to_datetime(pd.Series([row.get("timestamp")]), utc=True, errors="coerce").iloc[0]
+    if pd.isna(parsed):
+        return None
+    return max(0.0, ((_now_utc() if now is None else now) - parsed.to_pydatetime()).total_seconds() / 3600)
+
+
+def _progress_to_tp1(row: pd.Series) -> float | None:
+    side = str(row.get("side", "")).upper()
+    entry = pd.to_numeric(pd.Series([row.get("entry")]), errors="coerce").iloc[0]
+    tp1 = pd.to_numeric(pd.Series([row.get("tp1")]), errors="coerce").iloc[0]
+    current = pd.to_numeric(pd.Series([row.get("current_price")]), errors="coerce").iloc[0]
+    if (
+        pd.isna(entry) or pd.isna(tp1) or pd.isna(current)
+        or entry in [float("inf"), float("-inf")]
+        or tp1 in [float("inf"), float("-inf")]
+        or current in [float("inf"), float("-inf")]
+        or tp1 == entry
+    ):
+        return None
+    if side == "SHORT":
+        progress = (entry - current) / (entry - tp1) * 100
+    else:
+        progress = (current - entry) / (tp1 - entry) * 100
+    return float(max(0.0, min(100.0, progress)))
+
+
+def _distance_pct(from_price: Any, to_price: Any) -> float | None:
+    start = pd.to_numeric(pd.Series([from_price]), errors="coerce").iloc[0]
+    target = pd.to_numeric(pd.Series([to_price]), errors="coerce").iloc[0]
+    if (
+        pd.isna(start) or pd.isna(target)
+        or start in [float("inf"), float("-inf")]
+        or target in [float("inf"), float("-inf")]
+        or start == 0
+    ):
+        return None
+    return float(abs(target - start) / abs(start) * 100)
+
+
+def _current_pnl_pct(row: pd.Series) -> float | None:
+    side = str(row.get("side", "")).upper()
+    entry = pd.to_numeric(pd.Series([row.get("entry")]), errors="coerce").iloc[0]
+    current = pd.to_numeric(pd.Series([row.get("current_price")]), errors="coerce").iloc[0]
+    if (
+        pd.isna(entry) or pd.isna(current)
+        or entry in [float("inf"), float("-inf")]
+        or current in [float("inf"), float("-inf")]
+        or entry <= 0 or current <= 0
+    ):
+        return None
+    if side == "SHORT":
+        return float((entry - current) / entry * 100)
+    return float((current - entry) / entry * 100)
+
+
+def _tp1_already_reached(row: pd.Series) -> bool:
+    hit = str(row.get("hit_target", "")).strip().upper()
+    if hit in {"TP1", "TP2", "TP3", "1", "2", "3"}:
+        return True
+    for column in ["tp1_alert_sent", "breakeven_recommended"]:
+        value = str(row.get(column, "")).strip().lower()
+        if value in {"1", "true", "yes", "y"}:
+            return True
+    stage = str(row.get("position_management_stage", "")).upper()
+    return "TP1_REACHED" in stage
+
+
+def active_positions(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=df.columns)
+    source = _report_safe_signals(df)
+    status = _series(source, "signal_status").astype(str).str.lower()
+    result = _series(source, "result").astype(str).str.upper()
+    data = source[(status == "sent") & (result == "OPEN")].copy()
+    if data.empty:
+        return data
+    data["parsed_ts"] = _timestamp_series(data)
+    data = data.sort_values("parsed_ts", ascending=False).drop_duplicates("symbol", keep="first")
+    if "current_price" not in data.columns:
+        data["current_price"] = pd.NA
+    if "tp3" not in data.columns:
+        data["tp3"] = pd.NA
+    if "source" not in data.columns:
+        data["source"] = "Unknown"
+    if "signal_id" not in data.columns:
+        data["signal_id"] = _series(data, "timestamp")
+    data["time_open_hours"] = data.apply(_position_age_hours, axis=1)
+    data["progress_to_tp1_pct"] = data.apply(_progress_to_tp1, axis=1)
+    data["current_pnl_pct"] = data.apply(_current_pnl_pct, axis=1)
+    data["distance_to_tp1_pct"] = data.apply(
+        lambda row: row.get("distance_to_tp1_pct") if "distance_to_tp1_pct" in data.columns and pd.notna(row.get("distance_to_tp1_pct")) else _distance_pct(row.get("current_price"), row.get("tp1")),
+        axis=1,
+    )
+    data["distance_to_sl_pct"] = data.apply(
+        lambda row: row.get("distance_to_sl_pct") if "distance_to_sl_pct" in data.columns and pd.notna(row.get("distance_to_sl_pct")) else _distance_pct(row.get("current_price"), row.get("stop_loss")),
+        axis=1,
+    )
+    data["dashboard_status"] = data.apply(position_status, axis=1)
+    return data
+
+
+def position_status(row: pd.Series) -> str:
+    if _tp1_already_reached(row):
+        return "positive"
+    distance_sl = pd.to_numeric(pd.Series([row.get("distance_to_sl_pct")]), errors="coerce").iloc[0]
+    if pd.notna(distance_sl) and float(distance_sl) <= 0.75:
+        return "danger"
+    age = row.get("time_open_hours")
+    progress = row.get("progress_to_tp1_pct")
+    if age is not None and pd.notna(age) and float(age) >= 6 and (progress is None or pd.isna(progress) or float(progress) < 100):
+        return "warning"
+    pnl = pd.to_numeric(pd.Series([row.get("current_pnl_pct")]), errors="coerce").iloc[0]
+    if pd.notna(pnl) and float(pnl) > 0:
+        return "positive"
+    return "neutral"
+
+
+def position_review_queue(df: pd.DataFrame) -> pd.DataFrame:
+    active = active_positions(df)
+    if active.empty:
+        return pd.DataFrame(
+            columns=[
+                "symbol", "time_open_hours", "current_pnl_pct", "distance_to_tp1_pct",
+                "distance_to_sl_pct", "same_direction_signal", "opposite_direction_signal",
+                "review_reason", "recommendation",
+            ]
+        )
+    rows: list[dict[str, Any]] = []
+    latest_by_symbol = df.copy()
+    latest_by_symbol["parsed_ts"] = _timestamp_series(latest_by_symbol)
+    for _, position in active.iterrows():
+        symbol = str(position.get("symbol", ""))
+        side = str(position.get("side", "")).upper()
+        history = latest_by_symbol[_series(latest_by_symbol, "symbol").astype(str) == symbol]
+        later = history[history["parsed_ts"] > pd.to_datetime(position.get("timestamp"), utc=True, errors="coerce")]
+        later_side = _series(later, "side").astype(str).str.upper() if not later.empty else pd.Series(dtype=str)
+        same = bool((later_side == side).any()) if not later.empty else False
+        opposite = bool((later_side.isin({"LONG", "SHORT"}) & (later_side != side)).any()) if not later.empty else False
+        reasons = []
+        age = position.get("time_open_hours")
+        progress = position.get("progress_to_tp1_pct")
+        tp1_reached = _tp1_already_reached(position) or (progress is not None and pd.notna(progress) and float(progress) >= 100)
+        if age is not None and pd.notna(age) and float(age) >= 6 and not tp1_reached:
+            reasons.append("open >6h and TP1 not reached")
+        if same:
+            reasons.append("same direction signal exists")
+        if opposite:
+            reasons.append("opposite direction signal exists")
+        if str(position.get("dashboard_status")) == "danger":
+            reasons.append("near SL")
+        recommendation = position.get("position_recommendation") or position.get("position_management_stage") or "REVIEW REQUIRED"
+        if not str(recommendation).strip() or str(recommendation).strip().upper() in {"N/A", "NAN", "NONE"}:
+            recommendation = "REVIEW REQUIRED"
+        if reasons:
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "time_open_hours": age,
+                    "current_pnl_pct": position.get("current_pnl_pct"),
+                    "distance_to_tp1_pct": position.get("distance_to_tp1_pct"),
+                    "distance_to_sl_pct": position.get("distance_to_sl_pct"),
+                    "same_direction_signal": "YES" if same else "NO",
+                    "opposite_direction_signal": "YES" if opposite else "NO",
+                    "review_reason": "; ".join(reasons),
+                    "recommendation": recommendation,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def signal_funnel(df: pd.DataFrame) -> dict[str, Any]:
+    if df.empty:
+        return {
+            "Total Coins Scanned": "N/A",
+            "Candidates Found": 0,
+            "Rejected by Rule Filter": 0,
+            "Rejected by RR": 0,
+            "Rejected by Confidence": 0,
+            "Sent to AI": 0,
+            "AI Approved": "N/A",
+            "AI Rejected": "N/A",
+            "Signals Sent": 0,
+            "Outcome Pending": 0,
+        }
+    status = _series(df, "signal_status").astype(str).str.lower()
+    reason = _series(df, "skip_reason").astype(str).str.lower()
+    ai_summary = _series(df, "ai_summary").astype(str)
+    result = _series(df, "result").astype(str).str.upper()
+    return {
+        "Total Coins Scanned": "N/A",
+        "Candidates Found": int(len(df)),
+        "Rejected by Rule Filter": int(status.str.contains("skipped|filter|guard|cooldown|correlation", regex=True).sum()),
+        "Rejected by RR": int(reason.str.contains("rr|risk_reward|risk reward", regex=True).sum()),
+        "Rejected by Confidence": int(reason.str.contains("confidence|strength|score", regex=True).sum()),
+        "Sent to AI": int(ai_summary.str.strip().ne("").sum()),
+        "AI Approved": "N/A",
+        "AI Rejected": "N/A",
+        "Signals Sent": int((status == "sent").sum()),
+        "Outcome Pending": int(((status == "sent") & result.eq("OPEN")).sum()),
+    }
+
+
+def performance_windows(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    now = _now_utc()
+    ts = _timestamp_series(df)
+    windows = {
+        "Today": df[ts.dt.date == now.date()] if len(df) else df,
+        "7 Days": df[ts >= now - timedelta(days=7)] if len(df) else df,
+        "30 Days": df[ts >= now - timedelta(days=30)] if len(df) else df,
+    }
+    rows = []
+    source_values: list[str] = []
+    if "source" in df.columns and not df.empty:
+        source_values = sorted(
+            value for value in _series(df, "source", "Unknown").astype(str).replace("", "Unknown").unique().tolist()
+            if value and value.lower() not in {"nan", "none"}
+        )
+    if not source_values:
+        source_values = ["Unknown"]
+    for source in ["All", *source_values]:
+        source_df = df if source == "All" or "source" not in df.columns else df[_series(df, "source", "Unknown").astype(str).eq(source)]
+        for label, group in windows.items():
+            subset = source_df.loc[group.index.intersection(source_df.index)] if source != "all" else group
+            closed = _closed(subset)
+            wins = int((_series(closed, "result").astype(str).str.upper() == "WIN").sum()) if not closed.empty else 0
+            losses = int((_series(closed, "result").astype(str).str.upper() == "LOSS").sum()) if not closed.empty else 0
+            rr = _numeric_series(subset, "risk_reward").dropna()
+            realized = closed.apply(estimate_r, axis=1) if not closed.empty else pd.Series(dtype=float)
+            positive = realized[realized > 0]
+            negative = realized[realized < 0]
+            profit_factor = float(positive.sum() / abs(negative.sum())) if not negative.empty and abs(negative.sum()) > 0 else None
+            best_symbol, worst_symbol = _best_worst_by_win_rate(subset, "symbol")
+            best_session, worst_session = _best_worst_by_win_rate(subset, "market_session")
+            rows.append(
+                {
+                    "source": source,
+                    "window": label,
+                    "total_signals": int(len(subset)),
+                    "wins": wins,
+                    "losses": losses,
+                    "open": int((_series(subset, "result").astype(str).str.upper() == "OPEN").sum()) if not subset.empty else 0,
+                    "win_rate": wins / len(closed) * 100 if len(closed) else None,
+                    "average_rr": float(rr.mean()) if not rr.empty else None,
+                    "average_realized_r": float(realized.mean()) if not realized.empty else None,
+                    "total_realized_r": float(realized.sum()) if not realized.empty else 0.0,
+                    "profit_factor": profit_factor,
+                    "best_symbol": best_symbol,
+                    "worst_symbol": worst_symbol,
+                    "best_session": best_session,
+                    "worst_session": worst_session,
+                }
+            )
+    return {"performance": pd.DataFrame(rows)}
+
+
+def health_snapshot(paths: dict[str, Path] | None = None) -> dict[str, Any]:
+    load_dotenv(BASE_DIR / ".env")
+    source_paths = paths or DATA_PATHS
+    signals_path = source_paths.get("signals", DATA_PATHS["signals"])
+    latest_log = _latest_file_time(LOG_PATHS)
+    log_errors = dashboard_log_timeline(limit=500)
+    today = _now_utc().date()
+    error_today = 0
+    if not log_errors.empty and "timestamp" in log_errors.columns:
+        parsed = pd.to_datetime(log_errors["timestamp"], utc=True, errors="coerce")
+        error_today = int(((parsed.dt.date == today) & log_errors["level"].isin(["ERROR", "WARNING"])).sum())
+    try:
+        disk = shutil.disk_usage(BASE_DIR)
+        disk_usage = f"{(disk.used / disk.total * 100):.1f}%"
+    except OSError:
+        disk_usage = "N/A"
+    status = scanner_status_snapshot(source_paths)
+    return {
+        "Process Status": status["status"],
+        "Data Freshness": status["stale_warning"],
+        "Last Successful Scan": status["last_scan"],
+        "Scan Duration": "N/A",
+        "Binance API Status": "N/A",
+        "Binance Latency": "N/A",
+        "Gemini API Status": "Configured" if os.getenv("GEMINI_API_KEY") else "N/A",
+        "Gemini Latency": "N/A",
+        "Telegram Status": "Configured" if os.getenv("TELEGRAM_BOT_TOKEN") else "N/A",
+        "Database Status": "PASS" if signals_path.exists() else "N/A",
+        "Disk Usage": disk_usage,
+        "CPU Usage": "N/A",
+        "RAM Usage": "N/A",
+        "Last Error": latest_error_message(log_errors),
+        "Error Count Today": error_today,
+        "Latest Log Time": latest_log.isoformat() if latest_log else "N/A",
+    }
+
+
+def latest_error_message(events: pd.DataFrame) -> str:
+    if events.empty or "level" not in events.columns:
+        return "N/A"
+    errors = events[events["level"].isin(["ERROR", "WARNING"])]
+    if errors.empty:
+        return "N/A"
+    return str(errors.iloc[-1].get("message", "N/A"))[:180]
+
+
+def dashboard_log_timeline(limit: int = 200) -> pd.DataFrame:
+    path = next((item for item in LOG_PATHS if item.exists()), None)
+    if path is None:
+        return pd.DataFrame(columns=["timestamp", "level", "source", "event_type", "status", "message", "raw"])
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    except Exception:
+        return pd.DataFrame(columns=["timestamp", "level", "source", "event_type", "status", "message", "raw"])
+    rows = []
+    pattern = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} [^|]+)\|\s*(?P<level>[A-Z]+)\s*\|\s*(?P<msg>.*)$")
+    for raw in lines:
+        match = pattern.match(raw)
+        timestamp = match.group("ts").strip() if match else ""
+        level = match.group("level").strip() if match else "INFO"
+        message = match.group("msg").strip() if match else raw.strip()
+        lower = message.lower()
+        if "approved" in lower or "signal sent" in lower:
+            status = "Approved"
+        elif "reject" in lower or "skip" in lower:
+            status = "Rejected"
+        elif "error" in lower or level == "ERROR":
+            status = "Error"
+        else:
+            status = "Info"
+        if "gemini" in lower:
+            event_type = "AI"
+        elif "outcome" in lower or "tp" in lower or "sl" in lower:
+            event_type = "Outcome"
+        elif "telegram" in lower:
+            event_type = "Telegram"
+        elif "external" in lower:
+            event_type = "External"
+        else:
+            event_type = "Scanner"
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "level": level,
+                "source": event_type,
+                "event_type": event_type,
+                "status": status,
+                "message": message[:220],
+                "raw": raw,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def daily_summary_panel(df: pd.DataFrame) -> dict[str, Any]:
+    now = _now_utc()
+    ts = _timestamp_series(df)
+    today_df = df[ts.dt.date == now.date()] if len(df) else df
+    closed = _closed(today_df)
+    wins = int((_series(closed, "result").astype(str).str.upper() == "WIN").sum()) if not closed.empty else 0
+    losses = int((_series(closed, "result").astype(str).str.upper() == "LOSS").sum()) if not closed.empty else 0
+    open_count = int((_series(today_df, "result").astype(str).str.upper() == "OPEN").sum()) if not today_df.empty else 0
+    symbol_perf = performance_table(df, "symbol")
+    avoid = []
+    strong = []
+    if not symbol_perf.empty:
+        strong = symbol_perf.sort_values(["net_r", "win_rate"], ascending=[False, False]).head(3)["symbol"].astype(str).tolist()
+        avoid = symbol_perf[(symbol_perf["closed"] >= 5) & (symbol_perf["net_r"] < 0)].sort_values("net_r").head(3)["symbol"].astype(str).tolist()
+    health = health_snapshot()
+    return {
+        "Signals Today": int(len(today_df)),
+        "Win / Loss / Open": f"{wins}/{losses}/{open_count}",
+        "Total R": f"{_net_r(today_df):.2f}R",
+        "Strongest Symbols": ", ".join(strong) if strong else "N/A",
+        "Symbols To Avoid": ", ".join(avoid) if avoid else "N/A",
+        "Positions To Review": int(len(position_review_queue(df))),
+        "Scanner Health Summary": health["Process Status"],
+    }
 
 
 def _closed(df: pd.DataFrame) -> pd.DataFrame:
@@ -385,7 +975,7 @@ def latest_signals(df: pd.DataFrame, limit: int = 25) -> pd.DataFrame:
 
 
 def open_positions(df: pd.DataFrame) -> pd.DataFrame:
-    open_df = latest_open_positions(df)
+    open_df = active_positions(df)
     columns = [
         "timestamp", "symbol", "side", "entry", "tp1", "tp2", "stop_loss",
         "position_recommendation", "current_r", "distance_to_tp1_pct", "distance_to_sl_pct",
@@ -439,7 +1029,7 @@ def apply_filters(
         data = data[data["market_session"].isin(sessions)]
     if sides and "side" in data.columns:
         data = data[data["side"].isin(sides)]
-    if sources and "source" in data.columns:
+    if sources and "All" not in sources and "source" in data.columns:
         data = data[data["source"].isin(sources)]
     if results and "result" in data.columns:
         data = data[data["result"].isin(results)]
@@ -524,9 +1114,56 @@ def warning_table(df: pd.DataFrame) -> pd.DataFrame:
 def _format_metric(value: Any) -> str:
     if value is None:
         return "N/A"
+    if isinstance(value, str):
+        return value if value.strip() else "N/A"
     if isinstance(value, float):
         return f"{value:.1f}"
     return str(value)
+
+
+def _badge(status: str) -> str:
+    value = str(status or "N/A")
+    cls = "neutral"
+    if value.upper() in {"RUNNING", "PASS", "POSITIVE", "APPROVED"}:
+        cls = "positive"
+    elif value.upper() in {"DEGRADED", "WARNING", "DATA STALE"}:
+        cls = "warning"
+    elif value.upper() in {"STOPPED", "FAIL", "DANGER", "ERROR"}:
+        cls = "danger"
+    return f"<span class='badge {cls}'>{value}</span>"
+
+
+def _display_position_card(st: Any, row: pd.Series) -> None:
+    status = str(row.get("dashboard_status", "neutral"))
+    side = str(row.get("side", "N/A")).upper()
+    symbol = str(row.get("symbol", "N/A"))
+    border = {"positive": "#22c55e", "warning": "#f59e0b", "danger": "#ef4444"}.get(status, "#334155")
+    st.markdown(
+        f"""
+<div class="position-card" style="border-left-color:{border}">
+  <div class="position-head">
+    <strong>{symbol}</strong>
+    <span class="side {side.lower()}">{side}</span>
+  </div>
+  <div class="position-grid">
+    <span>Setup</span><b>{_format_metric(row.get("setup_strength", row.get("confidence")))}</b>
+    <span>Entry</span><b>{_fmt_price(row.get("entry"))}</b>
+    <span>Current</span><b>{_fmt_price(row.get("current_price"))}</b>
+    <span>SL</span><b>{_fmt_price(row.get("stop_loss"))}</b>
+    <span>TP1</span><b>{_fmt_price(row.get("tp1"))}</b>
+    <span>TP2</span><b>{_fmt_price(row.get("tp2"))}</b>
+    <span>TP3</span><b>{_fmt_price(row.get("tp3"))}</b>
+    <span>PnL</span><b>{_fmt_percent(row.get("current_pnl_pct"))}</b>
+    <span>Progress to TP1</span><b>{_fmt_percent(row.get("progress_to_tp1_pct"))}</b>
+    <span>Time Open</span><b>{_format_metric(row.get("time_open_hours"))}h</b>
+    <span>Status</span><b>{status}</b>
+    <span>Source</span><b>{row.get("source", "Unknown")}</b>
+  </div>
+  <div class="muted-small">Signal ref: {row.get("signal_id", row.get("timestamp", "N/A"))}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 def _streamlit_app() -> None:
@@ -535,12 +1172,54 @@ def _streamlit_app() -> None:
     except ModuleNotFoundError as exc:
         raise SystemExit("Streamlit is not installed. Run: pip install -r requirements.txt") from exc
 
-    st.set_page_config(page_title="Crypto Scanner Dashboard V3", layout="wide")
+    st.set_page_config(page_title="Crypto Scanner Dashboard V2", layout="wide")
     data = load_dashboard_data()
     sent = data["sent"]
 
-    st.title("Crypto Multi-Coin Scanner Dashboard V3")
-    st.caption("Read-only analytics dashboard. No Telegram sends, no API calls, no log writes, no auto trading.")
+    st.markdown(
+        """
+<style>
+  .block-container { padding-top: 1rem; max-width: 1280px; }
+  div[data-testid="stMetric"] {
+    background: #101827;
+    border: 1px solid #1f2a44;
+    border-radius: 8px;
+    padding: 0.75rem;
+  }
+  div[data-testid="stMetric"] label,
+  div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
+    color: #cbd5e1 !important;
+  }
+  div[data-testid="stMetricValue"] {
+    color: #f8fafc !important;
+    font-size: 1.35rem;
+  }
+  div[data-testid="stMetricDelta"] { color: #cbd5e1 !important; }
+  .badge { display:inline-block; padding: 0.2rem 0.55rem; border-radius: 999px; font-size: 0.78rem; font-weight: 700; }
+  .badge.positive { background:#064e3b; color:#a7f3d0; }
+  .badge.warning { background:#78350f; color:#fde68a; }
+  .badge.danger { background:#7f1d1d; color:#fecaca; }
+  .badge.neutral { background:#1e293b; color:#cbd5e1; }
+  .position-card { background:#0f172a; border:1px solid #1e293b; border-left:5px solid #334155; border-radius:8px; padding:14px; margin-bottom:12px; }
+  .position-head { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px; }
+  .side { padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; }
+  .side.long { background:#064e3b; color:#a7f3d0; }
+  .side.short { background:#7f1d1d; color:#fecaca; }
+  .position-grid { display:grid; grid-template-columns:minmax(96px, 1fr) minmax(90px, 1fr); gap:5px 12px; font-size:0.9rem; }
+  .position-grid span, .muted-small { color:#94a3b8; }
+  .muted-small { margin-top:10px; font-size:0.78rem; word-break:break-word; }
+  @media (max-width: 640px) {
+    .block-container { padding-left: 0.8rem; padding-right: 0.8rem; }
+    div[data-testid="stMetricValue"] { font-size: 1.05rem; }
+    .position-grid { grid-template-columns:1fr 1fr; font-size:0.82rem; }
+  }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.title("Crypto Multi-Coin Scanner Dashboard V2")
+    st.caption("Production Season 1 control center. Read-only: no Telegram sends, no API calls, no log writes, no auto trading.")
 
     with st.sidebar:
         st.header("Filters")
@@ -574,7 +1253,9 @@ def _streamlit_app() -> None:
             100,
             (int(confidence_values.min()), int(confidence_values.max())) if not confidence_values.empty else (0, 100),
         )
-        sources = st.multiselect("Source", sorted(sent["source"].dropna().unique().tolist()) if "source" in sent.columns else [])
+        source_values = sorted(sent["source"].dropna().astype(str).replace("", "Unknown").unique().tolist()) if "source" in sent.columns else []
+        source_options = ["All", *sorted(set(["Scanner", "Refiner", "External", "Unknown", *source_values]))]
+        sources = st.multiselect("Source", source_options, default=["All"])
 
     filtered = apply_filters(
         sent,
@@ -592,6 +1273,95 @@ def _streamlit_app() -> None:
     )
     filtered = ensure_score_buckets(filtered)
     kpis = dashboard_kpis(filtered)
+
+    overview = overview_metrics(data)
+    active = active_positions(filtered)
+    reviews = position_review_queue(filtered)
+    funnel = signal_funnel(filtered)
+    perf = performance_windows(filtered)["performance"]
+    health = health_snapshot()
+    logs = dashboard_log_timeline()
+    daily_panel = daily_summary_panel(filtered)
+
+    st.markdown("### Production Overview")
+    st.markdown(
+        f"Scanner Status: {_badge(overview['status'])} &nbsp; "
+        f"Timezone: `{overview['timezone']}` &nbsp; "
+        f"Server Time: `{overview['server_time']}`",
+        unsafe_allow_html=True,
+    )
+    overview_cols = st.columns(4)
+    overview_items = [
+        ("Last Scan", overview["last_scan"]),
+        ("Next Scan", overview["next_scan"]),
+        ("Market Regime", overview["market_regime"]),
+        ("Active Positions", overview["active_positions"]),
+        ("Signals Today", overview["signals_today"]),
+        ("Win Rate 7D", _fmt_percent(overview["win_rate_7d"])),
+        ("Average RR", _format_metric(overview["average_rr"])),
+        ("Data Freshness", overview["stale_warning"]),
+    ]
+    for index, (label, value) in enumerate(overview_items):
+        overview_cols[index % 4].metric(label, _format_metric(value))
+
+    with st.expander("Active Positions", expanded=True):
+        if active.empty:
+            st.info("No active positions found in logs/signals.csv.")
+        else:
+            for _, row in active.iterrows():
+                _display_position_card(st, row)
+
+    with st.expander("Position Review", expanded=True):
+        st.caption("Advisory view only. Dashboard never opens, closes, or modifies positions.")
+        if reviews.empty:
+            st.success("No position review items from current data.")
+        else:
+            st.dataframe(reviews, use_container_width=True, hide_index=True)
+
+    with st.expander("Signal Funnel / Quality", expanded=True):
+        funnel_cols = st.columns(3)
+        for index, (label, value) in enumerate(funnel.items()):
+            funnel_cols[index % 3].metric(label, _format_metric(value))
+        st.caption("Missing granular scanner counters are shown as N/A instead of estimated.")
+
+    with st.expander("Performance: Today / 7 Days / 30 Days", expanded=True):
+        st.caption("Scanner and Signal Refiner are separated by source when source data exists.")
+        st.dataframe(perf, use_container_width=True, hide_index=True)
+
+    with st.expander("Scanner Health", expanded=True):
+        health_cols = st.columns(3)
+        for index, (label, value) in enumerate(health.items()):
+            health_cols[index % 3].metric(label, _format_metric(value))
+
+    with st.expander("Logs Timeline", expanded=True):
+        if logs.empty:
+            st.info("No readable scanner log found.")
+        else:
+            filter_cols = st.columns(5)
+            level_filter = filter_cols[0].multiselect("Level", sorted(logs["level"].dropna().unique().tolist()))
+            event_filter = filter_cols[1].multiselect("Event Type", sorted(logs["event_type"].dropna().unique().tolist()))
+            source_filter = filter_cols[2].multiselect("Source", sorted(logs["source"].dropna().unique().tolist()))
+            status_filter = filter_cols[3].multiselect("Approved / Rejected / Error", sorted(logs["status"].dropna().unique().tolist()))
+            symbol_filter = filter_cols[4].text_input("Symbol contains", "")
+            timeline = logs.copy()
+            if level_filter:
+                timeline = timeline[timeline["level"].isin(level_filter)]
+            if event_filter:
+                timeline = timeline[timeline["event_type"].isin(event_filter)]
+            if source_filter:
+                timeline = timeline[timeline["source"].isin(source_filter)]
+            if status_filter:
+                timeline = timeline[timeline["status"].isin(status_filter)]
+            if symbol_filter:
+                timeline = timeline[timeline["message"].str.contains(symbol_filter, case=False, na=False)]
+            st.dataframe(timeline[["timestamp", "level", "event_type", "status", "message"]].tail(120), use_container_width=True, hide_index=True)
+            with st.expander("Raw log lines"):
+                st.dataframe(timeline[["raw"]].tail(120), use_container_width=True, hide_index=True)
+
+    with st.expander("Daily Summary", expanded=True):
+        daily_cols = st.columns(3)
+        for index, (label, value) in enumerate(daily_panel.items()):
+            daily_cols[index % 3].metric(label, _format_metric(value))
 
     metric_columns = st.columns(4)
     for index, label in enumerate([
@@ -800,13 +1570,24 @@ def _table_html(df: pd.DataFrame) -> str:
 def render_dashboard(df: pd.DataFrame, output: Path = DASHBOARD_HTML) -> Path:
     """Backward-compatible static HTML renderer used by smoke tests."""
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    sent = sent_signals(df)
-    report = build_report(sent)
+    normalized = _report_safe_signals(df)
+    sent = sent_signals(normalized)
+    sent = _report_safe_signals(sent)
+    data = {"signals": normalized, "sent": sent}
+    report = _safe_build_report(sent)
     symbol_perf = performance_table(sent, "symbol")
     tier_perf = performance_table(sent, "watchlist_tier")
     session_perf = performance_table(sent, "market_session")
     direction_perf = performance_table(sent, "side")
     kpis = dashboard_kpis(sent)
+    overview = overview_metrics(data)
+    active = active_positions(sent)
+    reviews = position_review_queue(sent)
+    funnel = pd.DataFrame([signal_funnel(sent)])
+    perf_windows = performance_windows(sent)["performance"]
+    health = pd.DataFrame([health_snapshot()])
+    daily_panel = pd.DataFrame([daily_summary_panel(sent)])
+    timeline = dashboard_log_timeline().tail(20)
     v2 = build_performance_v2(sent)
     curve = equity_curve(sent)
     drawdown = drawdown_curve(sent)
@@ -836,8 +1617,13 @@ def render_dashboard(df: pd.DataFrame, output: Path = DASHBOARD_HTML) -> Path:
   </style>
 </head>
 <body>
-  <h1>Crypto Scanner Dashboard</h1>
-  <p class="muted">Local read-only dashboard. Telegram signal assistant only. No auto trading.</p>
+  <h1>Crypto Scanner Dashboard V2</h1>
+  <p class="muted">Production Season 1 read-only control center. Telegram signal assistant only. No auto trading.</p>
+
+  <section><h2>Production Overview</h2>
+    <p>Scanner Status: <strong>{overview['status']}</strong> | Last Scan: <strong>{overview['last_scan']}</strong> | Next Scan: <strong>{overview['next_scan']}</strong></p>
+    <p>Server Time: <strong>{overview['server_time']}</strong> | Market Regime: <strong>{overview['market_regime']}</strong></p>
+  </section>
 
   <section class="cards">
     <div class="card"><div class="label">Total Sent Signals</div><div class="value">{report['total_sent_signals']}</div></div>
@@ -850,6 +1636,13 @@ def render_dashboard(df: pd.DataFrame, output: Path = DASHBOARD_HTML) -> Path:
     <div class="card"><div class="label">Best Symbol</div><div class="value">{kpis['Best symbol']}</div></div>
   </section>
 
+  <section><h2>Active Positions</h2>{_table_html(active)}</section>
+  <section><h2>Position Review</h2>{_table_html(reviews)}</section>
+  <section><h2>Signal Funnel</h2>{_table_html(funnel)}</section>
+  <section><h2>Performance Today / 7 Days / 30 Days</h2>{_table_html(perf_windows)}</section>
+  <section><h2>Scanner Health</h2>{_table_html(health)}</section>
+  <section><h2>Logs Timeline</h2>{_table_html(timeline[["timestamp", "level", "event_type", "status", "message"]] if not timeline.empty else timeline)}</section>
+  <section><h2>Daily Summary</h2>{_table_html(daily_panel)}</section>
   <section><h2>Dashboard V3 Equity Curve</h2>{_table_html(curve.tail(50))}</section>
   <section><h2>Daily PnL Histogram Data</h2>{_table_html(daily.tail(50))}</section>
   <section><h2>Drawdown Curve</h2>{_table_html(drawdown.tail(50))}</section>

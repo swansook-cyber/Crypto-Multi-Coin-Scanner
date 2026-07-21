@@ -2858,7 +2858,10 @@ def test_dashboard_renders_html() -> None:
         dashboard.render_dashboard(df, output)
         html = output.read_text(encoding="utf-8")
         assert "Crypto Scanner Dashboard" in html
-        assert "Overview" not in html or "Total Signals" in html
+        assert "Production Overview" in html
+        assert "Signal Funnel" in html
+        assert "Scanner Health" in html
+        assert "Daily Summary" in html
         assert "Open Positions" in html
         assert "Top Performers" in html
         assert "Worst Performers" in html
@@ -2894,6 +2897,223 @@ def test_dashboard_v2_handles_missing_and_empty_data() -> None:
     assert dashboard.equity_curve(pd.DataFrame()).empty
     assert dashboard.daily_net_r(pd.DataFrame()).empty
     assert dashboard.analytics_suggestions(pd.DataFrame())
+    assert dashboard.active_positions(pd.DataFrame()).empty
+    assert dashboard.position_review_queue(pd.DataFrame()).empty
+    assert dashboard.signal_funnel(pd.DataFrame())["Total Coins Scanned"] == "N/A"
+    assert dashboard.performance_windows(pd.DataFrame())["performance"]["source"].tolist() == [
+        "All", "All", "All", "Unknown", "Unknown", "Unknown"
+    ]
+    output = Path(tempfile.gettempdir()) / "crypto_dashboard_empty_smoke.html"
+    try:
+        dashboard.render_dashboard(pd.DataFrame(), output)
+        assert "Production Overview" in output.read_text(encoding="utf-8")
+    finally:
+        output.unlink(missing_ok=True)
+
+
+def test_dashboard_v2_active_positions_reviews_and_source_split() -> None:
+    older = (datetime.now(timezone.utc) - pd.Timedelta(hours=7)).isoformat()
+    newer = (datetime.now(timezone.utc) - pd.Timedelta(hours=1)).isoformat()
+    df = performance_report.normalize(
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": older,
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "source": "Scanner",
+                    "watchlist_tier": "A",
+                    "market_session": "London",
+                    "entry": 100,
+                    "current_price": 100.5,
+                    "tp1": 104,
+                    "tp2": 108,
+                    "tp3": 112,
+                    "stop_loss": 98,
+                    "risk_reward": 2,
+                    "result": "OPEN",
+                    "signal_status": "sent",
+                    "setup_strength": 82,
+                },
+                {
+                    "timestamp": newer,
+                    "symbol": "BTCUSDT",
+                    "side": "SHORT",
+                    "source": "External",
+                    "watchlist_tier": "A",
+                    "market_session": "London",
+                    "entry": 99,
+                    "tp1": 97,
+                    "tp2": 95,
+                    "stop_loss": 101,
+                    "risk_reward": 2,
+                    "result": "SKIPPED",
+                    "signal_status": "skipped_position_management",
+                },
+                {
+                    "timestamp": newer,
+                    "closed_at": newer,
+                    "symbol": "ETHUSDT",
+                    "side": "SHORT",
+                    "source": "External",
+                    "watchlist_tier": "B",
+                    "market_session": "Asia",
+                    "entry": 100,
+                    "tp1": 98,
+                    "tp2": 96,
+                    "stop_loss": 102,
+                    "risk_reward": 2,
+                    "result": "WIN",
+                    "hit_target": "TP1",
+                    "signal_status": "sent",
+                },
+            ]
+        )
+    )
+    active = dashboard.active_positions(df)
+    assert len(active) == 1
+    assert active.iloc[0]["dashboard_status"] == "warning"
+    assert active.iloc[0]["progress_to_tp1_pct"] > 0
+    reviews = dashboard.position_review_queue(df)
+    assert len(reviews) == 1
+    assert reviews.iloc[0]["opposite_direction_signal"] == "YES"
+    assert "open >6h" in reviews.iloc[0]["review_reason"]
+    funnel = dashboard.signal_funnel(df)
+    assert funnel["Signals Sent"] == 2
+    perf = dashboard.performance_windows(df)["performance"]
+    assert set(perf["source"]) == {"All", "Scanner", "External"}
+    external_today = perf[(perf["source"] == "External") & (perf["window"] == "Today")].iloc[0]
+    assert int(external_today["wins"]) == 1
+    assert len(dashboard.apply_filters(df, sources=["All"])) == len(df)
+
+
+def test_dashboard_v2_position_math_and_status_safety() -> None:
+    now = datetime.now(timezone.utc)
+    older = (now - pd.Timedelta(hours=7)).isoformat()
+    newer = (now - pd.Timedelta(hours=1)).isoformat()
+    df = pd.DataFrame(
+        [
+            {
+                "timestamp": older,
+                "symbol": "LINKUSDT",
+                "side": "LONG",
+                "entry": "100",
+                "current_price": "105",
+                "tp1": "110",
+                "tp2": "120",
+                "stop_loss": "95",
+                "result": "OPEN",
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": newer,
+                "symbol": "LINKUSDT",
+                "side": "LONG",
+                "entry": "101",
+                "current_price": "106",
+                "tp1": "111",
+                "tp2": "121",
+                "stop_loss": "96",
+                "result": "OPEN",
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": older,
+                "symbol": "SUIUSDT",
+                "side": "SHORT",
+                "entry": "1.0",
+                "current_price": "0.9",
+                "tp1": "0.8",
+                "tp2": "0.7",
+                "stop_loss": "1.1",
+                "result": "OPEN",
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": older,
+                "symbol": "ETHUSDT",
+                "side": "LONG",
+                "entry": "100",
+                "tp1": "110",
+                "stop_loss": "95",
+                "hit_target": "TP1",
+                "result": "OPEN",
+                "signal_status": "sent",
+            },
+            {
+                "timestamp": "bad timestamp",
+                "symbol": "BADUSDT",
+                "side": "LONG",
+                "entry": "100",
+                "current_price": "inf",
+                "tp1": "110",
+                "stop_loss": "95",
+                "result": "OPEN",
+                "signal_status": "sent",
+            },
+        ]
+    )
+    active = dashboard.active_positions(df)
+    assert active["symbol"].tolist().count("LINKUSDT") == 1
+    link = active[active["symbol"] == "LINKUSDT"].iloc[0]
+    assert round(float(link["current_pnl_pct"]), 2) == 4.95
+    assert round(float(link["progress_to_tp1_pct"]), 1) == 50.0
+    sui = active[active["symbol"] == "SUIUSDT"].iloc[0]
+    assert round(float(sui["current_pnl_pct"]), 2) == 10.0
+    assert round(float(sui["progress_to_tp1_pct"]), 1) == 50.0
+    eth = active[active["symbol"] == "ETHUSDT"].iloc[0]
+    assert pd.isna(eth["current_pnl_pct"])
+    reviews = dashboard.position_review_queue(df)
+    assert "ETHUSDT" not in reviews.get("symbol", pd.Series(dtype=str)).tolist()
+    assert "SUIUSDT" in reviews["symbol"].tolist()
+    safe = dashboard._report_safe_signals(pd.DataFrame([{"symbol": "NOSOURCE", "result": "OPEN", "signal_status": "sent"}]))
+    assert safe.iloc[0]["source"] == "Unknown"
+
+
+def test_dashboard_v2_pending_and_closed_counts_are_safe() -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    df = dashboard._report_safe_signals(
+        pd.DataFrame(
+            [
+                {"timestamp": now, "symbol": "BTCUSDT", "side": "LONG", "source": "Scanner", "result": "WIN", "hit_target": "TP1", "signal_status": "sent", "risk_reward": 2},
+                {"timestamp": now, "symbol": "ETHUSDT", "side": "SHORT", "source": "Scanner", "result": "LOSS", "hit_target": "SL", "signal_status": "sent", "risk_reward": 2},
+                {"timestamp": now, "symbol": "SOLUSDT", "side": "LONG", "source": "Refiner", "result": "OPEN", "signal_status": "sent", "risk_reward": 3},
+                {"timestamp": now, "symbol": "XRPUSDT", "side": "LONG", "source": "External", "result": "SKIPPED", "signal_status": "logged_quality_filter"},
+            ]
+        )
+    )
+    perf = dashboard.performance_windows(df)["performance"]
+    all_today = perf[(perf["source"] == "All") & (perf["window"] == "Today")].iloc[0]
+    assert int(all_today["wins"]) == 1
+    assert int(all_today["losses"]) == 1
+    assert int(all_today["open"]) == 1
+    assert round(float(all_today["win_rate"]), 1) == 50.0
+    assert round(float(all_today["total_realized_r"]), 1) == 0.2
+    assert "Refiner" in set(perf["source"])
+    funnel = dashboard.signal_funnel(df)
+    assert funnel["Signals Sent"] == 3
+    assert funnel["Outcome Pending"] == 1
+
+
+def test_dashboard_v2_stale_and_health_unavailable_safe() -> None:
+    old_time = datetime.now(timezone.utc) - pd.Timedelta(hours=3)
+    original_systemctl = dashboard._systemctl_state
+    original_latest = dashboard._latest_file_time
+    original_disk = dashboard.shutil.disk_usage
+    try:
+        dashboard._systemctl_state = lambda service="crypto-scanner.service": None
+        dashboard._latest_file_time = lambda paths: old_time
+        dashboard.shutil.disk_usage = lambda path: (_ for _ in ()).throw(OSError("disk unavailable"))
+        snapshot = dashboard.scanner_status_snapshot()
+        assert snapshot["status"] == "DATA STALE"
+        assert "older than" in snapshot["stale_warning"]
+        health = dashboard.health_snapshot()
+        assert health["Process Status"] == "DATA STALE"
+        assert health["Disk Usage"] == "N/A"
+    finally:
+        dashboard._systemctl_state = original_systemctl
+        dashboard._latest_file_time = original_latest
+        dashboard.shutil.disk_usage = original_disk
 
 
 def test_dashboard_v3_equity_drawdown_monthly_simulator() -> None:
@@ -4924,6 +5144,10 @@ def main() -> int:
     test_performance_analytics_v3_missing_fields_safe()
     test_dashboard_renders_html()
     test_dashboard_v2_handles_missing_and_empty_data()
+    test_dashboard_v2_active_positions_reviews_and_source_split()
+    test_dashboard_v2_position_math_and_status_safety()
+    test_dashboard_v2_pending_and_closed_counts_are_safe()
+    test_dashboard_v2_stale_and_health_unavailable_safe()
     test_dashboard_v3_equity_drawdown_monthly_simulator()
     test_entry_timing_engine_shadow_csv_and_report_summary()
     test_scanner_final_candidate_writes_entry_timing_row()

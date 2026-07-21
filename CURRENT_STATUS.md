@@ -33,7 +33,7 @@
 - Daily summary reporting
 - Daily Performance Report via `performance_report.py`
 - Complete Performance Analytics V1 via `core/performance_analytics_v1.py`
-- Dashboard V3 as read-only Streamlit analytics app via `dashboard.py`
+- Dashboard V2/V3 as read-only Streamlit production control and analytics app via `dashboard.py`
 - Position Management Advisor V2 via `position_manager.py`
 - Real-Time Position Watcher V2 via `position_watcher.py`
 - Tier C Experimental Report-Only Mode via `ENABLE_TIER_C_REPORT_ONLY`
@@ -120,7 +120,7 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 - Current priority: production readiness, observability, data integrity, and stable VPS operations
 - Position Exit Advisor: pending
 - Advanced TP Engine: pending
-- Dashboard V2 optimization views: implemented; ongoing work is deployment hardening and calibration after more outcomes
+- Dashboard V2 production overview/control-center views: implemented; ongoing work is deployment hardening and calibration after more outcomes
 - Confidence/setup strength calibration: pending more real outcome data
 
 ## Production Notes

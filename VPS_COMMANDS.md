@@ -398,7 +398,7 @@ cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/streamlit run dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
 
-Dashboard V2 is read-only. It reads CSV logs from `logs/` and does not send Telegram, call Binance, place trades, modify logs, or change strategy settings.
+Dashboard V2 is read-only. It reads CSV logs from `logs/` and does not send Telegram, call Binance, place trades, modify logs, or change strategy settings. If systemd status is unavailable it shows `UNKNOWN` / `DATA STALE`, and missing signal source values are shown as `Unknown`.
 
 Position Management Advisor:
 
@@ -563,6 +563,9 @@ cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python performance_report.py
 .venv/bin/streamlit run dashboard.py --server.address 0.0.0.0 --server.port 8501
 ```
+
+Dashboard V2 is read-only and uses existing CSV/log files. It does not send
+Telegram, call Binance, place trades, modify logs, or change strategy settings.
 
 Slow data integrity audit:
 
