@@ -58,6 +58,22 @@ setup should remain paper/report-only for the pilot. It is not an order signal.
 
 See `MANUAL_LIVE_PILOT.md` for the full workflow.
 
+## Production Season Reset
+
+Before the first real-money Manual Live Pilot, archive development/testing
+statistics and start a clean production season:
+
+```bash
+python production_reset.py --dry-run
+python production_reset.py --archive --force --season-name Production_S1
+```
+
+The reset tool always creates a runtime backup first. If backup creation fails,
+the reset aborts before archiving or clearing any statistics. Archives are stored
+under `archive/<season_name>/` with `archive_manifest.json` and
+`RESET_REPORT.md`. Runtime config, `.env`, Git data, backups, documentation, and
+Production Universe settings are preserved.
+
 ## Files
 
 - `cornix_agent.py` - main scanner
@@ -67,6 +83,7 @@ See `MANUAL_LIVE_PILOT.md` for the full workflow.
 - `manual_live_pilot.py` - advisory-only manual pilot journal and policy guard
 - `manual_trade_plan.py` - manual risk calculator, no leverage recommendation
 - `live_pilot_preflight.py` - read-only pilot readiness check
+- `production_reset.py` - one-time pre-live-pilot statistics archive/reset tool
 - `stats_dashboard.py` - CSV analytics dashboard and report exporter
 - `tier_review.py` - tier promotion/demotion recommendation report
 - `logs/signals.csv` - generated signal journal

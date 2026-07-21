@@ -53,6 +53,7 @@
 - Manual Live Pilot controls via `manual_live_pilot.py`
 - Manual trade risk calculator via `manual_trade_plan.py`
 - Manual pilot preflight via `live_pilot_preflight.py`
+- Production Season Reset tool via `production_reset.py`
 - RC1 release snapshot via `RELEASE_CANDIDATE_V1.md`
 - Daily VPS operations checklist via `DAILY_OPERATIONS.md`
 - RC1.4 audit performance optimization: `data_integrity_audit.py --profile` and `--benchmark` are available; stale watcher cleanup now builds runtime indexes once per run.
@@ -129,6 +130,8 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 - Manual Live Pilot is policy/journal/advisory only; it never sends exchange orders
 - Keep `TRADING_MODE=PAPER` and `LIVE_PILOT_ENABLED=false` unless explicitly running the supervised manual pilot
 - Run `python live_pilot_preflight.py` before enabling or operating the pilot
+- Before first real-money pilot, run `python production_reset.py --dry-run`, then `python production_reset.py --archive --force --season-name Production_S1` only after reviewing the dry-run plan
+- `production_reset.py` archives first, writes `archive_manifest.json` and `RESET_REPORT.md`, and preserves `.env`, Git, backups, docs, and production settings
 - Use `python production_health.py`, `python data_integrity_audit.py`, and `python backup_runtime_data.py` before production updates
 - Use `python data_integrity_audit.py --profile` when audit runtime needs diagnosis; use `--benchmark` only for synthetic local performance checks
 - Current synthetic benchmark on local data: 5,000 source rows and 200 Entry Timing rows complete in roughly 1.7 seconds; production timings depend on VPS disk and CSV size

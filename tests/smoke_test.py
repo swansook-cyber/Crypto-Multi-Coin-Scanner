@@ -34,6 +34,7 @@ import performance_report
 import position_manager
 import position_watcher
 import position_watcher_state_cleanup
+import production_reset
 import production_health
 import production_v1_readiness
 import review_signals
@@ -4776,6 +4777,105 @@ def test_live_pilot_preflight_exit_codes() -> None:
     assert live_pilot_preflight.final_status(fail) == ("PILOT BLOCKED", 2)
 
 
+def test_production_reset_archive_reset_and_preserve_config() -> None:
+    temp_dir = Path(tempfile.gettempdir()) / "production_reset_smoke"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    (temp_dir / "logs").mkdir(parents=True)
+    (temp_dir / "reports").mkdir()
+    (temp_dir / "journal").mkdir()
+    (temp_dir / "backups").mkdir()
+    (temp_dir / ".env").write_text("SECRET=keep\n", encoding="utf-8")
+    (temp_dir / "logs" / "signals.csv").write_text("timestamp,symbol,result\n2026-01-01,BTCUSDT,WIN\n", encoding="utf-8")
+    (temp_dir / "logs" / "manual_live_pilot.csv").write_text("timestamp_utc,symbol,status\n2026-01-01,BTCUSDT,OPEN\n", encoding="utf-8")
+    (temp_dir / "reports" / "report.html").write_text("<html>old</html>", encoding="utf-8")
+    (temp_dir / "signal_state.json").write_text('{"daily": 3}\n', encoding="utf-8")
+
+    old_base = production_reset.BASE_DIR
+    old_archive = production_reset.ARCHIVE_ROOT
+    original_backup = production_reset.backup_runtime_data.create_backup
+    original_git = production_reset.git_commit
+    original_clean = production_reset.git_tracked_clean
+    production_reset.BASE_DIR = temp_dir
+    production_reset.ARCHIVE_ROOT = temp_dir / "archive"
+    production_reset.git_commit = lambda: "abc123"
+    production_reset.git_tracked_clean = lambda: True
+    def fake_backup() -> Path:
+        path = temp_dir / "backups" / "runtime.zip"
+        path.write_text("backup", encoding="utf-8")
+        return path
+
+    production_reset.backup_runtime_data.create_backup = fake_backup
+    try:
+        dry = production_reset.dry_run("Production_S1_Test")
+        assert dry.dry_run is True
+        assert "logs/signals.csv" in dry.archived_files
+        assert "logs/signals.csv" in dry.reset_files
+
+        result = production_reset.run_reset("Production_S1_Test", force=True)
+        archive = temp_dir / "archive" / "Production_S1_Test"
+        assert result.backup_path and result.backup_path.exists()
+        assert archive.exists()
+        assert (archive / "logs" / "signals.csv").read_text(encoding="utf-8").count("BTCUSDT") == 1
+        manifest = json.loads((archive / "archive_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["season_name"] == "Production_S1_Test"
+        assert manifest["git_commit"] == "abc123"
+        assert any(item["path"] == "logs/signals.csv" and item["sha256"] for item in manifest["files"])
+        assert (archive / "RESET_REPORT.md").exists()
+        assert (temp_dir / ".env").read_text(encoding="utf-8") == "SECRET=keep\n"
+        assert pd.read_csv(temp_dir / "logs" / "signals.csv").empty
+        assert json.loads((temp_dir / "signal_state.json").read_text(encoding="utf-8")) == {}
+        assert "Backup: PASS" in production_reset.format_summary(result)
+        assert "Git Clean: PASS" in production_reset.format_summary(result)
+    finally:
+        production_reset.BASE_DIR = old_base
+        production_reset.ARCHIVE_ROOT = old_archive
+        production_reset.backup_runtime_data.create_backup = original_backup
+        production_reset.git_commit = original_git
+        production_reset.git_tracked_clean = original_clean
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+
+
+def test_production_reset_backup_failure_aborts_and_force_cli() -> None:
+    temp_dir = Path(tempfile.gettempdir()) / "production_reset_failure_smoke"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    (temp_dir / "logs").mkdir(parents=True)
+    (temp_dir / "logs" / "signals.csv").write_text("timestamp,symbol\n2026-01-01,BTCUSDT\n", encoding="utf-8")
+
+    old_base = production_reset.BASE_DIR
+    old_archive = production_reset.ARCHIVE_ROOT
+    original_backup = production_reset.backup_runtime_data.create_backup
+    original_git = production_reset.git_commit
+    production_reset.BASE_DIR = temp_dir
+    production_reset.ARCHIVE_ROOT = temp_dir / "archive"
+    production_reset.git_commit = lambda: "abc123"
+    try:
+        production_reset.backup_runtime_data.create_backup = lambda: (_ for _ in ()).throw(RuntimeError("backup down"))
+        assert production_reset.main(["--archive", "--force", "--season-name", "Failure"]) == 1
+        assert not (temp_dir / "archive" / "Failure").exists()
+        assert "BTCUSDT" in (temp_dir / "logs" / "signals.csv").read_text(encoding="utf-8")
+
+        def fake_backup() -> Path:
+            path = temp_dir / "backup.zip"
+            path.write_text("backup", encoding="utf-8")
+            return path
+
+        production_reset.backup_runtime_data.create_backup = fake_backup
+        assert production_reset.main(["--dry-run", "--season-name", "DryRun"]) == 0
+        assert not (temp_dir / "archive" / "DryRun").exists()
+        assert production_reset.main(["--archive", "--force", "--season-name", "Force"]) == 0
+        assert (temp_dir / "archive" / "Force" / "archive_manifest.json").exists()
+    finally:
+        production_reset.BASE_DIR = old_base
+        production_reset.ARCHIVE_ROOT = old_archive
+        production_reset.backup_runtime_data.create_backup = original_backup
+        production_reset.git_commit = original_git
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -4867,6 +4967,8 @@ def main() -> int:
     test_manual_live_pilot_journal_backup_append_only_and_disable()
     test_manual_live_pilot_telegram_no_balance_and_cornix_unchanged()
     test_live_pilot_preflight_exit_codes()
+    test_production_reset_archive_reset_and_preserve_config()
+    test_production_reset_backup_failure_aborts_and_force_cli()
     print("smoke tests passed")
     return 0
 

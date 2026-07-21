@@ -21,6 +21,8 @@ exchange positions.
 - `manual_live_pilot.py`: advisory-only manual pilot policy and journal.
 - `manual_trade_plan.py`: manual risk calculator with no leverage advice.
 - `live_pilot_preflight.py`: read-only manual pilot readiness check.
+- `production_reset.py`: one-time pre-live-pilot archive/reset for development
+  statistics.
 - `system_status.py`: compact read-only production status console.
 - `data_integrity_audit.py --profile`: compact read-only audit timing report.
 - `data_integrity_audit.py --benchmark`: synthetic provenance benchmark that does
@@ -78,6 +80,17 @@ Create a runtime backup:
 cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python backup_runtime_data.py
 ```
+
+Archive and reset development/testing statistics before Manual Live Pilot:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python production_reset.py --dry-run
+.venv/bin/python production_reset.py --archive --force --season-name Production_S1
+```
+
+The reset tool aborts if runtime backup creation fails. It preserves `.env`,
+Git, backups, documentation, and production settings.
 
 Deploy safely:
 

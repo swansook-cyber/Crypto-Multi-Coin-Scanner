@@ -30,6 +30,19 @@ cd /opt/Crypto-Multi-Coin-Scanner
 sudo systemctl restart crypto-scanner.service
 ```
 
+One-time pre-live-pilot statistics reset:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python production_reset.py --dry-run
+.venv/bin/python production_reset.py --archive --force --season-name Production_S1
+```
+
+This creates a runtime backup first, writes `archive/Production_S1/`, generates
+`archive_manifest.json` and `RESET_REPORT.md`, then resets runtime statistics
+files. It preserves `.env`, Git, backups, docs, and production settings. Do not
+run it casually; it is intended for the pre-live-pilot season reset.
+
 Pilot `.env` values, only when supervised manual pilot is intentionally enabled:
 
 ```env
@@ -79,6 +92,7 @@ cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python data_integrity_audit.py
 .venv/bin/python entry_timing_operational_summary.py
 .venv/bin/python live_pilot_preflight.py
+.venv/bin/python production_reset.py --dry-run
 .venv/bin/python position_watcher_state_cleanup.py
 .venv/bin/python production_v1_readiness.py
 .venv/bin/python backup_runtime_data.py
