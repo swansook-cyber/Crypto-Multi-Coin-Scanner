@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+import manual_live_pilot
 from core.analytics_reporting import build_daily_performance_report, export_journal_csvs
 from core.equity_tracker import equity_curve_status
 from core.performance_stats import load_csv as load_performance_csv
@@ -231,9 +232,12 @@ def build_daily_summary(df: pd.DataFrame, date: str | None = None) -> dict[str, 
 
 
 def build_telegram_message(summary: dict[str, Any]) -> str:
+    pilot_config = manual_live_pilot.load_config()
     return (
         "📊 Daily Signal Summary\n"
         f"Date: {summary['date']}\n\n"
+        f"Trading Mode: {pilot_config.trading_mode}\n"
+        f"Manual Pilot: {'DISABLED' if manual_live_pilot.pilot_disabled(pilot_config) else 'ENABLED'}\n\n"
         f"Signals: {summary['total_signals']}\n"
         f"Wins: {summary['wins']}\n"
         f"Losses: {summary['losses']}\n"

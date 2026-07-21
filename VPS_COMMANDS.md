@@ -2,6 +2,47 @@
 
 Crypto-Multi-Coin-Scanner is an internal lab Telegram signal assistant. It does not auto-trade.
 
+## Manual Live Pilot
+
+Manual Live Pilot is disabled by default and remains advisory-only. It never
+places exchange orders and does not change scanner scoring, TP/SL/RR, routing,
+or Cornix signal format.
+
+Status and preflight:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python manual_live_pilot.py status
+.venv/bin/python live_pilot_preflight.py
+```
+
+Risk calculator:
+
+```bash
+.venv/bin/python manual_trade_plan.py --symbol BTCUSDT --entry 100 --stop 99 --account-balance 1000 --risk-percent 0.25
+```
+
+Emergency disable:
+
+```bash
+cd /opt/Crypto-Multi-Coin-Scanner
+.venv/bin/python manual_live_pilot.py disable
+sudo systemctl restart crypto-scanner.service
+```
+
+Pilot `.env` values, only when supervised manual pilot is intentionally enabled:
+
+```env
+TRADING_MODE=MANUAL_LIVE_PILOT
+LIVE_PILOT_ENABLED=true
+LIVE_PILOT_RISK_PER_TRADE_PCT=0.25
+LIVE_PILOT_MAX_DAILY_RISK_PCT=0.50
+LIVE_PILOT_MAX_OPEN_POSITIONS=1
+LIVE_PILOT_MAX_SIGNALS_PER_DAY=3
+LIVE_PILOT_MAX_CONSECUTIVE_LOSSES=2
+LIVE_PILOT_ALLOWED_TIERS=S,A
+```
+
 ## Production Layout
 
 Production app path:
@@ -37,6 +78,7 @@ cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python production_health.py
 .venv/bin/python data_integrity_audit.py
 .venv/bin/python entry_timing_operational_summary.py
+.venv/bin/python live_pilot_preflight.py
 .venv/bin/python position_watcher_state_cleanup.py
 .venv/bin/python production_v1_readiness.py
 .venv/bin/python backup_runtime_data.py
@@ -433,6 +475,7 @@ uptime
 df -h /
 cd /opt/Crypto-Multi-Coin-Scanner
 .venv/bin/python system_status.py
+.venv/bin/python manual_live_pilot.py status
 .venv/bin/python data_integrity_audit.py --profile
 test -f .env && echo ".env OK" || echo ".env MISSING"
 .venv/bin/python -m compileall -q . && echo "compile OK"

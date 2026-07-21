@@ -27,6 +27,9 @@ import data_integrity_audit
 import daily_summary
 import entry_timing_operational_summary
 import external_signal_analyzer
+import live_pilot_preflight
+import manual_live_pilot
+import manual_trade_plan
 import performance_report
 import position_manager
 import position_watcher
@@ -4596,6 +4599,183 @@ def test_system_status_systemctl_backup_and_compaction() -> None:
             pass
 
 
+def _with_pilot_env(values: dict[str, str | None]):
+    original = {key: os.environ.get(key) for key in values}
+    for key, value in values.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    return original
+
+
+def _restore_env(original: dict[str, str | None]) -> None:
+    for key, value in original.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def test_manual_live_pilot_defaults_disabled_and_paper() -> None:
+    original = _with_pilot_env({"TRADING_MODE": None, "LIVE_PILOT_ENABLED": None})
+    try:
+        config = manual_live_pilot.load_config()
+        assert config.trading_mode == manual_live_pilot.PAPER
+        assert config.enabled is False
+        verdict = manual_live_pilot.evaluate_signal_pilot(sample_signal(), config=config, journal=pd.DataFrame())
+        assert verdict.status == "BLOCKED"
+        assert "TRADING_MODE is PAPER" in verdict.reasons
+    finally:
+        _restore_env(original)
+
+
+def test_manual_live_pilot_policy_blocks_and_allows_core_tiers() -> None:
+    original = _with_pilot_env({"TRADING_MODE": "MANUAL_LIVE_PILOT", "LIVE_PILOT_ENABLED": "true"})
+    try:
+        config = manual_live_pilot.LivePilotConfig(
+            trading_mode=manual_live_pilot.MANUAL_LIVE_PILOT,
+            enabled=True,
+            risk_per_trade_pct=0.25,
+            max_daily_risk_pct=0.50,
+            max_open_positions=1,
+            max_signals_per_day=3,
+            max_consecutive_losses=2,
+            allowed_tiers=("S", "A"),
+        )
+        signal = sample_signal()
+        signal.watchlist_tier = "A"
+        assert manual_live_pilot.evaluate_signal_pilot(signal, config=config, journal=pd.DataFrame()).status == "ALLOWED"
+        signal.watchlist_tier = "B"
+        assert "outside Production Universe Core/Tier A" in manual_live_pilot.evaluate_signal_pilot(signal, config=config, journal=pd.DataFrame()).reasons
+        signal.watchlist_tier = "A"
+        signal.sl = signal.entry
+        assert "calculated stop distance is invalid" in manual_live_pilot.evaluate_signal_pilot(signal, config=config, journal=pd.DataFrame()).reasons
+        signal.sl = 0
+        assert "signal lacks valid entry or SL" in manual_live_pilot.evaluate_signal_pilot(signal, config=config, journal=pd.DataFrame()).reasons
+        signal.sl = 101
+        assert "system health is FAIL" in manual_live_pilot.evaluate_signal_pilot(signal, config=config, journal=pd.DataFrame(), system_health_status="FAIL").reasons
+        assert "data integrity has critical findings" in manual_live_pilot.evaluate_signal_pilot(signal, config=config, journal=pd.DataFrame(), data_integrity_status="FAIL").reasons
+    finally:
+        _restore_env(original)
+
+
+def test_manual_live_pilot_limits_duplicates_and_losses() -> None:
+    config = manual_live_pilot.LivePilotConfig(
+        trading_mode=manual_live_pilot.MANUAL_LIVE_PILOT,
+        enabled=True,
+        risk_per_trade_pct=0.25,
+        max_daily_risk_pct=0.50,
+        max_open_positions=1,
+        max_signals_per_day=3,
+        max_consecutive_losses=2,
+        allowed_tiers=("S", "A"),
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    open_row = {
+        "pilot_trade_id": "p1",
+        "source_signal_id": "s1",
+        "symbol": "BTCUSDT",
+        "direction": "LONG",
+        "planned_entry": 100,
+        "actual_entry": 100,
+        "planned_sl": 99,
+        "actual_sl": 99,
+        "risk_percent": 0.25,
+        "status": "OPEN",
+        "outcome": "OPEN",
+        "created_at": now,
+        "updated_at": now,
+    }
+    journal = pd.DataFrame([open_row])
+    signal = sample_signal()
+    signal.symbol = "BTCUSDT"
+    signal.direction = "SHORT"
+    signal.watchlist_tier = "A"
+    reasons = manual_live_pilot.evaluate_signal_pilot(signal, config=config, journal=journal).reasons
+    assert "maximum open pilot position reached" in reasons
+    assert "duplicate symbol position is already open" in reasons
+    assert "opposite signal while symbol is open" in reasons
+    assert "daily risk limit reached" in reasons
+
+    closed_rows = []
+    for idx in range(2):
+        closed_rows.append({**open_row, "pilot_trade_id": f"c{idx}", "status": "CLOSED", "outcome": "LOSS", "updated_at": f"2026-07-0{idx + 1}T00:00:00+00:00"})
+    assert "consecutive loss limit reached" in manual_live_pilot.evaluate_signal_pilot(signal, config=config, journal=pd.DataFrame(closed_rows)).reasons
+
+
+def test_manual_trade_plan_and_invalid_inputs() -> None:
+    plan = manual_live_pilot.calculate_trade_plan("BTC/USDT", 100000, 99000, 1000, 0.25, "LONG")
+    assert plan["symbol"] == "BTCUSDT"
+    assert round(plan["maximum_loss_amount"], 4) == 2.5
+    assert round(plan["maximum_position_notional"], 4) == 250.0
+    text = manual_trade_plan.format_plan(plan)
+    assert "Maximum risk limit only" in text
+    assert "Leverage" not in text
+    for bad in ["nan", "0", "-1"]:
+        try:
+            manual_live_pilot.calculate_trade_plan("BTCUSDT", bad, 99, 1000, 0.25)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid numeric input should fail")
+
+
+def test_manual_live_pilot_journal_backup_append_only_and_disable(tmp_path: Path | None = None) -> None:
+    temp_dir = Path(tempfile.gettempdir()) / "manual_live_pilot_smoke"
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(exist_ok=True)
+    journal = temp_dir / "manual_live_pilot.csv"
+    old_journal = manual_live_pilot.JOURNAL
+    old_logs = manual_live_pilot.LOGS_DIR
+    old_marker = manual_live_pilot.DISABLE_MARKER
+    calls: list[str] = []
+    original_backup = manual_live_pilot.backup_runtime_data.create_backup
+    manual_live_pilot.JOURNAL = journal
+    manual_live_pilot.LOGS_DIR = temp_dir
+    manual_live_pilot.DISABLE_MARKER = temp_dir / "manual_live_pilot.disabled"
+    manual_live_pilot.backup_runtime_data.create_backup = lambda: calls.append("backup") or temp_dir / "backup.zip"
+    try:
+        row = {column: "" for column in manual_live_pilot.PILOT_COLUMNS}
+        row.update({"pilot_trade_id": "p1", "source_signal_id": "s1", "symbol": "BTCUSDT", "direction": "LONG", "status": "OPEN", "outcome": "OPEN", "created_at": "2026-07-01T00:00:00+00:00", "updated_at": "2026-07-01T00:00:00+00:00"})
+        manual_live_pilot.append_journal(row, journal)
+        row.update({"status": "CLOSED", "outcome": "WIN", "updated_at": "2026-07-01T01:00:00+00:00"})
+        manual_live_pilot.append_journal(row, journal)
+        saved = pd.read_csv(journal)
+        assert len(saved) == 2
+        assert calls == ["backup", "backup"]
+        manual_live_pilot.disable_pilot()
+        assert manual_live_pilot.DISABLE_MARKER.exists()
+    finally:
+        manual_live_pilot.backup_runtime_data.create_backup = original_backup
+        manual_live_pilot.JOURNAL = old_journal
+        manual_live_pilot.LOGS_DIR = old_logs
+        manual_live_pilot.DISABLE_MARKER = old_marker
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_manual_live_pilot_telegram_no_balance_and_cornix_unchanged() -> None:
+    signal = sample_signal()
+    cfg = scanner.ScannerConfig.from_env()
+    notifier = scanner.TelegramNotifier(cfg)
+    message = notifier.build_message(signal)
+    cornix = notifier.build_cornix_message(signal)
+    assert "MANUAL LIVE PILOT" in message
+    assert "Account balance" not in message
+    assert "1000" not in message
+    assert "Leverage:\n20x" in cornix
+    assert "MANUAL LIVE PILOT" not in cornix
+
+
+def test_live_pilot_preflight_exit_codes() -> None:
+    ready = [live_pilot_preflight.PreflightItem("a", "PASS", "ok")]
+    warning = ready + [live_pilot_preflight.PreflightItem("b", "WARNING", "warn")]
+    fail = warning + [live_pilot_preflight.PreflightItem("c", "FAIL", "bad")]
+    assert live_pilot_preflight.final_status(ready) == ("PILOT READY", 0)
+    assert live_pilot_preflight.final_status(warning) == ("PILOT READY WITH WARNINGS", 1)
+    assert live_pilot_preflight.final_status(fail) == ("PILOT BLOCKED", 2)
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -4680,6 +4860,13 @@ def main() -> int:
     test_system_status_exit_codes_json_and_helpers()
     test_system_status_read_only_and_missing_optional_inputs()
     test_system_status_systemctl_backup_and_compaction()
+    test_manual_live_pilot_defaults_disabled_and_paper()
+    test_manual_live_pilot_policy_blocks_and_allows_core_tiers()
+    test_manual_live_pilot_limits_duplicates_and_losses()
+    test_manual_trade_plan_and_invalid_inputs()
+    test_manual_live_pilot_journal_backup_append_only_and_disable()
+    test_manual_live_pilot_telegram_no_balance_and_cornix_unchanged()
+    test_live_pilot_preflight_exit_codes()
     print("smoke tests passed")
     return 0
 

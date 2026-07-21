@@ -15,6 +15,7 @@ import pandas as pd
 import backup_runtime_data
 import data_integrity_audit
 import entry_timing_operational_summary
+import manual_live_pilot
 import performance_report
 import position_watcher_state_cleanup
 import production_health
@@ -52,6 +53,14 @@ def _load_csv(path: Path) -> pd.DataFrame:
 
 def build_readiness(include_services: bool = True) -> list[ReadinessItem]:
     items: list[ReadinessItem] = []
+    pilot_config = manual_live_pilot.load_config()
+    items.append(
+        ReadinessItem(
+            "Manual Live Pilot mode",
+            "PASS",
+            f"TRADING_MODE={pilot_config.trading_mode}; enabled={pilot_config.enabled}; effective={'DISABLED' if manual_live_pilot.pilot_disabled(pilot_config) else 'ENABLED'}",
+        )
+    )
     health_checks = production_health.run_checks(include_services=include_services)
     health_status = _status_from_health(health_checks)
     items.append(ReadinessItem("health", health_status, f"{len(health_checks)} checks"))

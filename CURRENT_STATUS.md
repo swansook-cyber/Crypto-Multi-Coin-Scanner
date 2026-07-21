@@ -14,6 +14,8 @@
 - Execution model: Telegram signal assistant only
 - Auto trading: not implemented
 - Manual execution: required
+- Manual Live Pilot: implemented as advisory-only and disabled by default
+- Default trading mode: `TRADING_MODE=PAPER`
 - Release marker: `SCANNER_RELEASE=V1.0`
 
 ## Implemented
@@ -48,6 +50,9 @@
 - Production V1 readiness summary via `production_v1_readiness.py`
 - Production V1 status console via `system_status.py`
 - Production V1 release record via `PRODUCTION_V1.md`
+- Manual Live Pilot controls via `manual_live_pilot.py`
+- Manual trade risk calculator via `manual_trade_plan.py`
+- Manual pilot preflight via `live_pilot_preflight.py`
 - RC1 release snapshot via `RELEASE_CANDIDATE_V1.md`
 - Daily VPS operations checklist via `DAILY_OPERATIONS.md`
 - RC1.4 audit performance optimization: `data_integrity_audit.py --profile` and `--benchmark` are available; stale watcher cleanup now builds runtime indexes once per run.
@@ -121,6 +126,9 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 
 - Runtime CSV/log/chart/dashboard output should stay out of Git
 - `.env` and real API/chat IDs must not be committed
+- Manual Live Pilot is policy/journal/advisory only; it never sends exchange orders
+- Keep `TRADING_MODE=PAPER` and `LIVE_PILOT_ENABLED=false` unless explicitly running the supervised manual pilot
+- Run `python live_pilot_preflight.py` before enabling or operating the pilot
 - Use `python production_health.py`, `python data_integrity_audit.py`, and `python backup_runtime_data.py` before production updates
 - Use `python data_integrity_audit.py --profile` when audit runtime needs diagnosis; use `--benchmark` only for synthetic local performance checks
 - Current synthetic benchmark on local data: 5,000 source rows and 200 Entry Timing rows complete in roughly 1.7 seconds; production timings depend on VPS disk and CSV size

@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 import data_integrity_audit
 import entry_timing_operational_summary
+import manual_live_pilot
 import performance_report
 import position_watcher_state_cleanup
 
@@ -283,6 +284,15 @@ def build_status(include_services: bool = True) -> dict[str, Any]:
     entry = entry_timing_status()
     universe = production_universe(report)
     safety = safety_status()
+    pilot_config = manual_live_pilot.load_config()
+    pilot_df = manual_live_pilot.load_journal()
+    pilot = {
+        "trading_mode": pilot_config.trading_mode,
+        "enabled": "YES" if pilot_config.enabled else "NO",
+        "effective_status": "DISABLED" if manual_live_pilot.pilot_disabled(pilot_config) else "ENABLED",
+        "open_positions": len(manual_live_pilot.open_positions(pilot_df)),
+        "daily_risk_used_pct": manual_live_pilot.daily_risk_used_pct(pilot_df),
+    }
     status_inputs = [
         safety["data_integrity"],
         safety["duplicate_alert_protection"],
@@ -307,6 +317,7 @@ def build_status(include_services: bool = True) -> dict[str, Any]:
         "entry_timing": entry,
         "production_universe": universe,
         "safety": safety,
+        "manual_live_pilot": pilot,
         "final_status": final,
         "exit_code": code,
     }
@@ -334,6 +345,7 @@ def format_status(status: dict[str, Any]) -> str:
     entry = status["entry_timing"]
     universe = status["production_universe"]
     safety = status["safety"]
+    pilot = status.get("manual_live_pilot", {})
     lines = [
         "Crypto Scanner Production V1",
         "============================",
@@ -356,6 +368,13 @@ def format_status(status: dict[str, Any]) -> str:
         f"- Net R: {_r(runtime['net_r'])}",
         f"- Today Sent: {runtime['today_sent']}",
         f"- Today Wins/Losses: {runtime['today_wins']}/{runtime['today_losses']}",
+        "",
+        "Manual Live Pilot",
+        f"- Trading Mode: {pilot.get('trading_mode', 'PAPER')}",
+        f"- Pilot Enabled: {pilot.get('enabled', 'NO')}",
+        f"- Effective Status: {pilot.get('effective_status', 'DISABLED')}",
+        f"- Open Pilot Positions: {pilot.get('open_positions', 0)}",
+        f"- Daily Pilot Risk Used: {float(pilot.get('daily_risk_used_pct', 0.0)):.2f}%",
         "",
         "Reporting",
         f"- Executive Report: {reporting['executive_report']}",

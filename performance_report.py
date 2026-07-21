@@ -16,6 +16,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+import manual_live_pilot
 from core.analytics_reporting import load_csv_safely
 from core.entry_timing_engine import format_entry_timing_summary, summarize_entry_timing
 from core.performance_analytics_v1 import (
@@ -182,6 +183,7 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def format_report(report: dict[str, Any]) -> str:
+    pilot_config = manual_live_pilot.load_config()
     warning = "\n\nSample size is still small. Use for monitoring only." if report.get("small_sample_warning") else ""
     win_rate = format_value(report.get("win_rate"), "%")
     long_rate = format_value(report.get("long_win_rate"), "%")
@@ -189,6 +191,10 @@ def format_report(report: dict[str, Any]) -> str:
     return (
         "Daily Performance Report\n"
         f"Date: {report['date']}\n\n"
+        "Manual Live Pilot\n"
+        f"Trading Mode: {pilot_config.trading_mode}\n"
+        f"Pilot Enabled: {pilot_config.enabled}\n"
+        f"Effective Status: {'DISABLED' if manual_live_pilot.pilot_disabled(pilot_config) else 'ENABLED'}\n\n"
         f"Total sent signals: {report['total_sent_signals']}\n"
         f"Closed signals: {report['closed_signals']}\n"
         f"Open signals: {report['open_signals']}\n"
@@ -513,6 +519,7 @@ def format_executive_report(
     dashboard_url: str | None = None,
 ) -> str:
     timing = _entry_timing_counts(entry_timing if entry_timing is not None else pd.DataFrame())
+    pilot_config = manual_live_pilot.load_config()
     counts = timing["counts"]
     warnings = _executive_warnings(report, 4)
     url = (dashboard_url or os.getenv("ANALYTICS_DASHBOARD_URL", "")).strip()
@@ -524,6 +531,8 @@ def format_executive_report(
         f"Date: {report.get('date', 'ALL')}",
         "",
         "Performance",
+        f"- Trading Mode: {pilot_config.trading_mode}",
+        f"- Pilot: {'DISABLED' if manual_live_pilot.pilot_disabled(pilot_config) else 'ENABLED'}",
         f"- Closed: {report.get('closed_signals', 0)}",
         f"- Wins / Losses: {report.get('wins', 0)} / {report.get('losses', 0)}",
         f"- Win Rate: {format_value(report.get('win_rate'), '%')}",

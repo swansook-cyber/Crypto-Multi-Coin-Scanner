@@ -18,6 +18,9 @@ exchange positions.
   breakeven command mode.
 - `performance_report.py`: Executive Telegram summary and full analytics report.
 - `dashboard.py`: read-only local analytics dashboard.
+- `manual_live_pilot.py`: advisory-only manual pilot policy and journal.
+- `manual_trade_plan.py`: manual risk calculator with no leverage advice.
+- `live_pilot_preflight.py`: read-only manual pilot readiness check.
 - `system_status.py`: compact read-only production status console.
 - `data_integrity_audit.py --profile`: compact read-only audit timing report.
 - `data_integrity_audit.py --benchmark`: synthetic provenance benchmark that does
@@ -39,6 +42,8 @@ exchange positions.
 - Cornix channel: Cornix-ready open signal text and configured breakeven commands.
 - Reports channel: outcomes, position management, Executive Report, diagnostics.
 - VelaHub Monitor channel: external infrastructure watchdog messages only.
+- Manual Live Pilot block: advisory status in scanner messages only; not an
+  execution command.
 
 ## Experimental Modes
 
@@ -49,6 +54,8 @@ These modes are report-only experiments and must not change scanner scoring:
 - Session risk report-only mode.
 - London LONG report-only experiment.
 - Entry Timing Engine remains shadow mode.
+- Manual Live Pilot defaults to `TRADING_MODE=PAPER` and
+  `LIVE_PILOT_ENABLED=false`; activation is supervised and advisory-only.
 
 ## Known Limitations
 
@@ -56,6 +63,8 @@ These modes are report-only experiments and must not change scanner scoring:
 - Entry Timing recommendations are not enforced in production.
 - Cornix breakeven command format may require live channel validation.
 - Dashboard and reports are read-only and depend on journal data quality.
+- Manual Live Pilot requires explicit human execution; it has no exchange API
+  order path and no auto-close path.
 - Audit performance diagnostics are observability-only and do not alter
   historical CSV values.
 - Canonical provenance resolution changes only audit explanation quality; it
@@ -96,3 +105,4 @@ Do not change:
 - TP/SL/RR calculations
 - Cornix signal format
 - Entry Timing enforcement
+- Manual Live Pilot risk limits without a new supervised release note

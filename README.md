@@ -19,12 +19,54 @@ Telegram signal assistant for Binance Futures. The scanner is rule-based and qua
 
 This project does not auto trade. It is a Telegram signal assistant only.
 
+## Manual Live Pilot
+
+Manual Live Pilot is an advisory-only operating layer for a small human-run
+pilot. It does not place exchange orders, does not auto-close positions, and
+does not change scanner scoring, TP/SL/RR, routing, Cornix signal format, or
+Entry Timing enforcement.
+
+Default mode is safe:
+
+```env
+TRADING_MODE=PAPER
+LIVE_PILOT_ENABLED=false
+LIVE_PILOT_RISK_PER_TRADE_PCT=0.25
+LIVE_PILOT_MAX_DAILY_RISK_PCT=0.50
+LIVE_PILOT_MAX_OPEN_POSITIONS=1
+LIVE_PILOT_MAX_SIGNALS_PER_DAY=3
+LIVE_PILOT_MAX_CONSECUTIVE_LOSSES=2
+LIVE_PILOT_ALLOWED_TIERS=S,A
+```
+
+Useful commands:
+
+```bash
+python live_pilot_preflight.py
+python manual_live_pilot.py status
+python manual_trade_plan.py --symbol BTCUSDT --entry 100 --stop 99 --account-balance 1000 --risk-percent 0.25
+python manual_live_pilot.py open --symbol BTCUSDT --direction LONG --entry 100 --stop 99 --tp1 102 --tp2 104 --account-balance 1000
+python manual_live_pilot.py list-open
+python manual_live_pilot.py close --symbol BTCUSDT --result WIN --pnl-percent 1.0
+python manual_live_pilot.py daily-summary
+python manual_live_pilot.py disable
+```
+
+The scanner Telegram message can include a `MANUAL LIVE PILOT` advisory block.
+`ALLOWED` means the manual pilot policy permits human review; `BLOCKED` means the
+setup should remain paper/report-only for the pilot. It is not an order signal.
+
+See `MANUAL_LIVE_PILOT.md` for the full workflow.
+
 ## Files
 
 - `cornix_agent.py` - main scanner
 - `.env.example` - environment config template
 - `requirements.txt` - Python dependencies
 - `review_signals.py` - outcome tracker for WIN / LOSS / OPEN
+- `manual_live_pilot.py` - advisory-only manual pilot journal and policy guard
+- `manual_trade_plan.py` - manual risk calculator, no leverage recommendation
+- `live_pilot_preflight.py` - read-only pilot readiness check
 - `stats_dashboard.py` - CSV analytics dashboard and report exporter
 - `tier_review.py` - tier promotion/demotion recommendation report
 - `logs/signals.csv` - generated signal journal

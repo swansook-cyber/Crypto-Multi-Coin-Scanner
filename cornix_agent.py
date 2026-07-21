@@ -36,6 +36,7 @@ from core.btc_regime_filter import detect_btc_regime
 from core.entry_timing_engine import EntryTimingEngine, EntryTimingLogger
 from core.loss_cooldown import LossCooldownTracker
 from core.wave_structure_analyzer import calculate_wave_score
+import manual_live_pilot
 from position_manager import evaluate_new_signal
 
 try:
@@ -1400,6 +1401,7 @@ class TelegramNotifier:
             f"📐 Size: {signal.position_size_coin:.6f} {signal.symbol.replace('USDT', '')}\n\n"
             f"🧠 Reason:\n{signal.reason}"
             f"{commentary}\n\n"
+            f"{manual_live_pilot.format_pilot_telegram_section(manual_live_pilot.evaluate_signal_pilot(signal))}\n\n"
             f"For educational analysis only. Not financial advice.\n\n"
             f"Exchange: Binance Futures\n"
             f"Leverage: Cross {self.config.max_leverage}x\n"
