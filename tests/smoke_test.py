@@ -49,6 +49,7 @@ from core.performance_analytics_v1 import build_complete_report, export_v1_outpu
 from core.performance_analytics_v2 import build_performance_v2, canonical_session, generate_performance_warnings
 from core.performance_analytics_v3 import build_performance_v3, shadow_filter_backtest
 from core.performance_analytics_v8 import build_root_cause_analytics
+from core.sr_trade_weight_gate import SRGateConfig, SRTradeWeightShadowLogger, evaluate_sr_trade_weight
 from core import wave_structure_analyzer as wave
 
 WATCHDOG_MONITOR_PATH = Path(__file__).resolve().parents[1] / "watchdog" / "monitor.py"
@@ -5096,6 +5097,136 @@ def test_production_reset_backup_failure_aborts_and_force_cli() -> None:
             shutil.rmtree(temp_dir)
 
 
+def test_sr_trade_weight_gate_decisions_and_breakout_contexts() -> None:
+    cfg = SRGateConfig()
+
+    def decision(**kwargs):
+        return evaluate_sr_trade_weight(config=cfg, **kwargs)
+
+    assert decision(side="LONG", entry=100, stop_loss=99, tp1=101.2, atr=1, support=96, resistance=103).decision == "SAFE"
+    assert decision(side="LONG", entry=100, stop_loss=99, tp1=101.2, atr=1, support=96, resistance=101.5).decision == "CAUTION"
+    assert decision(side="LONG", entry=100, stop_loss=99, tp1=101.2, atr=1, support=96, resistance=100.5).decision == "SKIP"
+    assert decision(side="LONG", entry=100, stop_loss=99, tp1=101.2, atr=1, support=96, resistance=100).decision == "UNKNOWN"
+
+    assert decision(side="SHORT", entry=100, stop_loss=101, tp1=98.8, atr=1, support=97, resistance=104).decision == "SAFE"
+    assert decision(side="SHORT", entry=100, stop_loss=101, tp1=98.8, atr=1, support=98.5, resistance=104).decision == "CAUTION"
+    assert decision(side="SHORT", entry=100, stop_loss=101, tp1=98.8, atr=1, support=99.5, resistance=104).decision == "SKIP"
+    assert decision(side="SHORT", entry=100, stop_loss=101, tp1=98.8, atr=1, support=100, resistance=104).decision == "UNKNOWN"
+
+    long_breakout = decision(
+        side="LONG",
+        entry=100,
+        stop_loss=99,
+        tp1=101.2,
+        atr=1,
+        support=96,
+        resistance=99,
+        breakout_confirmed=True,
+        volume_spike=True,
+        body_ratio=0.7,
+        opposite_wick_ratio=0.2,
+    )
+    assert long_breakout.decision == "SAFE"
+    assert long_breakout.breakout_context == "CONFIRMED_BREAKOUT"
+
+    weak_long_breakout = decision(
+        side="LONG",
+        entry=100,
+        stop_loss=99,
+        tp1=101.2,
+        atr=1,
+        support=96,
+        resistance=99,
+        breakout_confirmed=True,
+        volume_spike=False,
+        mfi_confirmed=False,
+        body_ratio=0.2,
+        opposite_wick_ratio=0.8,
+    )
+    assert weak_long_breakout.decision == "CAUTION"
+    assert weak_long_breakout.breakout_context == "WEAK_BREAKOUT"
+
+    short_breakdown = decision(
+        side="SHORT",
+        entry=100,
+        stop_loss=101,
+        tp1=98.8,
+        atr=1,
+        support=101,
+        resistance=104,
+        breakout_confirmed=True,
+        mfi_confirmed=True,
+        body_ratio=0.7,
+        opposite_wick_ratio=0.2,
+    )
+    assert short_breakdown.decision == "SAFE"
+    assert short_breakdown.breakout_context == "CONFIRMED_BREAKOUT"
+
+    weak_short_breakdown = decision(
+        side="SHORT",
+        entry=100,
+        stop_loss=101,
+        tp1=98.8,
+        atr=1,
+        support=101,
+        resistance=104,
+        breakout_confirmed=True,
+        body_ratio=0.2,
+        opposite_wick_ratio=0.8,
+    )
+    assert weak_short_breakdown.decision == "CAUTION"
+    assert weak_short_breakdown.breakout_context == "WEAK_BREAKOUT"
+
+    assert decision(side="LONG", entry=100, stop_loss=99, tp1=101.2, atr=1, support=96, resistance=None).decision == "UNKNOWN"
+    assert decision(side="LONG", entry=100, stop_loss=99, tp1=101.2, atr=0, support=96, resistance=103).decision == "UNKNOWN"
+    assert decision(side="LONG", entry=100, stop_loss=100, tp1=101.2, atr=1, support=96, resistance=103).decision == "UNKNOWN"
+    assert decision(side="LONG", entry=100, stop_loss=99, tp1=101.2, atr=1, support=96, resistance=95).decision == "UNKNOWN"
+
+
+def test_sr_trade_weight_shadow_logger_dedupes_and_does_not_mutate_signal() -> None:
+    path = Path(tempfile.gettempdir()) / "sr_trade_weight_shadow_smoke.csv"
+    try:
+        if path.exists():
+            path.unlink()
+        signal = sample_signal()
+        signal.direction = "LONG"
+        signal.entry = 100.0
+        signal.sl = 99.0
+        signal.tp1 = 101.2
+        signal.tp2 = 102.0
+        signal.support = 96.0
+        signal.resistance = 100.5
+        signal.breakout_confirmed = False
+        original_score = signal.score
+        original_confidence = signal.confidence
+        original_schema = list(scanner.TradeJournalLogger.FIELDNAMES)
+
+        result = evaluate_sr_trade_weight(
+            side=signal.direction,
+            entry=signal.entry,
+            stop_loss=signal.sl,
+            tp1=signal.tp1,
+            atr=abs(signal.entry - signal.sl),
+            support=signal.support,
+            resistance=signal.resistance,
+        )
+        assert result.decision == "SKIP"
+
+        logger = SRTradeWeightShadowLogger(path)
+        assert logger.log_signal(signal, result, "candidate") is True
+        assert logger.log_signal(signal, result, "candidate") is False
+        rows = pd.read_csv(path)
+        assert len(rows) == 1
+        assert rows.iloc[0]["sr_gate_decision"] == "SKIP"
+        assert signal.score == original_score
+        assert signal.confidence == original_confidence
+        assert list(scanner.TradeJournalLogger.FIELDNAMES) == original_schema
+        assert "sr_gate_decision" not in scanner.TradeJournalLogger.FIELDNAMES
+    finally:
+        if path.exists():
+            path.unlink()
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -5193,6 +5324,8 @@ def main() -> int:
     test_live_pilot_preflight_exit_codes()
     test_production_reset_archive_reset_and_preserve_config()
     test_production_reset_backup_failure_aborts_and_force_cli()
+    test_sr_trade_weight_gate_decisions_and_breakout_contexts()
+    test_sr_trade_weight_shadow_logger_dedupes_and_does_not_mutate_signal()
     print("smoke tests passed")
     return 0
 

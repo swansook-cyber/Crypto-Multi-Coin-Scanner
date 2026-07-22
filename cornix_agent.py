@@ -35,6 +35,7 @@ from urllib3.util.retry import Retry
 from core.btc_regime_filter import detect_btc_regime
 from core.entry_timing_engine import EntryTimingEngine, EntryTimingLogger
 from core.loss_cooldown import LossCooldownTracker
+from core.sr_trade_weight_gate import SRGateConfig, SRTradeWeightShadowLogger, evaluate_sr_trade_weight
 from core.wave_structure_analyzer import calculate_wave_score
 import manual_live_pilot
 from position_manager import evaluate_new_signal
@@ -52,6 +53,7 @@ STATE_FILE = BASE_DIR / "signal_state.json"
 LOG_FILE = LOG_DIR / "cornix_agent.log"
 SIGNAL_JOURNAL = LOG_DIR / "signals.csv"
 ENTRY_TIMING_JOURNAL = LOG_DIR / "entry_timing_engine.csv"
+SR_TRADE_WEIGHT_SHADOW_JOURNAL = LOG_DIR / "sr_trade_weight_shadow.csv"
 SIGNAL_VERSION = "internal-lab-v2"
 
 LOG_DIR.mkdir(exist_ok=True)
@@ -197,6 +199,12 @@ class ScannerConfig:
     weak_symbol_report_only_symbols: list[str]
     session_report_only_sessions: list[str]
     london_long_report_only: bool
+    sr_gate_shadow_enabled: bool
+    sr_gate_live_enabled: bool
+    sr_gate_hard_skip_effective_rr: float
+    sr_gate_caution_effective_rr: float
+    sr_gate_hard_skip_atr: float
+    sr_gate_caution_atr: float
 
     @classmethod
     def from_env(cls) -> "ScannerConfig":
@@ -320,6 +328,12 @@ class ScannerConfig:
                 if item.strip()
             ],
             london_long_report_only=env_bool("LONDON_LONG_REPORT_ONLY", True),
+            sr_gate_shadow_enabled=env_bool("SR_GATE_SHADOW_ENABLED", True),
+            sr_gate_live_enabled=env_bool("SR_GATE_LIVE_ENABLED", False),
+            sr_gate_hard_skip_effective_rr=env_float("SR_GATE_HARD_SKIP_EFFECTIVE_RR", 1.2),
+            sr_gate_caution_effective_rr=env_float("SR_GATE_CAUTION_EFFECTIVE_RR", 1.8),
+            sr_gate_hard_skip_atr=env_float("SR_GATE_HARD_SKIP_ATR", 0.65),
+            sr_gate_caution_atr=env_float("SR_GATE_CAUTION_ATR", 1.0),
         )
 
 
@@ -360,6 +374,7 @@ class TradeSignal:
     atr_expansion_ratio: float
     quality_flags: str
     reason: str
+    breakout_confirmed: bool = False
     liquidation_context: str = ""
     ai_commentary: str = ""
     risk_amount_usdt: float = 0.0
@@ -880,6 +895,7 @@ class SignalScorer:
             wave_phase=wave_phase,
             wave_notes=wave_notes,
             reason=reason,
+            breakout_confirmed=breakout_long if direction == "LONG" else breakout_short,
         )
 
     def _is_no_trade(self, regime: str, volume_ratio: float, atr_pct: float) -> bool:
@@ -1609,6 +1625,13 @@ class AgentRunner:
         self.notifier = TelegramNotifier(config)
         self.entry_timing = EntryTimingEngine()
         self.entry_timing_logger = EntryTimingLogger(ENTRY_TIMING_JOURNAL)
+        self.sr_gate_config = SRGateConfig(
+            hard_skip_effective_rr=config.sr_gate_hard_skip_effective_rr,
+            caution_effective_rr=config.sr_gate_caution_effective_rr,
+            hard_skip_atr=config.sr_gate_hard_skip_atr,
+            caution_atr=config.sr_gate_caution_atr,
+        )
+        self.sr_gate_logger = SRTradeWeightShadowLogger(SR_TRADE_WEIGHT_SHADOW_JOURNAL)
         self.state = self._load_state()
         self.fear_greed_value: int | None = None
 
@@ -1739,6 +1762,41 @@ class AgentRunner:
         except Exception as exc:
             LOGGER.warning("Entry Timing Engine shadow evaluation failed for %s: %s", signal.symbol, exc)
 
+    def evaluate_sr_trade_weight_shadow(self, signal: TradeSignal, signal_status: str = "candidate") -> None:
+        if not self.config.sr_gate_shadow_enabled:
+            return
+        try:
+            atr = abs(float(signal.entry) - float(signal.sl))
+            result = evaluate_sr_trade_weight(
+                side=signal.direction,
+                entry=signal.entry,
+                stop_loss=signal.sl,
+                tp1=signal.tp1,
+                atr=atr,
+                support=signal.support,
+                resistance=signal.resistance,
+                breakout_confirmed=signal.breakout_confirmed,
+                volume_spike=signal.volume_spike,
+                mfi_confirmed=signal.mfi_confirmed,
+                body_ratio=signal.body_ratio,
+                opposite_wick_ratio=signal.opposite_wick_ratio,
+                min_body_ratio=self.config.min_body_ratio,
+                max_opposite_wick_ratio=self.config.max_opposite_wick_ratio,
+                config=self.sr_gate_config,
+            )
+            appended = self.sr_gate_logger.log_signal(signal, result, signal_status=signal_status, source="scanner")
+            LOGGER.info(
+                "SR Gate shadow %s for %s %s: decision=%s effective_sr_rr=%s reason=%s",
+                "logged" if appended else "duplicate skipped",
+                signal.symbol,
+                signal.direction,
+                result.decision,
+                f"{result.effective_sr_rr:.2f}" if result.effective_sr_rr is not None else "N/A",
+                result.reason,
+            )
+        except Exception as exc:
+            LOGGER.warning("SR Gate shadow evaluation failed for %s: %s", signal.symbol, exc)
+
     def scan_symbol(self, symbol: str) -> TradeSignal | None:
         df_1h = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.trend_timeframe, 200))
         df_15m = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.entry_timeframe, 200))
@@ -1751,6 +1809,7 @@ class AgentRunner:
             return None
 
         signal = self.risk_manager.apply(signal)
+        self.evaluate_sr_trade_weight_shadow(signal, "candidate")
         signal.ai_commentary = ""
         return signal
 
