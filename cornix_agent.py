@@ -35,6 +35,11 @@ from urllib3.util.retry import Retry
 from core.btc_regime_filter import detect_btc_regime
 from core.entry_timing_engine import EntryTimingEngine, EntryTimingLogger
 from core.loss_cooldown import LossCooldownTracker
+from core.market_exhaustion_engine import (
+    MarketExhaustionConfig,
+    MarketExhaustionShadowLogger,
+    evaluate_market_exhaustion,
+)
 from core.sr_trade_weight_gate import SRGateConfig, SRTradeWeightShadowLogger, evaluate_sr_trade_weight
 from core.wave_structure_analyzer import calculate_wave_score
 import manual_live_pilot
@@ -54,6 +59,7 @@ LOG_FILE = LOG_DIR / "cornix_agent.log"
 SIGNAL_JOURNAL = LOG_DIR / "signals.csv"
 ENTRY_TIMING_JOURNAL = LOG_DIR / "entry_timing_engine.csv"
 SR_TRADE_WEIGHT_SHADOW_JOURNAL = LOG_DIR / "sr_trade_weight_shadow.csv"
+MARKET_EXHAUSTION_SHADOW_JOURNAL = LOG_DIR / "market_exhaustion_shadow.csv"
 SIGNAL_VERSION = "internal-lab-v2"
 
 LOG_DIR.mkdir(exist_ok=True)
@@ -205,6 +211,19 @@ class ScannerConfig:
     sr_gate_caution_effective_rr: float
     sr_gate_hard_skip_atr: float
     sr_gate_caution_atr: float
+    market_exhaustion_shadow_enabled: bool
+    market_exhaustion_live_enabled: bool
+    market_exhaustion_fresh_swing_atr: float
+    market_exhaustion_normal_swing_atr: float
+    market_exhaustion_exhausted_swing_atr: float
+    market_exhaustion_ema20_extended_atr: float
+    market_exhaustion_ema20_exhausted_atr: float
+    market_exhaustion_ema50_extended_atr: float
+    market_exhaustion_ema50_exhausted_atr: float
+    market_exhaustion_directional_run_extended: int
+    market_exhaustion_directional_run_exhausted: int
+    market_exhaustion_atr_expansion_extended: float
+    market_exhaustion_atr_expansion_exhausted: float
 
     @classmethod
     def from_env(cls) -> "ScannerConfig":
@@ -334,6 +353,19 @@ class ScannerConfig:
             sr_gate_caution_effective_rr=env_float("SR_GATE_CAUTION_EFFECTIVE_RR", 1.8),
             sr_gate_hard_skip_atr=env_float("SR_GATE_HARD_SKIP_ATR", 0.65),
             sr_gate_caution_atr=env_float("SR_GATE_CAUTION_ATR", 1.0),
+            market_exhaustion_shadow_enabled=env_bool("MARKET_EXHAUSTION_SHADOW_ENABLED", True),
+            market_exhaustion_live_enabled=env_bool("MARKET_EXHAUSTION_LIVE_ENABLED", False),
+            market_exhaustion_fresh_swing_atr=env_float("MARKET_EXHAUSTION_FRESH_SWING_ATR", 1.5),
+            market_exhaustion_normal_swing_atr=env_float("MARKET_EXHAUSTION_NORMAL_SWING_ATR", 2.5),
+            market_exhaustion_exhausted_swing_atr=env_float("MARKET_EXHAUSTION_EXHAUSTED_SWING_ATR", 4.0),
+            market_exhaustion_ema20_extended_atr=env_float("MARKET_EXHAUSTION_EMA20_EXTENDED_ATR", 1.5),
+            market_exhaustion_ema20_exhausted_atr=env_float("MARKET_EXHAUSTION_EMA20_EXHAUSTED_ATR", 2.0),
+            market_exhaustion_ema50_extended_atr=env_float("MARKET_EXHAUSTION_EMA50_EXTENDED_ATR", 2.5),
+            market_exhaustion_ema50_exhausted_atr=env_float("MARKET_EXHAUSTION_EMA50_EXHAUSTED_ATR", 4.0),
+            market_exhaustion_directional_run_extended=env_int("MARKET_EXHAUSTION_DIRECTIONAL_RUN_EXTENDED", 5),
+            market_exhaustion_directional_run_exhausted=env_int("MARKET_EXHAUSTION_DIRECTIONAL_RUN_EXHAUSTED", 7),
+            market_exhaustion_atr_expansion_extended=env_float("MARKET_EXHAUSTION_ATR_EXPANSION_EXTENDED", 1.5),
+            market_exhaustion_atr_expansion_exhausted=env_float("MARKET_EXHAUSTION_ATR_EXPANSION_EXHAUSTED", 2.0),
         )
 
 
@@ -1632,6 +1664,22 @@ class AgentRunner:
             caution_atr=config.sr_gate_caution_atr,
         )
         self.sr_gate_logger = SRTradeWeightShadowLogger(SR_TRADE_WEIGHT_SHADOW_JOURNAL)
+        self.market_exhaustion_config = MarketExhaustionConfig(
+            fresh_swing_atr=config.market_exhaustion_fresh_swing_atr,
+            normal_swing_atr=config.market_exhaustion_normal_swing_atr,
+            exhausted_swing_atr=config.market_exhaustion_exhausted_swing_atr,
+            ema20_extended_atr=config.market_exhaustion_ema20_extended_atr,
+            ema20_exhausted_atr=config.market_exhaustion_ema20_exhausted_atr,
+            ema50_extended_atr=config.market_exhaustion_ema50_extended_atr,
+            ema50_exhausted_atr=config.market_exhaustion_ema50_exhausted_atr,
+            directional_run_extended=config.market_exhaustion_directional_run_extended,
+            directional_run_exhausted=config.market_exhaustion_directional_run_exhausted,
+            atr_expansion_extended=config.market_exhaustion_atr_expansion_extended,
+            atr_expansion_exhausted=config.market_exhaustion_atr_expansion_exhausted,
+            strong_body_ratio=config.min_body_ratio,
+            max_opposite_wick_ratio=config.max_opposite_wick_ratio,
+        )
+        self.market_exhaustion_logger = MarketExhaustionShadowLogger(MARKET_EXHAUSTION_SHADOW_JOURNAL)
         self.state = self._load_state()
         self.fear_greed_value: int | None = None
 
@@ -1708,6 +1756,8 @@ class AgentRunner:
             self.config.dry_run,
             bool(self.ai_commentary.client),
         )
+        LOGGER.info("Market Exhaustion Shadow: %s", "ENABLED" if self.config.market_exhaustion_shadow_enabled else "DISABLED")
+        LOGGER.info("Market Exhaustion Live: %s", "ENABLED (ignored in Phase 1)" if self.config.market_exhaustion_live_enabled else "DISABLED")
         if self.config.run_once:
             self.scan_once()
             return
@@ -1762,9 +1812,9 @@ class AgentRunner:
         except Exception as exc:
             LOGGER.warning("Entry Timing Engine shadow evaluation failed for %s: %s", signal.symbol, exc)
 
-    def evaluate_sr_trade_weight_shadow(self, signal: TradeSignal, signal_status: str = "candidate") -> None:
+    def evaluate_sr_trade_weight_shadow(self, signal: TradeSignal, signal_status: str = "candidate") -> str:
         if not self.config.sr_gate_shadow_enabled:
-            return
+            return ""
         try:
             atr = abs(float(signal.entry) - float(signal.sl))
             result = evaluate_sr_trade_weight(
@@ -1794,8 +1844,76 @@ class AgentRunner:
                 f"{result.effective_sr_rr:.2f}" if result.effective_sr_rr is not None else "N/A",
                 result.reason,
             )
+            return result.decision
         except Exception as exc:
             LOGGER.warning("SR Gate shadow evaluation failed for %s: %s", signal.symbol, exc)
+            return ""
+
+    def evaluate_market_exhaustion_shadow(
+        self,
+        signal: TradeSignal,
+        df_1h: pd.DataFrame,
+        df_15m: pd.DataFrame,
+        signal_status: str = "candidate",
+        sr_gate_decision: str = "",
+    ) -> None:
+        if not self.config.market_exhaustion_shadow_enabled:
+            return
+        try:
+            latest_1h = df_1h.iloc[-1]
+            latest_15m = df_15m.iloc[-1]
+            def safe_float(value: Any, default: float) -> float:
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    return default
+                return number if math.isfinite(number) else default
+
+            latest_15m_close = safe_float(latest_15m.get("close"), 0.0)
+            latest_15m_ema9 = safe_float(latest_15m.get("ema9"), 0.0)
+            latest_15m_ema21 = safe_float(latest_15m.get("ema21"), 0.0)
+            latest_15m_rsi = safe_float(latest_15m.get("rsi14"), 50.0)
+            momentum_15m_confirmed = (
+                signal.direction == "LONG"
+                and latest_15m_close > latest_15m_ema9 > latest_15m_ema21
+                and latest_15m_rsi >= 52
+            ) or (
+                signal.direction == "SHORT"
+                and latest_15m_close < latest_15m_ema9 < latest_15m_ema21
+                and latest_15m_rsi <= 48
+            )
+            result = evaluate_market_exhaustion(
+                side=signal.direction,
+                entry=signal.entry,
+                atr=latest_1h.get("atr14"),
+                ema20=latest_1h.get("ema20"),
+                ema50=latest_1h.get("ema50"),
+                rsi=latest_1h.get("rsi14"),
+                mfi=signal.mfi,
+                volume_spike=signal.volume_spike,
+                body_ratio=signal.body_ratio,
+                opposite_wick_ratio=signal.opposite_wick_ratio,
+                breakout_confirmed=signal.breakout_confirmed,
+                momentum_15m_confirmed=momentum_15m_confirmed,
+                htf_alignment=signal.htf_alignment,
+                candles_1h=df_1h,
+                candles_15m=df_15m,
+                sr_gate_decision=sr_gate_decision,
+                config=self.market_exhaustion_config,
+            )
+            appended = self.market_exhaustion_logger.log_signal(signal, result, signal_status=signal_status, source="scanner")
+            LOGGER.info(
+                "ME_SHADOW %s %s %s swing=%sATR ema20=%sATR penalty=%s %s",
+                signal.symbol,
+                signal.direction,
+                result.exhaustion_class,
+                f"{result.swing_distance_atr:.2f}" if result.swing_distance_atr is not None else "N/A",
+                f"{result.ema20_distance_atr:.2f}" if result.ema20_distance_atr is not None else "N/A",
+                result.exhaustion_penalty_shadow,
+                "logged" if appended else "duplicate skipped",
+            )
+        except Exception as exc:
+            LOGGER.warning("Market Exhaustion shadow evaluation failed for %s: %s", signal.symbol, exc)
 
     def scan_symbol(self, symbol: str) -> TradeSignal | None:
         df_1h = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.trend_timeframe, 200))
@@ -1809,7 +1927,8 @@ class AgentRunner:
             return None
 
         signal = self.risk_manager.apply(signal)
-        self.evaluate_sr_trade_weight_shadow(signal, "candidate")
+        sr_gate_decision = self.evaluate_sr_trade_weight_shadow(signal, "candidate")
+        self.evaluate_market_exhaustion_shadow(signal, df_1h, df_15m, "candidate", sr_gate_decision)
         signal.ai_commentary = ""
         return signal
 

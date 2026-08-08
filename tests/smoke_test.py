@@ -45,6 +45,11 @@ from core.analytics_reporting import build_daily_performance_report, export_jour
 from core.btc_regime_filter import detect_btc_regime
 from core.entry_timing_engine import EntryTimingEngine, EntryTimingLogger, format_entry_timing_summary
 from core.loss_cooldown import LossCooldownTracker
+from core.market_exhaustion_engine import (
+    MarketExhaustionShadowLogger,
+    evaluate_market_exhaustion,
+    shadow_key_for_signal as market_exhaustion_shadow_key,
+)
 from core.performance_analytics_v1 import build_complete_report, export_v1_outputs
 from core.performance_analytics_v2 import build_performance_v2, canonical_session, generate_performance_warnings
 from core.performance_analytics_v3 import build_performance_v3, shadow_filter_backtest
@@ -5227,6 +5232,321 @@ def test_sr_trade_weight_shadow_logger_dedupes_and_does_not_mutate_signal() -> N
             path.unlink()
 
 
+def _market_exhaustion_candles(
+    side: str,
+    *,
+    entry: float = 100.0,
+    atr: float = 1.0,
+    swing_distance: float = 1.0,
+    run: int = 2,
+    ema20_distance: float = 0.3,
+    ema50_distance: float = 0.8,
+    atr_expansion: float = 1.0,
+    rsi: float = 55.0,
+    mfi: float = 55.0,
+    include_swing: bool = True,
+    include_ema: bool = True,
+) -> pd.DataFrame:
+    rows = []
+    side = side.upper()
+    for index in range(50):
+        close = entry - 2.0 + index * 0.04 if side == "LONG" else entry + 2.0 - index * 0.04
+        open_price = close + 0.05 if side == "LONG" else close - 0.05
+        if index >= 50 - run:
+            close = entry - (49 - index) * 0.02 if side == "LONG" else entry + (49 - index) * 0.02
+            open_price = close - 0.08 if side == "LONG" else close + 0.08
+        high = max(open_price, close) + 0.15
+        low = min(open_price, close) - 0.15
+        rows.append(
+            {
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": 1000 + index,
+                "close_time": datetime(2026, 1, 1, tzinfo=timezone.utc) + pd.Timedelta(hours=index),
+                "atr14": atr / atr_expansion,
+                "rsi14": rsi,
+                "mfi": mfi,
+            }
+        )
+    if include_swing:
+        swing_index = 35
+        if side == "LONG":
+            rows[swing_index]["low"] = entry - swing_distance * atr
+            rows[swing_index]["close"] = rows[swing_index]["low"] + 0.25
+        else:
+            rows[swing_index]["high"] = entry + swing_distance * atr
+            rows[swing_index]["close"] = rows[swing_index]["high"] - 0.25
+    rows[-1]["close"] = entry
+    rows[-1]["atr14"] = atr
+    if include_ema:
+        rows[-1]["ema20"] = entry - ema20_distance * atr if side == "LONG" else entry + ema20_distance * atr
+        rows[-1]["ema50"] = entry - ema50_distance * atr if side == "LONG" else entry + ema50_distance * atr
+    return pd.DataFrame(rows)
+
+
+def _market_exhaustion_decision(side: str, **kwargs: object):
+    candles_1h = kwargs.pop("candles_1h", None)
+    if candles_1h is None:
+        candles_1h = _market_exhaustion_candles(side, **{key: value for key, value in kwargs.items() if key in {
+            "entry",
+            "atr",
+            "swing_distance",
+            "run",
+            "ema20_distance",
+            "ema50_distance",
+            "atr_expansion",
+            "rsi",
+            "mfi",
+            "include_swing",
+            "include_ema",
+        }})
+    candles_15m = kwargs.pop("candles_15m", None)
+    if candles_15m is None:
+        candles_15m = _market_exhaustion_candles(side, entry=100.0, atr=1.0, swing_distance=1.0, run=int(kwargs.get("run_15m", 3)))
+    latest = candles_1h.iloc[-1]
+    return evaluate_market_exhaustion(
+        side=side,
+        entry=kwargs.get("entry", 100.0),
+        atr=kwargs.get("atr", latest.get("atr14")),
+        ema20=latest.get("ema20") if "ema20" in latest else None,
+        ema50=latest.get("ema50") if "ema50" in latest else None,
+        rsi=kwargs.get("rsi", latest.get("rsi14")),
+        mfi=kwargs.get("mfi", latest.get("mfi")),
+        volume_spike=bool(kwargs.get("volume_spike", False)),
+        body_ratio=kwargs.get("body_ratio", 0.5),
+        opposite_wick_ratio=kwargs.get("opposite_wick_ratio", 0.3),
+        breakout_confirmed=bool(kwargs.get("breakout_confirmed", False)),
+        momentum_15m_confirmed=bool(kwargs.get("momentum_15m_confirmed", False)),
+        htf_alignment=kwargs.get("htf_alignment", "Aligned"),
+        candles_1h=candles_1h,
+        candles_15m=candles_15m,
+        sr_gate_decision=str(kwargs.get("sr_gate_decision", "SAFE")),
+    )
+
+
+def test_market_exhaustion_shadow_classifications_and_mirrors() -> None:
+    assert _market_exhaustion_decision("LONG", swing_distance=1.0, run=2, ema20_distance=0.2, ema50_distance=0.8).exhaustion_class == "FRESH"
+    assert _market_exhaustion_decision("LONG", swing_distance=2.0, run=3, ema20_distance=0.8, ema50_distance=1.5).exhaustion_class == "NORMAL"
+    assert _market_exhaustion_decision("LONG", swing_distance=3.0, run=5, ema20_distance=1.6, ema50_distance=2.8, atr_expansion=1.6).exhaustion_class == "EXTENDED"
+    assert _market_exhaustion_decision("LONG", swing_distance=5.0, run=8, ema20_distance=2.4, ema50_distance=4.5, atr_expansion=2.2).exhaustion_class == "EXHAUSTED"
+
+    assert _market_exhaustion_decision("SHORT", swing_distance=1.0, run=2, ema20_distance=0.2, ema50_distance=0.8).exhaustion_class == "FRESH"
+    assert _market_exhaustion_decision("SHORT", swing_distance=2.0, run=3, ema20_distance=0.8, ema50_distance=1.5).exhaustion_class == "NORMAL"
+    assert _market_exhaustion_decision("SHORT", swing_distance=3.0, run=5, ema20_distance=1.6, ema50_distance=2.8, atr_expansion=1.6).exhaustion_class == "EXTENDED"
+    assert _market_exhaustion_decision("SHORT", swing_distance=5.0, run=8, ema20_distance=2.4, ema50_distance=4.5, atr_expansion=2.2).exhaustion_class == "EXHAUSTED"
+
+    high_rsi_fresh = _market_exhaustion_decision("LONG", swing_distance=1.0, run=1, ema20_distance=0.2, ema50_distance=0.5, rsi=82.0, mfi=90.0)
+    assert high_rsi_fresh.exhaustion_class in {"FRESH", "NORMAL"}
+
+
+def test_market_exhaustion_breakout_exception_and_safety_inputs() -> None:
+    strong_breakout = _market_exhaustion_decision(
+        "LONG",
+        swing_distance=5.0,
+        run=8,
+        ema20_distance=2.4,
+        ema50_distance=4.5,
+        atr_expansion=2.2,
+        breakout_confirmed=True,
+        volume_spike=True,
+        body_ratio=0.7,
+        opposite_wick_ratio=0.1,
+        momentum_15m_confirmed=True,
+        htf_alignment="Aligned",
+        sr_gate_decision="SAFE",
+    )
+    assert strong_breakout.exhaustion_class == "EXTENDED"
+    assert strong_breakout.momentum_exception_applied is True
+    assert strong_breakout.breakout_context == "MOMENTUM_CONTINUATION_EXCEPTION"
+
+    weak_breakout = _market_exhaustion_decision(
+        "LONG",
+        swing_distance=5.0,
+        run=8,
+        ema20_distance=2.4,
+        ema50_distance=4.5,
+        atr_expansion=2.2,
+        breakout_confirmed=True,
+        volume_spike=False,
+        body_ratio=0.2,
+        opposite_wick_ratio=0.8,
+        momentum_15m_confirmed=False,
+        sr_gate_decision="SAFE",
+    )
+    assert weak_breakout.exhaustion_class == "EXHAUSTED"
+    assert weak_breakout.breakout_context == "WEAK_BREAKOUT"
+
+    sr_skip_fresh = _market_exhaustion_decision("LONG", swing_distance=1.0, sr_gate_decision="SKIP")
+    assert sr_skip_fresh.exhaustion_class == "FRESH"
+    assert sr_skip_fresh.momentum_exception_applied is False
+
+    assert _market_exhaustion_decision("LONG", atr=0).exhaustion_class == "UNKNOWN"
+    assert _market_exhaustion_decision("LONG", atr=float("nan")).exhaustion_class == "UNKNOWN"
+    assert _market_exhaustion_decision("LONG", include_swing=False).exhaustion_class == "UNKNOWN"
+    assert _market_exhaustion_decision("LONG", include_ema=False).exhaustion_class == "UNKNOWN"
+
+    no_crash = evaluate_market_exhaustion(side="LONG", entry=None, atr=float("inf"), candles_1h=None, candles_15m=None)
+    assert no_crash.exhaustion_class == "UNKNOWN"
+
+
+def test_market_exhaustion_boundaries_runs_and_exception_limits() -> None:
+    assert _market_exhaustion_decision("LONG", swing_distance=1.49, run=1, ema20_distance=0.2, ema50_distance=0.5).exhaustion_class == "FRESH"
+    assert _market_exhaustion_decision("LONG", swing_distance=1.50, run=1, ema20_distance=0.2, ema50_distance=0.5).exhaustion_class == "NORMAL"
+    assert _market_exhaustion_decision("LONG", swing_distance=2.49, run=1, ema20_distance=0.2, ema50_distance=0.5).exhaustion_class == "NORMAL"
+    assert _market_exhaustion_decision("LONG", swing_distance=2.50, run=1, ema20_distance=0.2, ema50_distance=0.5).exhaustion_class == "EXTENDED"
+    assert _market_exhaustion_decision("LONG", swing_distance=3.99, run=1, ema20_distance=0.2, ema50_distance=0.5).exhaustion_class == "EXTENDED"
+
+    single_swing_4 = _market_exhaustion_decision("LONG", swing_distance=4.00, run=1, ema20_distance=0.2, ema50_distance=0.5)
+    assert single_swing_4.exhaustion_class == "EXTENDED"
+
+    confirmed_4 = _market_exhaustion_decision("LONG", swing_distance=4.00, run=8, ema20_distance=2.4, ema50_distance=4.5, atr_expansion=2.2)
+    assert confirmed_4.exhaustion_class == "EXHAUSTED"
+
+    doji_candles = _market_exhaustion_candles("LONG", swing_distance=1.0, run=5)
+    doji_candles.loc[len(doji_candles) - 1, "open"] = doji_candles.loc[len(doji_candles) - 1, "close"]
+    doji_result = _market_exhaustion_decision("LONG", candles_1h=doji_candles)
+    assert doji_result.directional_run_1h == 0
+
+    fresh_breakout = _market_exhaustion_decision(
+        "SHORT",
+        swing_distance=1.0,
+        run=1,
+        ema20_distance=0.2,
+        ema50_distance=0.5,
+        breakout_confirmed=True,
+        volume_spike=True,
+        body_ratio=0.7,
+        opposite_wick_ratio=0.1,
+        momentum_15m_confirmed=True,
+        htf_alignment="Aligned",
+        sr_gate_decision="SAFE",
+    )
+    assert fresh_breakout.exhaustion_class == "FRESH"
+    assert fresh_breakout.momentum_exception_applied is False
+
+    blocked_exception = _market_exhaustion_decision(
+        "SHORT",
+        swing_distance=5.0,
+        run=8,
+        ema20_distance=2.4,
+        ema50_distance=4.5,
+        atr_expansion=2.2,
+        breakout_confirmed=True,
+        volume_spike=True,
+        body_ratio=0.7,
+        opposite_wick_ratio=0.1,
+        momentum_15m_confirmed=True,
+        htf_alignment="Aligned",
+        sr_gate_decision="SKIP",
+    )
+    assert blocked_exception.exhaustion_class == "EXHAUSTED"
+    assert blocked_exception.momentum_exception_applied is False
+
+
+def test_market_exhaustion_shadow_logger_dedupe_and_no_live_mutation() -> None:
+    path = Path(tempfile.gettempdir()) / "market_exhaustion_shadow_smoke.csv"
+    try:
+        if path.exists():
+            path.unlink()
+        signal = sample_signal()
+        signal.direction = "LONG"
+        signal.entry = 100.0
+        signal.timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        original_score = signal.score
+        original_confidence = signal.confidence
+        original_schema = list(scanner.TradeJournalLogger.FIELDNAMES)
+        result = _market_exhaustion_decision("LONG", swing_distance=3.0, run=5, ema20_distance=1.6, ema50_distance=2.8)
+        logger = MarketExhaustionShadowLogger(path)
+        assert logger.log_signal(signal, result, "candidate") is True
+        assert logger.log_signal(signal, result, "candidate") is False
+        rows = pd.read_csv(path)
+        assert len(rows) == 1
+        assert rows.iloc[0]["exhaustion_class"] == "EXTENDED"
+        assert signal.score == original_score
+        assert signal.confidence == original_confidence
+        assert list(scanner.TradeJournalLogger.FIELDNAMES) == original_schema
+        assert "exhaustion_class" not in scanner.TradeJournalLogger.FIELDNAMES
+
+        signal_a = sample_signal()
+        signal_b = sample_signal()
+        signal_c = sample_signal()
+        signal_a.entry = 100
+        signal_b.entry = 100.0
+        signal_c.entry = 100.0000001
+        for item in (signal_a, signal_b, signal_c):
+            item.timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert market_exhaustion_shadow_key(signal_a) == market_exhaustion_shadow_key(signal_b)
+        assert market_exhaustion_shadow_key(signal_b) == market_exhaustion_shadow_key(signal_c)
+
+        signal_d = sample_signal()
+        signal_d.entry = 100.0
+        signal_d.timestamp = datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
+        assert market_exhaustion_shadow_key(signal_a) != market_exhaustion_shadow_key(signal_d)
+
+        header_only = Path(tempfile.gettempdir()) / "market_exhaustion_header_only_smoke.csv"
+        corrupt = Path(tempfile.gettempdir()) / "market_exhaustion_corrupt_smoke.csv"
+        try:
+            header_only.write_text(",".join(pd.read_csv(path, nrows=0).columns) + "\n", encoding="utf-8")
+            assert MarketExhaustionShadowLogger(header_only).log_signal(signal_d, result, "candidate") is True
+            assert len(pd.read_csv(header_only)) == 1
+            corrupt.write_text("not,a,valid,header\nbad,row\n", encoding="utf-8")
+            assert MarketExhaustionShadowLogger(corrupt).log_signal(signal_d, result, "candidate") is False
+        finally:
+            if header_only.exists():
+                header_only.unlink()
+            if corrupt.exists():
+                corrupt.unlink()
+    finally:
+        if path.exists():
+            path.unlink()
+
+
+def test_scanner_candidate_writes_market_exhaustion_shadow_row() -> None:
+    path = Path(tempfile.gettempdir()) / "market_exhaustion_integration_smoke.csv"
+    try:
+        if path.exists():
+            path.unlink()
+        cfg = scanner.ScannerConfig.from_env()
+        cfg.market_exhaustion_shadow_enabled = True
+        cfg.market_exhaustion_live_enabled = True
+        runner = scanner.AgentRunner(cfg)
+        runner.market_exhaustion_logger = MarketExhaustionShadowLogger(path)
+        signal = sample_signal()
+        signal.direction = "LONG"
+        signal.entry = 100.0
+        signal.timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        original_score = signal.score
+        original_confidence = signal.confidence
+        df_1h = _market_exhaustion_candles("LONG", swing_distance=3.0, run=5, ema20_distance=1.6, ema50_distance=2.8)
+        df_15m = _market_exhaustion_candles("LONG", swing_distance=1.0, run=4)
+
+        runner.evaluate_market_exhaustion_shadow(signal, df_1h, df_15m, "candidate", "SAFE")
+        runner.evaluate_market_exhaustion_shadow(signal, df_1h, df_15m, "candidate", "SAFE")
+
+        rows = pd.read_csv(path)
+        assert len(rows) == 1
+        assert rows.iloc[0]["symbol"] == "BTCUSDT"
+        assert rows.iloc[0]["sr_gate_decision"] == "SAFE"
+        assert rows.iloc[0]["exhaustion_class"] in {"EXTENDED", "EXHAUSTED"}
+        assert signal.score == original_score
+        assert signal.confidence == original_confidence
+
+        ordered_before = [item.symbol for item in runner.select_top_candidates([signal])]
+        ordered_after = [item.symbol for item in runner.select_top_candidates([signal])]
+        assert ordered_before == ordered_after
+
+        cfg.market_exhaustion_shadow_enabled = False
+        disabled_runner = scanner.AgentRunner(cfg)
+        disabled_runner.market_exhaustion_logger = MarketExhaustionShadowLogger(path)
+        disabled_runner.evaluate_market_exhaustion_shadow(signal, df_1h, df_15m, "candidate", "SAFE")
+        assert len(pd.read_csv(path)) == 1
+    finally:
+        if path.exists():
+            path.unlink()
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -5326,6 +5646,11 @@ def main() -> int:
     test_production_reset_backup_failure_aborts_and_force_cli()
     test_sr_trade_weight_gate_decisions_and_breakout_contexts()
     test_sr_trade_weight_shadow_logger_dedupes_and_does_not_mutate_signal()
+    test_market_exhaustion_shadow_classifications_and_mirrors()
+    test_market_exhaustion_breakout_exception_and_safety_inputs()
+    test_market_exhaustion_boundaries_runs_and_exception_limits()
+    test_market_exhaustion_shadow_logger_dedupe_and_no_live_mutation()
+    test_scanner_candidate_writes_market_exhaustion_shadow_row()
     print("smoke tests passed")
     return 0
 
