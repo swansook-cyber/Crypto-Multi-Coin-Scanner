@@ -38,6 +38,7 @@ import production_reset
 import production_health
 import production_v1_readiness
 import review_signals
+import shadow_linkage_coverage
 import stats_dashboard
 import system_status
 import telegram_external_inbox
@@ -55,6 +56,7 @@ from core.performance_analytics_v2 import build_performance_v2, canonical_sessio
 from core.performance_analytics_v3 import build_performance_v3, shadow_filter_backtest
 from core.performance_analytics_v8 import build_root_cause_analytics
 from core.sr_trade_weight_gate import SRGateConfig, SRTradeWeightShadowLogger, evaluate_sr_trade_weight
+from core.signal_identity import canonical_signal_key, normalize_float, normalize_side, normalize_symbol, normalize_timestamp
 from core import wave_structure_analyzer as wave
 
 WATCHDOG_MONITOR_PATH = Path(__file__).resolve().parents[1] / "watchdog" / "monitor.py"
@@ -5547,6 +5549,150 @@ def test_scanner_candidate_writes_market_exhaustion_shadow_row() -> None:
             path.unlink()
 
 
+def test_signal_identity_canonical_normalization() -> None:
+    assert normalize_symbol("BINANCE:BTC/USDT.P") == "BTCUSDT"
+    assert normalize_side("buy") == "LONG"
+    assert normalize_timestamp("2026-01-01T00:00:00.123456Z") == "2026-01-01T00:00:00Z"
+    assert normalize_timestamp("2026-01-01T00:00:00+00:00") == "2026-01-01T00:00:00Z"
+    assert normalize_float("100") == "100.000000"
+    assert normalize_float("100.0") == "100.000000"
+    assert normalize_float("100.0000004") == "100.000000"
+
+    key_a = canonical_signal_key(symbol="BTC/USDT", side="long", timestamp="2026-01-01T00:00:00.1Z", entry="100")
+    key_b = canonical_signal_key(symbol="BTCUSDT", side="LONG", timestamp="2026-01-01T00:00:00+00:00", entry="100.000000")
+    key_c = canonical_signal_key(symbol="BTCUSDT", side="LONG", timestamp="2026-01-01T01:00:00+00:00", entry="100.000000")
+    assert key_a == key_b
+    assert key_a != key_c
+
+
+def test_shadow_linkage_coverage_classifies_closed_open_rejected_and_archive_duplicates() -> None:
+    temp_dir = Path(tempfile.gettempdir()) / "shadow_linkage_coverage_smoke"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    try:
+        (temp_dir / "logs").mkdir(parents=True)
+        (temp_dir / "archive" / "Production_S1" / "logs").mkdir(parents=True)
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-01-01T00:00:00.123456Z",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": "100",
+                    "risk_reward": "2.0",
+                    "result": "WIN",
+                    "hit_target": "TP1",
+                    "signal_status": "sent",
+                },
+                {
+                    "timestamp": "2026-01-01T01:00:00Z",
+                    "symbol": "ETHUSDT",
+                    "side": "SHORT",
+                    "entry": "2000.000000",
+                    "risk_reward": "2.0",
+                    "result": "OPEN",
+                    "signal_status": "sent",
+                },
+                {
+                    "timestamp": "2026-01-01T02:00:00Z",
+                    "symbol": "XRPUSDT",
+                    "side": "LONG",
+                    "entry": "0.500000",
+                    "result": "SKIPPED",
+                    "signal_status": "logged_quality_filter",
+                },
+            ]
+        ).to_csv(temp_dir / "logs" / "signals.csv", index=False)
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": "100",
+                    "risk_reward": "2.0",
+                    "result": "LOSS",
+                    "signal_status": "sent",
+                }
+            ]
+        ).to_csv(temp_dir / "archive" / "Production_S1" / "logs" / "signals.csv", index=False)
+        pd.DataFrame(
+            [
+                {"final_signal_timestamp": "2026-01-01T00:00:00+00:00", "symbol": "BTC/USDT", "direction": "long", "entry": "100.0", "recommendation": "ENTER NOW"},
+                {"final_signal_timestamp": "2026-01-01T01:00:00Z", "symbol": "ETHUSDT", "direction": "SHORT", "entry": "2000", "recommendation": "WAIT FOR PULLBACK"},
+                {"final_signal_timestamp": "2026-01-01T02:00:00Z", "symbol": "XRPUSDT", "direction": "LONG", "entry": "0.5", "recommendation": "SKIP"},
+                {"final_signal_timestamp": "", "symbol": "BADUSDT", "direction": "LONG", "entry": "", "recommendation": "SKIP"},
+            ]
+        ).to_csv(temp_dir / "logs" / "entry_timing_engine.csv", index=False)
+        pd.DataFrame(
+            [
+                {"signal_timestamp": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT", "side": "LONG", "entry": "100.000000", "sr_gate_decision": "SAFE"},
+                {"signal_timestamp": "2026-01-01T00:00:00.999Z", "symbol": "BTCUSDT", "side": "LONG", "entry": "100", "sr_gate_decision": "SAFE"},
+                {"signal_timestamp": "2026-01-01T00:00:01Z", "symbol": "BTCUSDT", "side": "LONG", "entry": "100", "sr_gate_decision": "SAFE"},
+            ]
+        ).to_csv(temp_dir / "logs" / "sr_trade_weight_shadow.csv", index=False)
+        pd.DataFrame(
+            [
+                {"signal_timestamp": "2026-01-01T00:00:00Z", "symbol": "BTCUSDT", "side": "LONG", "entry": "100", "exhaustion_class": "NORMAL"}
+            ]
+        ).to_csv(temp_dir / "logs" / "market_exhaustion_shadow.csv", index=False)
+
+        report = shadow_linkage_coverage.build_report(temp_dir)
+        entry = next(item for item in report["coverage"] if item["shadow"] == "entry_timing")
+        sr = next(item for item in report["coverage"] if item["shadow"] == "sr_trade_weight")
+        me = next(item for item in report["coverage"] if item["shadow"] == "market_exhaustion")
+        assert report["closed_signals"] == 1
+        assert entry["matched_closed"] == 1
+        assert entry["matched_open"] == 1
+        assert entry["rejected_candidate"] == 1
+        assert entry["unmatched"] == 1
+        assert sr["duplicate_shadow_rows"] == 2
+        assert sr["matched_closed"] == 1
+        assert me["matched_closed"] == 1
+        text = shadow_linkage_coverage.format_report(report)
+        assert "Shadow Linkage Coverage V1" in text
+        assert "entry_timing" in text
+        assert report["benchmark"]["seconds"] >= 0
+    finally:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+
+
+def test_shadow_loggers_write_canonical_key_without_signal_mutation() -> None:
+    sr_path = Path(tempfile.gettempdir()) / "sr_canonical_key_smoke.csv"
+    me_path = Path(tempfile.gettempdir()) / "me_canonical_key_smoke.csv"
+    try:
+        for path in [sr_path, me_path]:
+            if path.exists():
+                path.unlink()
+        signal = sample_signal()
+        signal.timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        expected = canonical_signal_key(symbol=signal.symbol, side=signal.direction, timestamp=signal.timestamp, entry=signal.entry)
+        sr_result = evaluate_sr_trade_weight(
+            side=signal.direction,
+            entry=signal.entry,
+            stop_loss=signal.sl,
+            tp1=signal.tp1,
+            atr=abs(signal.entry - signal.sl),
+            support=signal.support,
+            resistance=signal.resistance,
+        )
+        assert SRTradeWeightShadowLogger(sr_path).log_signal(signal, sr_result, "candidate") is True
+        sr_rows = pd.read_csv(sr_path)
+        assert sr_rows.iloc[0]["canonical_signal_key"] == expected
+
+        me_result = _market_exhaustion_decision("SHORT", swing_distance=2.0, run=3, ema20_distance=0.8, ema50_distance=1.5)
+        assert MarketExhaustionShadowLogger(me_path).log_signal(signal, me_result, "candidate") is True
+        me_rows = pd.read_csv(me_path)
+        assert me_rows.iloc[0]["canonical_signal_key"] == expected
+        assert signal.score == 92
+        assert signal.confidence == 91
+    finally:
+        for path in [sr_path, me_path]:
+            if path.exists():
+                path.unlink()
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -5651,6 +5797,9 @@ def main() -> int:
     test_market_exhaustion_boundaries_runs_and_exception_limits()
     test_market_exhaustion_shadow_logger_dedupe_and_no_live_mutation()
     test_scanner_candidate_writes_market_exhaustion_shadow_row()
+    test_signal_identity_canonical_normalization()
+    test_shadow_linkage_coverage_classifies_closed_open_rejected_and_archive_duplicates()
+    test_shadow_loggers_write_canonical_key_without_signal_mutation()
     print("smoke tests passed")
     return 0
 

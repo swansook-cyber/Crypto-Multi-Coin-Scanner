@@ -18,11 +18,13 @@ from typing import Any
 
 import pandas as pd
 
+from core.signal_identity import canonical_signal_key
 from core.wave_structure_analyzer import detect_swing_highs_lows
 
 
 FIELDNAMES = [
     "timestamp_utc",
+    "canonical_signal_key",
     "shadow_key",
     "signal_timestamp",
     "symbol",
@@ -420,6 +422,16 @@ def evaluate_market_exhaustion(
 
 
 def shadow_key_for_signal(signal: Any, signal_status: str = "candidate") -> str:
+    canonical_key = canonical_signal_key(
+        symbol=getattr(signal, "symbol", ""),
+        side=getattr(signal, "direction", ""),
+        timestamp=getattr(signal, "timestamp", ""),
+        entry=getattr(signal, "entry", ""),
+        signal_id=getattr(signal, "signal_id", ""),
+        candidate_id=getattr(signal, "candidate_id", ""),
+    )
+    if canonical_key:
+        return hashlib.sha256(f"{canonical_key}|{signal_status}".encode("utf-8")).hexdigest()[:24]
     signal_id = str(getattr(signal, "signal_id", "") or getattr(signal, "candidate_id", "") or "").strip()
     if signal_id:
         return hashlib.sha256(signal_id.encode("utf-8")).hexdigest()[:24]
@@ -436,8 +448,17 @@ def shadow_key_for_signal(signal: Any, signal_status: str = "candidate") -> str:
 
 
 def build_shadow_record(signal: Any, result: MarketExhaustionResult, signal_status: str = "candidate", source: str = "scanner") -> dict[str, Any]:
+    canonical_key = canonical_signal_key(
+        symbol=getattr(signal, "symbol", ""),
+        side=getattr(signal, "direction", ""),
+        timestamp=getattr(signal, "timestamp", ""),
+        entry=getattr(signal, "entry", ""),
+        signal_id=getattr(signal, "signal_id", ""),
+        candidate_id=getattr(signal, "candidate_id", ""),
+    )
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "canonical_signal_key": canonical_key,
         "shadow_key": shadow_key_for_signal(signal, signal_status),
         "signal_timestamp": _normalize_timestamp(getattr(signal, "timestamp", "")),
         "symbol": getattr(signal, "symbol", ""),
@@ -469,7 +490,26 @@ class MarketExhaustionShadowLogger:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_header()
         self._known_keys: set[str] | None = None
+
+    def _ensure_header(self) -> None:
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return
+        try:
+            existing = pd.read_csv(self.path)
+        except Exception:
+            return
+        if list(existing.columns) == FIELDNAMES or "canonical_signal_key" in existing.columns:
+            return
+        old_fields = [field for field in FIELDNAMES if field != "canonical_signal_key"]
+        if not set(old_fields).issubset(set(existing.columns)):
+            return
+        existing["canonical_signal_key"] = ""
+        try:
+            existing.to_csv(self.path, index=False, columns=FIELDNAMES)
+        except OSError:
+            return
 
     def _load_keys(self) -> set[str]:
         if self._known_keys is not None:
@@ -480,7 +520,7 @@ class MarketExhaustionShadowLogger:
                 with self.path.open("r", encoding="utf-8", newline="") as handle:
                     reader = csv.DictReader(handle)
                     for row in reader:
-                        key = str(row.get("shadow_key", "")).strip()
+                        key = str(row.get("canonical_signal_key") or row.get("shadow_key", "")).strip()
                         if key:
                             keys.add(key)
             except OSError:
@@ -500,7 +540,7 @@ class MarketExhaustionShadowLogger:
         return header == FIELDNAMES
 
     def append(self, record: dict[str, Any]) -> bool:
-        key = str(record.get("shadow_key", "")).strip()
+        key = str(record.get("canonical_signal_key") or record.get("shadow_key", "")).strip()
         if not key:
             return False
         keys = self._load_keys()

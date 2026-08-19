@@ -16,9 +16,12 @@ from typing import Any
 
 import pandas as pd
 
+from core.signal_identity import canonical_signal_key
+
 
 FIELDNAMES = [
     "timestamp",
+    "canonical_signal_key",
     "symbol",
     "direction",
     "market_session",
@@ -53,6 +56,7 @@ FIELDNAMES = [
 @dataclass
 class EntryTimingResult:
     timestamp: str
+    canonical_signal_key: str
     symbol: str
     direction: str
     market_session: str
@@ -198,6 +202,14 @@ class EntryTimingEngine:
 
         return EntryTimingResult(
             timestamp=datetime.now(timezone.utc).isoformat(),
+            canonical_signal_key=canonical_signal_key(
+                symbol=getattr(signal, "symbol", ""),
+                side=direction,
+                timestamp=getattr(signal, "timestamp", ""),
+                entry=getattr(signal, "entry", ""),
+                signal_id=getattr(signal, "signal_id", ""),
+                candidate_id=getattr(signal, "candidate_id", ""),
+            ),
             symbol=str(getattr(signal, "symbol", "")).upper(),
             direction=direction,
             market_session=str(getattr(signal, "market_session", "")),
