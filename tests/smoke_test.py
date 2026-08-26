@@ -55,6 +55,15 @@ from core.performance_analytics_v1 import build_complete_report, export_v1_outpu
 from core.performance_analytics_v2 import build_performance_v2, canonical_session, generate_performance_warnings
 from core.performance_analytics_v3 import build_performance_v3, shadow_filter_backtest
 from core.performance_analytics_v8 import build_root_cause_analytics
+from core.rejected_outcome_shadow import (
+    RejectedOutcomeShadowLogger,
+    build_output_record,
+    candles_for_candidate_from_cache,
+    candidate_from_record,
+    evaluate_hypothetical_outcome,
+    normalize_rejection_category,
+    run_backfill,
+)
 from core.sr_trade_weight_gate import SRGateConfig, SRTradeWeightShadowLogger, evaluate_sr_trade_weight
 from core.signal_identity import canonical_signal_key, normalize_float, normalize_side, normalize_symbol, normalize_timestamp
 from core import wave_structure_analyzer as wave
@@ -5693,6 +5702,176 @@ def test_shadow_loggers_write_canonical_key_without_signal_mutation() -> None:
                 path.unlink()
 
 
+def _shadow_candidate_row(**overrides: object) -> dict:
+    row = {
+        "timestamp": "2026-07-01T00:00:00+00:00",
+        "symbol": "BTC/USDT",
+        "side": "LONG",
+        "entry": 100,
+        "stop_loss": 99,
+        "tp1": 101,
+        "tp2": 102,
+        "risk_reward": 2.0,
+        "score": 78,
+        "confidence": 76,
+        "watchlist_tier": "A",
+        "market_session": "London",
+        "signal_status": "logged_quality_filter",
+        "skip_reason": "score_below_threshold",
+        "result": "SKIPPED",
+    }
+    row.update(overrides)
+    return row
+
+
+def _shadow_candles(rows: list[tuple[str, float, float]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp(ts, tz="UTC") - pd.Timedelta(minutes=15),
+                "high": high,
+                "low": low,
+                "close_time": pd.Timestamp(ts, tz="UTC"),
+            }
+            for ts, high, low in rows
+        ]
+    )
+
+
+def test_rejected_outcome_shadow_long_short_and_conservative_same_candle() -> None:
+    long_candidate = candidate_from_record(_shadow_candidate_row())
+    assert long_candidate is not None
+    long_win = evaluate_hypothetical_outcome(
+        long_candidate,
+        _shadow_candles([("2026-07-01T00:15:00+00:00", 101.5, 99.5)]),
+    )
+    assert long_win.hypothetical_outcome == "WIN_TP1"
+    assert long_win.hypothetical_r == 1.0
+
+    long_loss = evaluate_hypothetical_outcome(
+        long_candidate,
+        _shadow_candles([("2026-07-01T00:15:00+00:00", 100.5, 98.8)]),
+    )
+    assert long_loss.hypothetical_outcome == "LOSS"
+
+    same_candle = evaluate_hypothetical_outcome(
+        long_candidate,
+        _shadow_candles([("2026-07-01T00:15:00+00:00", 102.5, 98.8)]),
+    )
+    assert same_candle.hypothetical_outcome == "LOSS"
+    assert same_candle.sl_hit
+
+    short_candidate = candidate_from_record(
+        _shadow_candidate_row(symbol="ETHUSDT", side="SHORT", entry=200, stop_loss=202, tp1=198, tp2=196)
+    )
+    assert short_candidate is not None
+    short_win = evaluate_hypothetical_outcome(
+        short_candidate,
+        _shadow_candles([("2026-07-01T00:15:00+00:00", 200.5, 197.5)]),
+    )
+    assert short_win.hypothetical_outcome == "WIN_TP1"
+
+    short_loss = evaluate_hypothetical_outcome(
+        short_candidate,
+        _shadow_candles([("2026-07-01T00:15:00+00:00", 202.5, 198.5)]),
+    )
+    assert short_loss.hypothetical_outcome == "LOSS"
+
+
+def test_rejected_outcome_shadow_candidate_parsing_categories_and_open() -> None:
+    status_map = {
+        "skipped_loss_cooldown": "LOSS_COOLDOWN",
+        "skipped_daily_risk_guard": "DAILY_RISK_GUARD",
+        "skipped_correlation": "CORRELATION",
+        "skipped_btc_regime": "BTC_REGIME",
+        "skipped_not_top_candidate": "NOT_TOP",
+        "logged_quality_filter": "QUALITY",
+    }
+    for status, category in status_map.items():
+        assert normalize_rejection_category(status, status) == category
+
+    malformed = candidate_from_record(_shadow_candidate_row(entry="", stop_loss="", signal_status="skipped_correlation"))
+    assert malformed is None
+
+    candidate = candidate_from_record(
+        _shadow_candidate_row(signal_status="skipped_loss_cooldown", skip_reason="recent_sl_same_symbol_direction")
+    )
+    assert candidate is not None
+    assert candidate.rejection_reason == "LOSS_COOLDOWN"
+    assert candidate.symbol == "BTCUSDT"
+    assert candidate.side == "LONG"
+    assert candidate.canonical_signal_key == canonical_signal_key(
+        symbol="BTCUSDT",
+        side="LONG",
+        timestamp="2026-07-01T00:00:00Z",
+        entry="100.000000",
+    )
+
+    open_outcome = evaluate_hypothetical_outcome(candidate, pd.DataFrame())
+    assert open_outcome.hypothetical_outcome == "OPEN"
+    assert open_outcome.hypothetical_r == 0.0
+
+
+def test_rejected_outcome_shadow_backfill_dedupe_and_logger_schema() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="rejected_shadow_smoke_"))
+    try:
+        input_path = temp_dir / "signals.csv"
+        output_path = temp_dir / "rejected_outcome_shadow.csv"
+        duplicate = _shadow_candidate_row(entry="100.0")
+        same_key = _shadow_candidate_row(entry="100.000000")
+        different_candle = _shadow_candidate_row(
+            timestamp="2026-07-01T01:00:00+00:00",
+            signal_status="skipped_correlation",
+            skip_reason="max_signals_per_direction_per_candle",
+        )
+        sent = _shadow_candidate_row(timestamp="2026-07-01T02:00:00+00:00", signal_status="sent", result="OPEN")
+        pd.DataFrame([duplicate, same_key, different_candle, sent]).to_csv(input_path, index=False)
+
+        def provider(candidate, lookahead_hours):
+            return _shadow_candles([("2026-07-01T00:15:00+00:00", 102.5, 99.5)])
+
+        result = run_backfill([input_path], output_path, dry_run=False, candle_provider=provider)
+        assert result["input_rows_usable"] == 2
+        assert result["evaluated"] == 2
+        assert result["written"] == 2
+
+        saved = pd.read_csv(output_path)
+        assert len(saved) == 2
+        assert saved["canonical_signal_key"].nunique() == 2
+        assert set(saved["rejection_reason"]) == {"QUALITY", "CORRELATION"}
+        assert "hypothetical_outcome" in saved.columns
+
+        second = run_backfill([input_path], output_path, dry_run=False, candle_provider=provider)
+        assert second["written"] == 0
+        assert len(pd.read_csv(output_path)) == 2
+
+        logger = RejectedOutcomeShadowLogger(output_path)
+        candidate = candidate_from_record(different_candle)
+        assert candidate is not None
+        record = build_output_record(candidate, evaluate_hypothetical_outcome(candidate, pd.DataFrame()))
+        assert logger.append_records([record]) == 0
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_rejected_outcome_shadow_candle_cache_filters_after_timestamp() -> None:
+    candidate = candidate_from_record(_shadow_candidate_row(timestamp="2026-07-01T01:00:00+00:00"))
+    assert candidate is not None
+    cache = {
+        "BTCUSDT": _shadow_candles(
+            [
+                ("2026-07-01T00:45:00+00:00", 150.0, 50.0),
+                ("2026-07-01T01:15:00+00:00", 101.5, 99.5),
+                ("2026-07-02T02:00:00+00:00", 102.0, 98.0),
+            ]
+        )
+    }
+    filtered = candles_for_candidate_from_cache(candidate, cache, lookahead_hours=24)
+    assert len(filtered) == 1
+    outcome = evaluate_hypothetical_outcome(candidate, filtered)
+    assert outcome.hypothetical_outcome == "WIN_TP1"
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -5800,6 +5979,10 @@ def main() -> int:
     test_signal_identity_canonical_normalization()
     test_shadow_linkage_coverage_classifies_closed_open_rejected_and_archive_duplicates()
     test_shadow_loggers_write_canonical_key_without_signal_mutation()
+    test_rejected_outcome_shadow_long_short_and_conservative_same_candle()
+    test_rejected_outcome_shadow_candidate_parsing_categories_and_open()
+    test_rejected_outcome_shadow_backfill_dedupe_and_logger_schema()
+    test_rejected_outcome_shadow_candle_cache_filters_after_timestamp()
     print("smoke tests passed")
     return 0
 
