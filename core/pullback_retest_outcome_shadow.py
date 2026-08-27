@@ -13,7 +13,7 @@ import csv
 import logging
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -30,6 +30,7 @@ LOGGER = logging.getLogger("pullback_retest_outcome_shadow")
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 TIMEFRAME = "15m"
 DEFAULT_LOOKAHEAD_HOURS = 24
+CONTEXT_LOOKBACK_HOURS = 72
 DEFAULT_WAIT_WINDOWS = [45, 90, 180]
 STRATEGIES = [
     "ATR_PULLBACK_0_30",
@@ -86,6 +87,12 @@ FIELDNAMES = [
     "prior_24h_move_atr",
     "prior_session_move_atr",
     "prior_day_known_net_r",
+    "prior_day_known_wins",
+    "prior_day_known_losses",
+    "trailing_24h_known_net_r",
+    "trailing_24h_known_wins",
+    "trailing_24h_known_losses",
+    "context_flags",
     "pre_retest_mae_atr",
     "pre_retest_mfe_atr",
     "generated_at_utc",
@@ -134,6 +141,14 @@ class Candidate:
     directional_run: float = math.nan
     atr_expansion_ratio: float = math.nan
     prior_day_known_net_r: float = math.nan
+    prior_day_known_wins: int = 0
+    prior_day_known_losses: int = 0
+    trailing_24h_known_net_r: float = math.nan
+    trailing_24h_known_wins: int = 0
+    trailing_24h_known_losses: int = 0
+    prior_24h_move_atr: float = math.nan
+    prior_session_move_atr: float = math.nan
+    context_flags: str = ""
 
 
 @dataclass(frozen=True)
@@ -243,6 +258,122 @@ def result_from_r(value: float) -> str:
     return "OPEN"
 
 
+def normalized_identity_tuple(symbol: Any, side: Any, timestamp: Any, entry: Any) -> str:
+    timestamp_text = normalize_timestamp(timestamp)
+    symbol_text = normalize_symbol(symbol)
+    side_text = normalize_side(side)
+    entry_text = normalize_float(entry)
+    if not timestamp_text or not symbol_text or not side_text or not entry_text:
+        return ""
+    return f"{timestamp_text}|{symbol_text}|{side_text}|{entry_text}"
+
+
+def add_identity_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    frame = frame.copy()
+    symbol_series = frame["symbol"] if "symbol" in frame.columns else pd.Series([""] * len(frame), index=frame.index)
+    side_series = frame["side"] if "side" in frame.columns else pd.Series([""] * len(frame), index=frame.index)
+    timestamp_series = frame["timestamp_utc"] if "timestamp_utc" in frame.columns else pd.Series([""] * len(frame), index=frame.index)
+    entry_series = frame["entry"] if "entry" in frame.columns else pd.Series([""] * len(frame), index=frame.index)
+    frame["identity_tuple"] = [
+        normalized_identity_tuple(symbol, side, timestamp, entry)
+        for symbol, side, timestamp, entry in zip(symbol_series, side_series, timestamp_series, entry_series)
+    ]
+    return frame
+
+
+def merge_shadow_context(data: pd.DataFrame, context: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """Merge exact canonical context, then exact normalized tuple context.
+
+    Older shadow rows sometimes lack the candidate's final canonical key. The
+    tuple fallback remains deterministic and rejects duplicate tuple matches so
+    loose or ambiguous historical rows do not leak into analytics.
+    """
+    if data.empty or context.empty:
+        return data
+    result = data.copy()
+    context = add_identity_columns(context)
+    data_with_tuple = add_identity_columns(result)
+    payload = context.drop(columns=[c for c in ["timestamp_utc", "symbol", "side", "entry"] if c in context.columns])
+    rename_map = {
+        column: f"{prefix}_{column}"
+        for column in payload.columns
+        if column not in {"canonical_signal_key", "identity_tuple"} and column in data_with_tuple.columns
+    }
+    payload = payload.rename(columns=rename_map)
+    if "canonical_signal_key" in payload.columns and "canonical_signal_key" in data_with_tuple.columns:
+        result = data_with_tuple.merge(payload.drop(columns=["identity_tuple"], errors="ignore"), on="canonical_signal_key", how="left")
+    else:
+        result = data_with_tuple
+
+    missing_payload_columns = [col for col in payload.columns if col not in {"canonical_signal_key", "identity_tuple"}]
+    for col in missing_payload_columns:
+        if col not in result.columns:
+            result[col] = ""
+    needs_fallback = pd.Series(False, index=result.index)
+    for col in missing_payload_columns:
+        needs_fallback = needs_fallback | result[col].fillna("").astype(str).str.strip().eq("")
+    fallback = payload[payload["identity_tuple"].astype(str).str.strip().ne("")].copy()
+    duplicate_tuples = set(fallback.loc[fallback["identity_tuple"].duplicated(keep=False), "identity_tuple"].astype(str))
+    fallback = fallback[~fallback["identity_tuple"].astype(str).isin(duplicate_tuples)].drop_duplicates("identity_tuple", keep="last")
+    if not fallback.empty and needs_fallback.any():
+        fallback = fallback.drop(columns=["canonical_signal_key"], errors="ignore")
+        merged = result.loc[needs_fallback, ["identity_tuple"]].merge(fallback, on="identity_tuple", how="left")
+        merged.index = result.loc[needs_fallback].index
+        for col in missing_payload_columns:
+            if col not in merged.columns:
+                continue
+            empty = result.loc[needs_fallback, col].fillna("").astype(str).str.strip().eq("")
+            target_index = result.loc[needs_fallback].index[empty]
+            result.loc[target_index, col] = merged.loc[target_index, col]
+    return result.drop(columns=["identity_tuple"], errors="ignore")
+
+
+def attach_prior_performance_context(data: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
+    if data.empty or signals.empty:
+        return data
+    result = data.copy()
+    for column in [
+        "prior_day_known_net_r",
+        "prior_day_known_wins",
+        "prior_day_known_losses",
+        "trailing_24h_known_net_r",
+        "trailing_24h_known_wins",
+        "trailing_24h_known_losses",
+    ]:
+        result[column] = math.nan if column.endswith("net_r") else 0
+    closed = signals[
+        signals["result"].isin(["WIN", "LOSS"])
+        & signals["closed_at"].astype(str).str.strip().ne("")
+    ].copy()
+    if closed.empty:
+        return result
+    closed["closed_ts"] = pd.to_datetime(closed["closed_at"], utc=True, errors="coerce")
+    closed = closed.dropna(subset=["closed_ts"])
+    closed["known_r"] = pd.to_numeric(closed["original_r"], errors="coerce").fillna(0.0)
+    for idx, row in result.iterrows():
+        ts = pd.to_datetime(row.get("timestamp_utc"), utc=True, errors="coerce")
+        if pd.isna(ts):
+            continue
+        known = closed[closed["closed_ts"] < ts]
+        if known.empty:
+            continue
+        previous_day = (ts - pd.Timedelta(days=1)).floor("D")
+        previous_day_end = previous_day + pd.Timedelta(days=1)
+        prior_day = known[(known["closed_ts"] >= previous_day) & (known["closed_ts"] < previous_day_end)]
+        trailing = known[(known["closed_ts"] >= ts - pd.Timedelta(hours=24)) & (known["closed_ts"] < ts)]
+        if not prior_day.empty:
+            result.at[idx, "prior_day_known_net_r"] = round(float(prior_day["known_r"].sum()), 4)
+            result.at[idx, "prior_day_known_wins"] = int(prior_day["result"].eq("WIN").sum())
+            result.at[idx, "prior_day_known_losses"] = int(prior_day["result"].eq("LOSS").sum())
+        if not trailing.empty:
+            result.at[idx, "trailing_24h_known_net_r"] = round(float(trailing["known_r"].sum()), 4)
+            result.at[idx, "trailing_24h_known_wins"] = int(trailing["result"].eq("WIN").sum())
+            result.at[idx, "trailing_24h_known_losses"] = int(trailing["result"].eq("LOSS").sum())
+    return result
+
+
 def build_session() -> requests.Session:
     session = requests.Session()
     retry = Retry(
@@ -307,6 +438,152 @@ def fetch_range(session: requests.Session, symbol: str, start_ts: pd.Timestamp, 
     return pd.concat(frames, ignore_index=True).drop_duplicates(["open_time", "close_time"]).sort_values("open_time").reset_index(drop=True)
 
 
+def true_range(frame: pd.DataFrame) -> pd.Series:
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    low = pd.to_numeric(frame["low"], errors="coerce")
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    previous_close = close.shift(1)
+    ranges = pd.concat([(high - low).abs(), (high - previous_close).abs(), (low - previous_close).abs()], axis=1)
+    return ranges.max(axis=1)
+
+
+def resample_1h(candles: pd.DataFrame) -> pd.DataFrame:
+    if candles.empty:
+        return pd.DataFrame()
+    frame = candles.copy()
+    frame["open_time"] = pd.to_datetime(frame["open_time"], utc=True, errors="coerce")
+    frame = frame.dropna(subset=["open_time"]).sort_values("open_time")
+    if frame.empty:
+        return pd.DataFrame()
+    frame = frame.set_index("open_time")
+    hourly = frame.resample("1h").agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+    return hourly.dropna(subset=["open", "high", "low", "close"]).reset_index()
+
+
+def count_directional_run(hourly: pd.DataFrame, side: str) -> int:
+    if hourly.empty:
+        return 0
+    run = 0
+    for _, candle in hourly.sort_values("open_time", ascending=False).iterrows():
+        open_ = safe_float(candle.get("open"), math.nan)
+        close = safe_float(candle.get("close"), math.nan)
+        if not math.isfinite(open_) or not math.isfinite(close) or close == open_:
+            break
+        matches = close > open_ if side == "LONG" else close < open_
+        if not matches:
+            break
+        run += 1
+    return run
+
+
+def close_at_or_before(candles: pd.DataFrame, timestamp: pd.Timestamp) -> float:
+    if candles.empty or pd.isna(timestamp):
+        return math.nan
+    frame = candles[pd.to_datetime(candles["close_time"], utc=True, errors="coerce") <= timestamp]
+    if frame.empty:
+        return math.nan
+    return safe_float(frame.sort_values("close_time").iloc[-1].get("close"), math.nan)
+
+
+def session_start_utc(timestamp: pd.Timestamp, session_name: str) -> pd.Timestamp:
+    day = timestamp.floor("D")
+    session = str(session_name or "").strip().lower().replace(" ", "")
+    if session == "asia":
+        return day
+    if session == "london":
+        return day + pd.Timedelta(hours=8)
+    if session in {"newyork", "london+newyork"}:
+        return day + pd.Timedelta(hours=13)
+    if timestamp.hour >= 21:
+        return day + pd.Timedelta(hours=21)
+    return day - pd.Timedelta(hours=3)
+
+
+def build_context_flags(candidate: Candidate) -> str:
+    flags: list[str] = []
+    if math.isfinite(candidate.prior_24h_move_atr):
+        if candidate.prior_24h_move_atr >= 4.0:
+            flags.append("PRIOR_MOVE_VERY_STRONG")
+        elif candidate.prior_24h_move_atr >= 2.5:
+            flags.append("PRIOR_MOVE_STRONG")
+    if math.isfinite(candidate.prior_day_known_net_r):
+        if candidate.prior_day_known_net_r >= 4.0:
+            flags.append("PRIOR_DAY_STRONGLY_PROFITABLE")
+        elif candidate.prior_day_known_net_r > 0:
+            flags.append("PRIOR_DAY_PROFITABLE")
+    if str(candidate.exhaustion_class).upper() in {"EXTENDED", "EXHAUSTED"}:
+        flags.append(f"{candidate.exhaustion_class.upper()}_CONTEXT")
+    if str(candidate.sr_class).upper() in {"CAUTION", "SKIP"}:
+        flags.append("SR_NEAR_OPPOSING")
+    return "|".join(dict.fromkeys(flags))
+
+
+def enrich_candidate_with_candle_context(candidate: Candidate, candles: pd.DataFrame) -> Candidate:
+    if candles.empty:
+        return replace(candidate, context_flags=build_context_flags(candidate))
+    ts = pd.to_datetime(candidate.timestamp_utc, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return replace(candidate, context_flags=build_context_flags(candidate))
+    frame = candles.copy()
+    frame["close_time"] = pd.to_datetime(frame["close_time"], utc=True, errors="coerce")
+    frame = frame.dropna(subset=["close_time"]).sort_values("close_time")
+    prior = frame[frame["close_time"] <= ts].copy()
+    if prior.empty:
+        return replace(candidate, context_flags=build_context_flags(candidate))
+
+    hourly = resample_1h(prior)
+    latest_close = safe_float(prior.iloc[-1].get("close"), math.nan)
+    atr = candidate.atr
+    if (not math.isfinite(atr) or atr <= 0) and not hourly.empty:
+        atr_series = true_range(hourly).rolling(14, min_periods=3).mean().dropna()
+        if not atr_series.empty:
+            atr = safe_float(atr_series.iloc[-1], math.nan)
+    if not math.isfinite(atr) or atr <= 0:
+        return replace(candidate, context_flags=build_context_flags(candidate))
+
+    prior_24_close = close_at_or_before(prior, ts - pd.Timedelta(hours=24))
+    session_close = close_at_or_before(prior, session_start_utc(ts, candidate.session))
+
+    def directional_move(start_close: float) -> float:
+        if not math.isfinite(start_close) or not math.isfinite(latest_close):
+            return math.nan
+        raw = latest_close - start_close if candidate.side == "LONG" else start_close - latest_close
+        return round(float(raw / atr), 4)
+
+    values: dict[str, Any] = {
+        "atr": atr,
+        "prior_24h_move_atr": directional_move(prior_24_close),
+        "prior_session_move_atr": directional_move(session_close),
+    }
+    if not hourly.empty:
+        hourly = hourly.sort_values("open_time")
+        values["directional_run"] = count_directional_run(hourly, candidate.side)
+        close = pd.to_numeric(hourly["close"], errors="coerce")
+        if close.notna().sum() >= 20:
+            ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+            values["ema20_distance_atr"] = round(float(((latest_close - ema20) if candidate.side == "LONG" else (ema20 - latest_close)) / atr), 4)
+        if close.notna().sum() >= 50:
+            ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+            values["ema50_distance_atr"] = round(float(((latest_close - ema50) if candidate.side == "LONG" else (ema50 - latest_close)) / atr), 4)
+        atr_points = true_range(hourly).rolling(14, min_periods=3).mean().dropna()
+        median_atr = atr_points.tail(20).median() if not atr_points.empty else math.nan
+        current_atr = atr_points.iloc[-1] if not atr_points.empty else math.nan
+        if math.isfinite(safe_float(median_atr, math.nan)) and median_atr > 0 and math.isfinite(safe_float(current_atr, math.nan)):
+            values["atr_expansion_ratio"] = round(float(current_atr / median_atr), 4)
+
+    enriched = replace(
+        candidate,
+        atr=safe_float(values.get("atr"), candidate.atr),
+        prior_24h_move_atr=safe_float(values.get("prior_24h_move_atr"), candidate.prior_24h_move_atr),
+        prior_session_move_atr=safe_float(values.get("prior_session_move_atr"), candidate.prior_session_move_atr),
+        directional_run=safe_float(values.get("directional_run"), candidate.directional_run),
+        ema20_distance_atr=safe_float(values.get("ema20_distance_atr"), candidate.ema20_distance_atr),
+        ema50_distance_atr=safe_float(values.get("ema50_distance_atr"), candidate.ema50_distance_atr),
+        atr_expansion_ratio=safe_float(values.get("atr_expansion_ratio"), candidate.atr_expansion_ratio),
+    )
+    return replace(enriched, context_flags=build_context_flags(enriched))
+
+
 def build_candle_cache(candidates: list[Candidate], lookahead_hours: int, session: requests.Session) -> tuple[dict[str, pd.DataFrame], int]:
     grouped: dict[str, list[pd.Timestamp]] = {}
     for candidate in candidates:
@@ -318,7 +595,7 @@ def build_candle_cache(candidates: list[Candidate], lookahead_hours: int, sessio
     request_estimate = 0
     now = pd.Timestamp.now(tz="UTC")
     for symbol, timestamps in grouped.items():
-        start_ts = min(timestamps)
+        start_ts = min(timestamps) - pd.Timedelta(hours=CONTEXT_LOOKBACK_HOURS)
         end_ts = min(max(timestamps) + pd.Timedelta(hours=lookahead_hours), now)
         if end_ts <= start_ts:
             cache[symbol] = pd.DataFrame()
@@ -341,7 +618,21 @@ def candles_for_candidate(candidate: Candidate, cache: dict[str, pd.DataFrame], 
     if pd.isna(ts):
         return pd.DataFrame()
     end_ts = ts + pd.Timedelta(hours=lookahead_hours)
-    mask = (candles["open_time"] >= ts) & (candles["close_time"] <= end_ts)
+    start_ts = ts - pd.Timedelta(hours=CONTEXT_LOOKBACK_HOURS)
+    mask = (candles["open_time"] >= start_ts) & (candles["close_time"] <= end_ts)
+    return candles.loc[mask].copy().reset_index(drop=True)
+
+
+def future_candles_for_candidate(candidate: Candidate, candles: pd.DataFrame, lookahead_hours: int) -> pd.DataFrame:
+    if candles.empty:
+        return pd.DataFrame()
+    ts = pd.to_datetime(candidate.timestamp_utc, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return pd.DataFrame()
+    end_ts = ts + pd.Timedelta(hours=lookahead_hours)
+    open_time = pd.to_datetime(candles["open_time"], utc=True, errors="coerce")
+    close_time = pd.to_datetime(candles["close_time"], utc=True, errors="coerce")
+    mask = (open_time >= ts) & (close_time <= end_ts)
     return candles.loc[mask].copy().reset_index(drop=True)
 
 
@@ -363,6 +654,7 @@ def normalize_signal_frame(data: pd.DataFrame) -> pd.DataFrame:
     out["signal_status"] = first_series(data, ["signal_status"], "").astype(str).str.lower()
     out["result"] = first_series(data, ["result"], "OPEN").astype(str).str.upper().replace({"": "OPEN", "NAN": "OPEN", "NONE": "OPEN"})
     out["hit_target"] = first_series(data, ["hit_target", "outcome"]).astype(str).str.upper()
+    out["closed_at"] = first_series(data, ["closed_at", "close_timestamp", "resolution_timestamp"]).map(normalize_timestamp)
     out["atr"] = pd.to_numeric(first_series(data, ["atr"]), errors="coerce")
     out["support"] = pd.to_numeric(first_series(data, ["support"]), errors="coerce")
     out["resistance"] = pd.to_numeric(first_series(data, ["resistance"]), errors="coerce")
@@ -371,7 +663,7 @@ def normalize_signal_frame(data: pd.DataFrame) -> pd.DataFrame:
         for symbol, side, timestamp, entry in zip(out["symbol"], out["side"], out["timestamp_utc"], out["entry"])
     ]
     out["original_r"] = out.apply(original_r_from_row, axis=1)
-    return out
+    return add_identity_columns(out)
 
 
 def normalize_shadow_context(data: pd.DataFrame, kind: str) -> pd.DataFrame:
@@ -390,7 +682,9 @@ def normalize_shadow_context(data: pd.DataFrame, kind: str) -> pd.DataFrame:
         ],
         index=out.index,
     )
-    out["canonical_signal_key"] = existing.where(existing.astype(str).str.strip().ne(""), derived)
+    existing_text = existing.astype(str).str.strip()
+    valid_existing = existing_text.ne("") & ~existing_text.str.lower().isin(["nan", "none", "null", "nat"])
+    out["canonical_signal_key"] = existing.where(valid_existing, derived)
     if kind == "sr":
         out["sr_class"] = first_series(data, ["sr_gate_decision"], "").astype(str).str.upper()
         out["support"] = pd.to_numeric(first_series(data, ["support"]), errors="coerce")
@@ -416,7 +710,9 @@ def normalize_shadow_context(data: pd.DataFrame, kind: str) -> pd.DataFrame:
         out["ema50_distance_atr"] = pd.to_numeric(first_series(data, ["ema50_distance_atr"]), errors="coerce")
         out["directional_run"] = pd.to_numeric(first_series(data, ["directional_run_1h"]), errors="coerce")
         out["atr_expansion_ratio"] = pd.to_numeric(first_series(data, ["atr_expansion_ratio"]), errors="coerce")
-    return out[out["canonical_signal_key"].astype(str).str.strip().ne("")].drop_duplicates("canonical_signal_key", keep="last")
+    out = add_identity_columns(out)
+    key_text = out["canonical_signal_key"].astype(str).str.strip()
+    return out[key_text.ne("") & ~key_text.str.lower().isin(["nan", "none", "null", "nat"])].drop_duplicates("canonical_signal_key", keep="last")
 
 
 def read_csv_safe(path: Path) -> pd.DataFrame:
@@ -442,14 +738,7 @@ def load_candidates(base_dir: Path, population: str = "all") -> tuple[list[Candi
     data = signals.copy()
     for name, context in contexts.items():
         if not context.empty:
-            context_payload = context.drop(columns=[c for c in ["timestamp_utc", "symbol", "side", "entry"] if c in context.columns])
-            rename_map = {
-                column: f"{name}_{column}"
-                for column in context_payload.columns
-                if column != "canonical_signal_key" and column in data.columns
-            }
-            context_payload = context_payload.rename(columns=rename_map)
-            data = data.merge(context_payload, on="canonical_signal_key", how="left")
+            data = merge_shadow_context(data, context, name)
 
     for numeric in ["atr", "support", "resistance"]:
         for ctx_col in [f"sr_{numeric}", f"entry_{numeric}", f"me_{numeric}"]:
@@ -475,6 +764,8 @@ def load_candidates(base_dir: Path, population: str = "all") -> tuple[list[Candi
     data.loc[data["entry_timing_class"].fillna("").astype(str).str.contains("WAIT PULLBACK", na=False), "source_population"] = "wait_pullback"
     data.loc[data["sr_class"].fillna("").astype(str).str.upper().isin(["CAUTION", "SKIP"]), "source_population"] = data["source_population"].where(data["source_population"].eq("sent"), "sr_caution_skip")
     data.loc[data["exhaustion_class"].fillna("").astype(str).str.upper().isin(["EXTENDED", "EXHAUSTED"]), "source_population"] = data["source_population"].where(data["source_population"].isin(["sent", "wait_pullback", "sr_caution_skip"]), "exhaustion")
+
+    data = attach_prior_performance_context(data, signals)
 
     if population != "all":
         aliases = {"rejected": "rejected", "sent": "sent", "wait_pullback": "wait_pullback", "sr": "sr_caution_skip", "exhaustion": "exhaustion"}
@@ -524,6 +815,12 @@ def load_candidates(base_dir: Path, population: str = "all") -> tuple[list[Candi
                 ema50_distance_atr=safe_float(row.get("ema50_distance_atr"), math.nan),
                 directional_run=safe_float(row.get("directional_run"), math.nan),
                 atr_expansion_ratio=safe_float(row.get("atr_expansion_ratio"), math.nan),
+                prior_day_known_net_r=safe_float(row.get("prior_day_known_net_r"), math.nan),
+                prior_day_known_wins=int(safe_float(row.get("prior_day_known_wins"), 0)),
+                prior_day_known_losses=int(safe_float(row.get("prior_day_known_losses"), 0)),
+                trailing_24h_known_net_r=safe_float(row.get("trailing_24h_known_net_r"), math.nan),
+                trailing_24h_known_wins=int(safe_float(row.get("trailing_24h_known_wins"), 0)),
+                trailing_24h_known_losses=int(safe_float(row.get("trailing_24h_known_losses"), 0)),
             )
         )
     counts = {str(k): int(v) for k, v in valid["source_population"].value_counts().to_dict().items()}
@@ -586,7 +883,9 @@ def evaluate_retest_fill(candidate: Candidate, target: float, candles: pd.DataFr
     if pd.isna(start):
         return RetestResult("DATA_INSUFFICIENT")
     window_end = start + pd.Timedelta(minutes=wait_window_minutes)
-    window = candles[pd.to_datetime(candles["close_time"], utc=True, errors="coerce") <= window_end].copy().reset_index(drop=True)
+    open_time = pd.to_datetime(candles["open_time"], utc=True, errors="coerce")
+    close_time = pd.to_datetime(candles["close_time"], utc=True, errors="coerce")
+    window = candles[(open_time >= start) & (close_time <= window_end)].copy().reset_index(drop=True)
     if window.empty:
         return RetestResult("DATA_INSUFFICIENT")
 
@@ -720,9 +1019,15 @@ def build_record(candidate: Candidate, strategy: StrategyTarget, window: int, mo
         "ema50_distance_atr": f"{candidate.ema50_distance_atr:.4f}" if math.isfinite(candidate.ema50_distance_atr) else "",
         "directional_run": f"{candidate.directional_run:.4f}" if math.isfinite(candidate.directional_run) else "",
         "atr_expansion_ratio": f"{candidate.atr_expansion_ratio:.4f}" if math.isfinite(candidate.atr_expansion_ratio) else "",
-        "prior_24h_move_atr": "",
-        "prior_session_move_atr": "",
+        "prior_24h_move_atr": f"{candidate.prior_24h_move_atr:.4f}" if math.isfinite(candidate.prior_24h_move_atr) else "",
+        "prior_session_move_atr": f"{candidate.prior_session_move_atr:.4f}" if math.isfinite(candidate.prior_session_move_atr) else "",
         "prior_day_known_net_r": f"{candidate.prior_day_known_net_r:.4f}" if math.isfinite(candidate.prior_day_known_net_r) else "",
+        "prior_day_known_wins": candidate.prior_day_known_wins,
+        "prior_day_known_losses": candidate.prior_day_known_losses,
+        "trailing_24h_known_net_r": f"{candidate.trailing_24h_known_net_r:.4f}" if math.isfinite(candidate.trailing_24h_known_net_r) else "",
+        "trailing_24h_known_wins": candidate.trailing_24h_known_wins,
+        "trailing_24h_known_losses": candidate.trailing_24h_known_losses,
+        "context_flags": candidate.context_flags,
         "pre_retest_mae_atr": f"{fill.pre_mae_atr:.4f}" if math.isfinite(fill.pre_mae_atr) else "",
         "pre_retest_mfe_atr": f"{fill.pre_mfe_atr:.4f}" if math.isfinite(fill.pre_mfe_atr) else "",
         "generated_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
@@ -899,6 +1204,27 @@ def summarize_interaction(records: list[dict[str, Any]] | pd.DataFrame, column: 
     return pd.DataFrame(rows, columns=columns).sort_values(["resolved", "net_r"], ascending=[False, False])
 
 
+def context_coverage(candidates: list[Candidate]) -> dict[str, int]:
+    def has_text(value: Any) -> bool:
+        text = str(value or "").strip()
+        return bool(text) and text.lower() not in {"nan", "none", "null", "unknown"}
+
+    def has_number(value: Any) -> bool:
+        return math.isfinite(safe_float(value, math.nan))
+
+    return {
+        "candidates": len(candidates),
+        "sr_class": sum(1 for item in candidates if has_text(item.sr_class)),
+        "entry_timing_class": sum(1 for item in candidates if has_text(item.entry_timing_class)),
+        "exhaustion_class": sum(1 for item in candidates if has_text(item.exhaustion_class)),
+        "prior_24h_move_atr": sum(1 for item in candidates if has_number(item.prior_24h_move_atr)),
+        "prior_session_move_atr": sum(1 for item in candidates if has_number(item.prior_session_move_atr)),
+        "prior_day_known_net_r": sum(1 for item in candidates if has_number(item.prior_day_known_net_r)),
+        "trailing_24h_known_net_r": sum(1 for item in candidates if has_number(item.trailing_24h_known_net_r)),
+        "context_flags": sum(1 for item in candidates if has_text(item.context_flags)),
+    }
+
+
 def run_shadow(
     base_dir: Path,
     output_path: Path,
@@ -923,12 +1249,17 @@ def run_shadow(
         unique_symbols = {candidate.symbol for candidate in candidates}
         request_estimate = len(unique_symbols)
 
+    enriched_candidates: list[Candidate] = []
     for candidate in candidates:
         try:
             candles = candle_provider(candidate, lookahead_hours) if candle_provider else candles_for_candidate(candidate, cache, lookahead_hours)
-            records.extend(evaluate_candidate(candidate, candles))
+            enriched = enrich_candidate_with_candle_context(candidate, candles)
+            enriched_candidates.append(enriched)
+            future_candles = future_candles_for_candidate(enriched, candles, lookahead_hours)
+            records.extend(evaluate_candidate(enriched, future_candles))
         except Exception as exc:
             LOGGER.warning("Pullback retest skipped %s: %s", candidate.canonical_signal_key, exc)
+            enriched_candidates.append(candidate)
 
     written = 0
     if not dry_run:
@@ -943,6 +1274,7 @@ def run_shadow(
         "dry_run": dry_run,
         "output_path": str(output_path),
         "estimated_api_requests": request_estimate,
+        "context_coverage": context_coverage(enriched_candidates),
         "summary": summary,
         "by_exhaustion": summarize_interaction(records, "exhaustion_class"),
         "by_sr": summarize_interaction(records, "sr_class"),
@@ -965,6 +1297,18 @@ def format_summary(result: dict[str, Any], limit: int = 20) -> str:
     ]
     counts = result.get("population_counts", {})
     lines.extend([f"- {key}: {value}" for key, value in sorted(counts.items())] or ["- N/A"])
+    lines.append("")
+    coverage = result.get("context_coverage", {})
+    lines.append("Context coverage:")
+    if coverage:
+        total = int(coverage.get("candidates", 0) or 0)
+        for key, value in coverage.items():
+            if key == "candidates":
+                continue
+            pct = float(value) / total * 100 if total else 0.0
+            lines.append(f"- {key}: {value}/{total} ({pct:.1f}%)")
+    else:
+        lines.append("- N/A")
     lines.append("")
     summary = result["summary"]
     lines.append("Strategy summary:")

@@ -62,6 +62,56 @@ Candidate identity uses `core/signal_identity.py` semantics:
 
 This keeps linkage compatible with existing shadow analytics and older logs that do not contain `canonical_signal_key`.
 
+## Context Enrichment V1
+
+The shadow module now enriches each candidate with frozen pre-signal context so pullback/retest performance can be segmented by market exhaustion and prior profit-taking pressure.
+
+Context sources:
+
+- `logs/sr_trade_weight_shadow.csv`
+- `logs/entry_timing_engine.csv`
+- `logs/market_exhaustion_shadow.csv`
+- closed outcomes in `logs/signals.csv`
+- Binance Futures 15m candles fetched around the candidate window
+
+Linkage is deterministic:
+
+- primary match: `canonical_signal_key`
+- fallback match: normalized `timestamp_utc + symbol + side + entry`
+- ambiguous fallback matches are ignored rather than guessed
+
+No loose time-window matching is used.
+
+Frozen pre-signal fields:
+
+- `prior_24h_move_atr`
+- `prior_session_move_atr`
+- `directional_run`
+- `ema20_distance_atr`
+- `ema50_distance_atr`
+- `atr_expansion_ratio`
+- `prior_day_known_net_r`
+- `prior_day_known_wins`
+- `prior_day_known_losses`
+- `trailing_24h_known_net_r`
+- `trailing_24h_known_wins`
+- `trailing_24h_known_losses`
+- `context_flags`
+
+Context flags:
+
+- `PRIOR_MOVE_STRONG`
+- `PRIOR_MOVE_VERY_STRONG`
+- `PRIOR_DAY_PROFITABLE`
+- `PRIOR_DAY_STRONGLY_PROFITABLE`
+- `EXTENDED_CONTEXT`
+- `EXHAUSTED_CONTEXT`
+- `SR_NEAR_OPPOSING`
+
+Prior performance context uses only outcomes with `closed_at` earlier than the candidate timestamp. Open, unresolved, and future-closed trades are excluded.
+
+The candle cache fetches a bounded pre-signal lookback for context, but retest fill and outcome simulation still evaluate only candles at or after the candidate timestamp. Context enrichment does not change retest targets, production entries, scores, routing, or any live scanner behavior.
+
 ## Retest Strategies
 
 All targets are deterministic and are calculated before future candles are inspected.
@@ -194,6 +244,11 @@ Important fields:
 - `sr_class`
 - `entry_timing_class`
 - `exhaustion_class`
+- `prior_24h_move_atr`
+- `prior_session_move_atr`
+- `prior_day_known_net_r`
+- `trailing_24h_known_net_r`
+- `context_flags`
 - `pre_retest_mae_atr`
 - `pre_retest_mfe_atr`
 

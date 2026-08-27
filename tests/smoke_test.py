@@ -68,8 +68,14 @@ from core.cluster_representative_shadow import (
 from core.pullback_retest_outcome_shadow import (
     Candidate as PullbackRetestCandidate,
     PullbackRetestShadowLogger,
+    attach_prior_performance_context,
+    context_coverage as pullback_context_coverage,
+    enrich_candidate_with_candle_context,
     evaluate_candidate as evaluate_pullback_candidate,
     evaluate_retest_fill,
+    future_candles_for_candidate,
+    merge_shadow_context,
+    normalize_shadow_context,
     run_shadow as run_pullback_retest_shadow,
     strategy_target as pullback_strategy_target,
     summarize_records as summarize_pullback_records,
@@ -6168,6 +6174,148 @@ def test_pullback_retest_logger_dedupe_and_dry_run_no_write() -> None:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_pullback_context_linkage_and_backward_compatibility() -> None:
+    timestamp = "2026-01-01T00:00:00Z"
+    data = pd.DataFrame(
+        [
+            {
+                "timestamp_utc": timestamp,
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "entry": 100.0,
+                "canonical_signal_key": canonical_signal_key(symbol="BTCUSDT", side="LONG", timestamp=timestamp, entry=100),
+            }
+        ]
+    )
+    old_sr = normalize_shadow_context(
+        pd.DataFrame(
+            [
+                {
+                    "signal_timestamp": "2026-01-01T00:00:00+00:00",
+                    "symbol": "BTC/USDT",
+                    "direction": "BUY",
+                    "entry": "100.000000",
+                    "sr_gate_decision": "CAUTION",
+                    "opposing_distance_atr": "0.8",
+                    "effective_sr_rr": "1.3",
+                }
+            ]
+        ),
+        "sr",
+    )
+    merged = merge_shadow_context(data, old_sr, "sr")
+    assert merged.iloc[0]["sr_class"] == "CAUTION"
+    assert float(merged.iloc[0]["opposing_distance_atr"]) == 0.8
+
+    ambiguous = normalize_shadow_context(
+        pd.DataFrame(
+            [
+                {"signal_timestamp": timestamp, "symbol": "BTCUSDT", "side": "LONG", "entry": "100", "recommendation": "WAIT FOR PULLBACK"},
+                {"canonical_signal_key": "legacy-a", "signal_timestamp": timestamp, "symbol": "BTCUSDT", "side": "LONG", "entry": "100", "recommendation": "WAIT FOR PULLBACK"},
+                {"canonical_signal_key": "legacy-b", "signal_timestamp": timestamp, "symbol": "BTCUSDT", "side": "LONG", "entry": "100.0", "recommendation": "ENTER NOW"},
+            ]
+        ),
+        "entry",
+    )
+    no_loose_match = merge_shadow_context(data.drop(columns=["canonical_signal_key"]), ambiguous, "entry")
+    assert str(no_loose_match.iloc[0].get("entry_timing_class", "")).strip() == ""
+
+
+def test_pullback_prior_performance_context_excludes_future_and_unresolved() -> None:
+    candidate_ts = "2026-01-03T12:00:00Z"
+    data = pd.DataFrame([{"timestamp_utc": candidate_ts}])
+    signals = pd.DataFrame(
+        [
+            {"result": "WIN", "closed_at": "2026-01-02T15:00:00Z", "original_r": 1.0},
+            {"result": "LOSS", "closed_at": "2026-01-03T11:30:00Z", "original_r": -1.0},
+            {"result": "WIN", "closed_at": "2026-01-03T12:30:00Z", "original_r": 2.0},
+            {"result": "OPEN", "closed_at": "", "original_r": 0.0},
+        ]
+    )
+    enriched = attach_prior_performance_context(data, signals).iloc[0]
+    assert float(enriched["prior_day_known_net_r"]) == 1.0
+    assert int(enriched["prior_day_known_wins"]) == 1
+    assert int(enriched["prior_day_known_losses"]) == 0
+    assert float(enriched["trailing_24h_known_net_r"]) == 0.0
+    assert int(enriched["trailing_24h_known_wins"]) == 1
+    assert int(enriched["trailing_24h_known_losses"]) == 1
+
+
+def test_pullback_candle_context_uses_prior_closed_candles_and_preserves_target() -> None:
+    candidate = _pullback_candidate("LONG")
+    rows = []
+    base = pd.Timestamp("2025-12-30T00:00:00Z")
+    price = 90.0
+    for idx in range(220):
+        ts = base + pd.Timedelta(minutes=15 * idx)
+        close = price + 0.05
+        rows.append((ts.isoformat(), price, max(price, close) + 0.2, min(price, close) - 0.2, close))
+        price = close
+    candles = _pullback_candles(rows + [("2026-01-01T00:00:00Z", 100, 101, 99, 100)])
+    before_target = pullback_strategy_target(candidate, "ATR_PULLBACK_0_50").target_entry
+    enriched = enrich_candidate_with_candle_context(candidate, candles)
+    after_target = pullback_strategy_target(enriched, "ATR_PULLBACK_0_50").target_entry
+    assert before_target == after_target
+    assert enriched.prior_24h_move_atr > 0
+    assert enriched.directional_run >= 1
+    future_only = future_candles_for_candidate(enriched, candles, 24)
+    assert not future_only.empty
+    assert pd.to_datetime(future_only["open_time"], utc=True).min() >= pd.Timestamp("2026-01-01T00:00:00Z")
+
+
+def test_pullback_context_coverage_and_dry_run_no_write_with_context() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="pullback_context_smoke_"))
+    try:
+        logs = temp_dir / "logs"
+        logs.mkdir()
+        ts = "2026-01-01T00:00:00Z"
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": ts,
+                    "symbol": "TESTUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "stop_loss": 98,
+                    "tp1": 102,
+                    "tp2": 104,
+                    "risk_reward": 2,
+                    "signal_status": "sent",
+                    "result": "LOSS",
+                    "score": 90,
+                    "setup_strength": 85,
+                    "market_session": "Asia",
+                }
+            ]
+        ).to_csv(logs / "signals.csv", index=False)
+        pd.DataFrame(
+            [{"signal_timestamp": ts, "symbol": "TESTUSDT", "side": "LONG", "entry": "100.000000", "sr_gate_decision": "SKIP"}]
+        ).to_csv(logs / "sr_trade_weight_shadow.csv", index=False)
+
+        def provider(candidate: PullbackRetestCandidate, lookahead_hours: int) -> pd.DataFrame:
+            rows = []
+            start = pd.Timestamp("2025-12-30T00:00:00Z")
+            for idx in range(210):
+                ts_i = start + pd.Timedelta(minutes=15 * idx)
+                price = 90 + idx * 0.05
+                rows.append((ts_i.isoformat(), price, price + 0.3, price - 0.3, price + 0.1))
+            rows.append(("2026-01-01T00:00:00Z", 100, 101, 99, 100))
+            rows.append(("2026-01-01T00:15:00Z", 100, 103, 99, 102))
+            return _pullback_candles(rows)
+
+        output = logs / "pullback_retest_outcome_shadow.csv"
+        result = run_pullback_retest_shadow(temp_dir, output, dry_run=True, limit=1, candle_provider=provider)
+        assert result["written"] == 0
+        assert not output.exists()
+        coverage = result["context_coverage"]
+        assert coverage["sr_class"] == 1
+        assert coverage["prior_24h_move_atr"] == 1
+        assert coverage["context_flags"] == 1
+        assert pullback_context_coverage([_pullback_candidate("LONG")])["sr_class"] == 1
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def _cluster_rejected_rows() -> list[dict]:
     return [
         {
@@ -6523,6 +6671,10 @@ def main() -> int:
     test_pullback_retest_not_applicable_and_policy_denominators()
     test_pullback_retest_original_structure_effective_rr_geometry()
     test_pullback_retest_logger_dedupe_and_dry_run_no_write()
+    test_pullback_context_linkage_and_backward_compatibility()
+    test_pullback_prior_performance_context_excludes_future_and_unresolved()
+    test_pullback_candle_context_uses_prior_closed_candles_and_preserves_target()
+    test_pullback_context_coverage_and_dry_run_no_write_with_context()
     test_cluster_representative_identity_clustering_and_population()
     test_cluster_representative_strategies_ties_and_outcome_independence()
     test_cluster_representative_production_zero_one_multiple_and_dedupe()
