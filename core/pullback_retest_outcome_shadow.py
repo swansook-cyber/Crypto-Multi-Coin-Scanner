@@ -64,6 +64,8 @@ FIELDNAMES = [
     "retest_fill_timestamp",
     "retest_entry",
     "effective_rr_at_retest",
+    "effective_rr_tp1_at_retest",
+    "effective_rr_tp2_at_retest",
     "retest_outcome",
     "retest_r",
     "resolution_timestamp",
@@ -622,9 +624,9 @@ def levels_for_model(candidate: Candidate, retest_entry: float, model: str) -> t
     return retest_entry + risk, retest_entry - risk, retest_entry - risk * rr
 
 
-def effective_rr(side: str, entry: float, sl: float, tp2: float) -> float:
+def effective_rr(side: str, entry: float, sl: float, target: float) -> float:
     risk = abs(entry - sl)
-    reward = abs(tp2 - entry)
+    reward = abs(target - entry)
     if risk <= 0 or reward <= 0:
         return math.nan
     return round(reward / risk, 4)
@@ -662,14 +664,19 @@ def evaluate_after_retest(candidate: Candidate, candles: pd.DataFrame, fill_inde
 
 def build_record(candidate: Candidate, strategy: StrategyTarget, window: int, model: str, fill: RetestResult, outcome: OutcomeResult) -> dict[str, Any]:
     retest_entry = strategy.target_entry if fill.status == "RETEST_FILLED" else math.nan
-    rr_at_retest = math.nan
+    rr_tp1_at_retest = math.nan
+    rr_tp2_at_retest = math.nan
     if fill.status == "RETEST_FILLED":
-        sl, _, tp2 = levels_for_model(candidate, retest_entry, model)
-        rr_at_retest = effective_rr(candidate.side, retest_entry, sl, tp2)
+        sl, tp1, tp2 = levels_for_model(candidate, retest_entry, model)
+        rr_tp1_at_retest = effective_rr(candidate.side, retest_entry, sl, tp1)
+        rr_tp2_at_retest = effective_rr(candidate.side, retest_entry, sl, tp2)
     retest_r = outcome.r_value if fill.status == "RETEST_FILLED" else 0.0
     original_winner = candidate.original_r > 0
     original_loser = candidate.original_r < 0
     retest_winner = retest_r > 0
+    applicable = strategy.status == "APPLICABLE"
+    performance_eligible = applicable and fill.status != "DATA_INSUFFICIENT"
+    matched_resolved = fill.status == "RETEST_FILLED" and outcome.outcome in {"WIN_TP1", "WIN_TP2", "LOSS"}
     dedupe = f"{candidate.canonical_signal_key}|{strategy.strategy}|{window}|{model}"
     return {
         "dedupe_key": dedupe,
@@ -693,14 +700,16 @@ def build_record(candidate: Candidate, strategy: StrategyTarget, window: int, mo
         "retest_status": fill.status if strategy.status == "APPLICABLE" else strategy.status,
         "retest_fill_timestamp": fill.fill_timestamp,
         "retest_entry": normalize_float(retest_entry),
-        "effective_rr_at_retest": f"{rr_at_retest:.4f}" if math.isfinite(rr_at_retest) else "",
+        "effective_rr_at_retest": f"{rr_tp2_at_retest:.4f}" if math.isfinite(rr_tp2_at_retest) else "",
+        "effective_rr_tp1_at_retest": f"{rr_tp1_at_retest:.4f}" if math.isfinite(rr_tp1_at_retest) else "",
+        "effective_rr_tp2_at_retest": f"{rr_tp2_at_retest:.4f}" if math.isfinite(rr_tp2_at_retest) else "",
         "retest_outcome": outcome.outcome if fill.status == "RETEST_FILLED" else fill.status,
-        "retest_r": f"{retest_r:.4f}",
+        "retest_r": f"{retest_r:.4f}" if applicable else "",
         "resolution_timestamp": outcome.resolution_timestamp,
-        "r_delta_vs_original": f"{(retest_r - candidate.original_r):.4f}",
-        "sl_avoided": int(original_loser and fill.status in {"NO_RETEST", "INVALIDATED_BEFORE_RETEST"} or (original_loser and retest_r >= 0)),
-        "winner_missed": int(original_winner and fill.status != "RETEST_FILLED"),
-        "loser_to_winner": int(original_loser and retest_winner),
+        "r_delta_vs_original": f"{(retest_r - candidate.original_r):.4f}" if performance_eligible else "",
+        "sl_avoided": int(original_loser and fill.status in {"NO_RETEST", "INVALIDATED_BEFORE_RETEST"}) if performance_eligible else "",
+        "winner_missed": int(original_winner and fill.status == "NO_RETEST") if performance_eligible else "",
+        "loser_to_winner": int(original_loser and retest_winner) if matched_resolved else "",
         "sr_class": candidate.sr_class,
         "opposing_distance_atr": f"{candidate.opposing_distance_atr:.4f}" if math.isfinite(candidate.opposing_distance_atr) else "",
         "effective_sr_rr": f"{candidate.effective_sr_rr:.4f}" if math.isfinite(candidate.effective_sr_rr) else "",
@@ -793,52 +802,74 @@ def summarize_records(records: list[dict[str, Any]] | pd.DataFrame) -> pd.DataFr
         "wait_window_minutes",
         "model",
         "candidates",
-        "applicable",
-        "retest_filled",
+        "applicable_n",
+        "fill_n",
         "no_retest",
-        "invalidated_before_retest",
+        "invalidated",
+        "data_insufficient",
         "fill_rate",
-        "resolved_hypothetical",
-        "wr",
-        "net_r",
-        "avg_effective_rr",
-        "r_delta_vs_original",
-        "sl_avoided",
-        "winners_missed",
+        "matched_filled_n",
+        "retest_wr",
+        "retest_net_r",
+        "matched_original_wr",
+        "matched_original_net_r",
+        "matched_r_delta",
+        "winner_to_loser",
         "loser_to_winner",
+        "policy_net_r",
+        "full_original_net_r",
+        "policy_r_delta",
+        "winners_missed",
+        "losses_avoided",
+        "avg_effective_rr_tp1",
+        "avg_effective_rr_tp2",
     ]
     if data.empty:
         return pd.DataFrame(columns=columns)
-    for col in ["retest_r", "original_r", "effective_rr_at_retest", "r_delta_vs_original"]:
+    for col in ["retest_r", "original_r", "effective_rr_at_retest", "effective_rr_tp1_at_retest", "effective_rr_tp2_at_retest", "r_delta_vs_original"]:
         data[col] = pd.to_numeric(data.get(col), errors="coerce")
     rows = []
     for (strategy, window, model), group in data.groupby(["strategy", "wait_window_minutes", "model"], dropna=False):
-        applicable = group[~group["retest_status"].isin(["NOT_APPLICABLE"])]
+        applicable = group[~group["retest_status"].isin(["NOT_APPLICABLE"])].copy()
+        evaluable = applicable[~applicable["retest_status"].isin(["DATA_INSUFFICIENT"])].copy()
         filled = group[group["retest_status"].eq("RETEST_FILLED")]
-        resolved = filled[filled["retest_outcome"].isin(["WIN_TP1", "WIN_TP2", "LOSS"])]
-        wins = int(resolved["retest_outcome"].astype(str).str.startswith("WIN").sum()) if not resolved.empty else 0
+        matched = filled[filled["retest_outcome"].isin(["WIN_TP1", "WIN_TP2", "LOSS"])].copy()
+        retest_wins = int(matched["retest_outcome"].astype(str).str.startswith("WIN").sum()) if not matched.empty else 0
+        original_wins = int(pd.to_numeric(matched["original_r"], errors="coerce").fillna(0).gt(0).sum()) if not matched.empty else 0
+        winner_to_loser = int((pd.to_numeric(matched["original_r"], errors="coerce").fillna(0).gt(0) & matched["retest_outcome"].eq("LOSS")).sum()) if not matched.empty else 0
+        loser_to_winner = int((pd.to_numeric(matched["original_r"], errors="coerce").fillna(0).lt(0) & matched["retest_outcome"].astype(str).str.startswith("WIN")).sum()) if not matched.empty else 0
+        policy_r = pd.to_numeric(evaluable.get("retest_r"), errors="coerce").fillna(0.0) if not evaluable.empty else pd.Series(dtype=float)
+        policy_original_r = pd.to_numeric(evaluable.get("original_r"), errors="coerce").fillna(0.0) if not evaluable.empty else pd.Series(dtype=float)
         rows.append(
             {
                 "strategy": strategy,
                 "wait_window_minutes": int(window),
                 "model": model,
                 "candidates": int(len(group)),
-                "applicable": int(len(applicable)),
-                "retest_filled": int(len(filled)),
-                "no_retest": int(group["retest_status"].eq("NO_RETEST").sum()),
-                "invalidated_before_retest": int(group["retest_status"].eq("INVALIDATED_BEFORE_RETEST").sum()),
+                "applicable_n": int(len(applicable)),
+                "fill_n": int(len(filled)),
+                "no_retest": int(applicable["retest_status"].eq("NO_RETEST").sum()) if not applicable.empty else 0,
+                "invalidated": int(applicable["retest_status"].eq("INVALIDATED_BEFORE_RETEST").sum()) if not applicable.empty else 0,
+                "data_insufficient": int(applicable["retest_status"].eq("DATA_INSUFFICIENT").sum()) if not applicable.empty else 0,
                 "fill_rate": round(float(len(filled) / len(applicable) * 100), 2) if len(applicable) else 0.0,
-                "resolved_hypothetical": int(len(resolved)),
-                "wr": round(float(wins / len(resolved) * 100), 2) if len(resolved) else 0.0,
-                "net_r": round(float(resolved["retest_r"].fillna(0).sum()), 4) if not resolved.empty else 0.0,
-                "avg_effective_rr": round(float(filled["effective_rr_at_retest"].mean()), 4) if not filled.empty else 0.0,
-                "r_delta_vs_original": round(float(group["r_delta_vs_original"].fillna(0).sum()), 4),
-                "sl_avoided": int(pd.to_numeric(group.get("sl_avoided"), errors="coerce").fillna(0).sum()),
-                "winners_missed": int(pd.to_numeric(group.get("winner_missed"), errors="coerce").fillna(0).sum()),
-                "loser_to_winner": int(pd.to_numeric(group.get("loser_to_winner"), errors="coerce").fillna(0).sum()),
+                "matched_filled_n": int(len(matched)),
+                "retest_wr": round(float(retest_wins / len(matched) * 100), 2) if len(matched) else 0.0,
+                "retest_net_r": round(float(pd.to_numeric(matched.get("retest_r"), errors="coerce").fillna(0).sum()), 4) if not matched.empty else 0.0,
+                "matched_original_wr": round(float(original_wins / len(matched) * 100), 2) if len(matched) else 0.0,
+                "matched_original_net_r": round(float(pd.to_numeric(matched.get("original_r"), errors="coerce").fillna(0).sum()), 4) if not matched.empty else 0.0,
+                "matched_r_delta": round(float(pd.to_numeric(matched.get("retest_r"), errors="coerce").fillna(0).sum() - pd.to_numeric(matched.get("original_r"), errors="coerce").fillna(0).sum()), 4) if not matched.empty else 0.0,
+                "winner_to_loser": winner_to_loser,
+                "loser_to_winner": loser_to_winner,
+                "policy_net_r": round(float(policy_r.sum()), 4) if not policy_r.empty else 0.0,
+                "full_original_net_r": round(float(policy_original_r.sum()), 4) if not policy_original_r.empty else 0.0,
+                "policy_r_delta": round(float(policy_r.sum() - policy_original_r.sum()), 4) if not policy_r.empty else 0.0,
+                "winners_missed": int(pd.to_numeric(evaluable.get("winner_missed"), errors="coerce").fillna(0).sum()) if not evaluable.empty else 0,
+                "losses_avoided": int(pd.to_numeric(evaluable.get("sl_avoided"), errors="coerce").fillna(0).sum()) if not evaluable.empty else 0,
+                "avg_effective_rr_tp1": round(float(pd.to_numeric(filled.get("effective_rr_tp1_at_retest"), errors="coerce").mean()), 4) if not filled.empty else 0.0,
+                "avg_effective_rr_tp2": round(float(pd.to_numeric(filled.get("effective_rr_tp2_at_retest"), errors="coerce").mean()), 4) if not filled.empty else 0.0,
             }
         )
-    return pd.DataFrame(rows, columns=columns).sort_values(["net_r", "wr", "retest_filled"], ascending=[False, False, False])
+    return pd.DataFrame(rows, columns=columns).sort_values(["policy_net_r", "retest_net_r", "fill_n"], ascending=[False, False, False])
 
 
 def summarize_interaction(records: list[dict[str, Any]] | pd.DataFrame, column: str) -> pd.DataFrame:

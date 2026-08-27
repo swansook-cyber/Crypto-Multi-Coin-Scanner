@@ -119,6 +119,7 @@ Model A: `ORIGINAL_STRUCTURE`
 - keep original TP1/TP2
 - use retest entry
 - effective RR changes naturally
+- `effective_rr_tp1_at_retest` and `effective_rr_tp2_at_retest` show the improved or worsened geometry from the retest entry
 
 Model B: `PRESERVED_RISK_RR`
 
@@ -127,6 +128,43 @@ Model B: `PRESERVED_RISK_RR`
 - derive TP1/TP2 from original RR convention
 
 Reports must not mix Model A and Model B. Model A is primary unless a later audit justifies otherwise.
+
+## R Accounting
+
+V1 keeps outcome-R mapping conservative and explicit:
+
+- `LOSS = -1R`
+- `WIN_TP1 = +1R`
+- `WIN_TP2 = effective_rr_tp2_at_retest` when calculable
+- `NO_RETEST = 0R` in full-policy comparison
+- `INVALIDATED_BEFORE_RETEST = 0R` in full-policy comparison
+- `DATA_INSUFFICIENT` is excluded from policy performance
+- `NOT_APPLICABLE` is excluded from all performance denominators
+
+`effective_rr_at_retest` is kept for backward compatibility and represents TP2 effective RR. New fields make this explicit:
+
+- `effective_rr_tp1_at_retest`
+- `effective_rr_tp2_at_retest`
+
+This means improved entry geometry is visible separately even when `WIN_TP1` is still scored as `+1R`.
+
+## Comparison Types
+
+Summary output separates two comparisons.
+
+Matched-fill comparison:
+
+- population is only rows where retest filled and hypothetical outcome resolved
+- compares retest R against original R for the exact same candidates
+- reports matched original WR/Net R, retest WR/Net R, matched R delta, loser-to-winner, and winner-to-loser
+
+Full-policy / opportunity-cost comparison:
+
+- population is all applicable rows except `DATA_INSUFFICIENT`
+- filled trades use retest R
+- `NO_RETEST` and `INVALIDATED_BEFORE_RETEST` use `0R`
+- compares policy R against original R for the same applicable/evaluable candidates
+- reports winners missed and losses avoided due to no entry
 
 ## Output
 

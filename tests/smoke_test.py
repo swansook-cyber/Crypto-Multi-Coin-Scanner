@@ -5991,12 +5991,133 @@ def test_pullback_retest_records_no_retest_not_win_and_loser_to_winner() -> None
     assert atr_record["retest_outcome"] == "WIN_TP1"
     assert atr_record["loser_to_winner"] == 1
     summary = summarize_pullback_records(records)
-    assert int(summary["resolved_hypothetical"].sum()) >= 1
+    assert int(summary["matched_filled_n"].sum()) >= 1
 
     no_retest_records = evaluate_pullback_candidate(candidate, _pullback_candles([("2026-01-01T00:00:00Z", 100, 101, 99.9, 100)]), windows=[45], models=["ORIGINAL_STRUCTURE"])
     no_retest = [record for record in no_retest_records if record["retest_status"] == "NO_RETEST"]
     assert no_retest
     assert all(float(record["retest_r"]) == 0.0 for record in no_retest)
+
+
+def test_pullback_retest_not_applicable_and_policy_denominators() -> None:
+    winner = _pullback_candidate("LONG", original_result="WIN")
+    records = evaluate_pullback_candidate(winner, pd.DataFrame(), windows=[45], models=["ORIGINAL_STRUCTURE"])
+    breakout = next(record for record in records if record["strategy"] == "BREAKOUT_RETEST")
+    assert breakout["retest_status"] == "NOT_APPLICABLE"
+    assert breakout["r_delta_vs_original"] == ""
+    assert breakout["winner_missed"] == ""
+    assert breakout["sl_avoided"] == ""
+    assert breakout["loser_to_winner"] == ""
+
+    manual = [
+        {
+            "strategy": "ATR_PULLBACK_0_30",
+            "wait_window_minutes": 45,
+            "model": "ORIGINAL_STRUCTURE",
+            "retest_status": "RETEST_FILLED",
+            "retest_outcome": "WIN_TP1",
+            "retest_r": "1",
+            "original_r": "-1",
+            "winner_missed": "0",
+            "sl_avoided": "0",
+            "loser_to_winner": "1",
+            "effective_rr_tp1_at_retest": "1.5",
+            "effective_rr_tp2_at_retest": "3.0",
+        },
+        {
+            "strategy": "ATR_PULLBACK_0_30",
+            "wait_window_minutes": 45,
+            "model": "ORIGINAL_STRUCTURE",
+            "retest_status": "NO_RETEST",
+            "retest_outcome": "NO_RETEST",
+            "retest_r": "0",
+            "original_r": "1",
+            "winner_missed": "1",
+            "sl_avoided": "0",
+            "loser_to_winner": "",
+            "effective_rr_tp1_at_retest": "",
+            "effective_rr_tp2_at_retest": "",
+        },
+        {
+            "strategy": "ATR_PULLBACK_0_30",
+            "wait_window_minutes": 45,
+            "model": "ORIGINAL_STRUCTURE",
+            "retest_status": "INVALIDATED_BEFORE_RETEST",
+            "retest_outcome": "INVALIDATED_BEFORE_RETEST",
+            "retest_r": "0",
+            "original_r": "-1",
+            "winner_missed": "0",
+            "sl_avoided": "1",
+            "loser_to_winner": "",
+            "effective_rr_tp1_at_retest": "",
+            "effective_rr_tp2_at_retest": "",
+        },
+        {
+            "strategy": "ATR_PULLBACK_0_30",
+            "wait_window_minutes": 45,
+            "model": "ORIGINAL_STRUCTURE",
+            "retest_status": "DATA_INSUFFICIENT",
+            "retest_outcome": "DATA_INSUFFICIENT",
+            "retest_r": "",
+            "original_r": "1",
+            "winner_missed": "",
+            "sl_avoided": "",
+            "loser_to_winner": "",
+            "effective_rr_tp1_at_retest": "",
+            "effective_rr_tp2_at_retest": "",
+        },
+        {
+            "strategy": "BREAKOUT_RETEST",
+            "wait_window_minutes": 45,
+            "model": "ORIGINAL_STRUCTURE",
+            "retest_status": "NOT_APPLICABLE",
+            "retest_outcome": "NOT_APPLICABLE",
+            "retest_r": "",
+            "original_r": "1",
+            "winner_missed": "",
+            "sl_avoided": "",
+            "loser_to_winner": "",
+            "effective_rr_tp1_at_retest": "",
+            "effective_rr_tp2_at_retest": "",
+        },
+    ]
+    summary = summarize_pullback_records(manual)
+    row = summary[summary["strategy"].eq("ATR_PULLBACK_0_30")].iloc[0]
+    assert int(row["applicable_n"]) == 4
+    assert int(row["data_insufficient"]) == 1
+    assert int(row["matched_filled_n"]) == 1
+    assert float(row["matched_original_net_r"]) == -1.0
+    assert float(row["matched_r_delta"]) == 2.0
+    assert float(row["policy_net_r"]) == 1.0
+    assert float(row["full_original_net_r"]) == -1.0
+    assert float(row["policy_r_delta"]) == 2.0
+    assert int(row["winners_missed"]) == 1
+    assert int(row["losses_avoided"]) == 1
+    assert int(row["loser_to_winner"]) == 1
+
+    not_applicable = summary[summary["strategy"].eq("BREAKOUT_RETEST")].iloc[0]
+    assert int(not_applicable["applicable_n"]) == 0
+    assert float(not_applicable["policy_r_delta"]) == 0.0
+    assert int(not_applicable["winners_missed"]) == 0
+    assert int(not_applicable["losses_avoided"]) == 0
+
+
+def test_pullback_retest_original_structure_effective_rr_geometry() -> None:
+    candidate = _pullback_candidate("LONG", original_result="LOSS")
+    candles = _pullback_candles(
+        [
+            ("2026-01-01T00:00:00Z", 100, 101, 99.0, 100),
+            ("2026-01-01T00:15:00Z", 100, 103.0, 98.8, 102),
+        ]
+    )
+    records = evaluate_pullback_candidate(candidate, candles, windows=[45], models=["ORIGINAL_STRUCTURE"])
+    record = next(item for item in records if item["strategy"] == "ATR_PULLBACK_0_50")
+    assert record["retest_entry"] == "99.000000"
+    assert record["effective_rr_tp1_at_retest"] == "3.0000"
+    assert record["effective_rr_tp2_at_retest"] == "5.0000"
+    assert record["effective_rr_at_retest"] == record["effective_rr_tp2_at_retest"]
+    assert record["retest_outcome"] == "WIN_TP1"
+    assert record["retest_r"] == "1.0000"
 
 
 def test_pullback_retest_logger_dedupe_and_dry_run_no_write() -> None:
@@ -6399,6 +6520,8 @@ def main() -> int:
     test_pullback_retest_targets_are_deterministic_and_no_lookahead()
     test_pullback_retest_fill_invalidation_and_no_retest_rules()
     test_pullback_retest_records_no_retest_not_win_and_loser_to_winner()
+    test_pullback_retest_not_applicable_and_policy_denominators()
+    test_pullback_retest_original_structure_effective_rr_geometry()
     test_pullback_retest_logger_dedupe_and_dry_run_no_write()
     test_cluster_representative_identity_clustering_and_population()
     test_cluster_representative_strategies_ties_and_outcome_independence()
