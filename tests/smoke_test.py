@@ -65,6 +65,15 @@ from core.cluster_representative_shadow import (
     run_shadow as run_cluster_shadow,
     select_representative as select_cluster_representative,
 )
+from core.pullback_retest_outcome_shadow import (
+    Candidate as PullbackRetestCandidate,
+    PullbackRetestShadowLogger,
+    evaluate_candidate as evaluate_pullback_candidate,
+    evaluate_retest_fill,
+    run_shadow as run_pullback_retest_shadow,
+    strategy_target as pullback_strategy_target,
+    summarize_records as summarize_pullback_records,
+)
 from core.rejected_outcome_shadow import (
     RejectedOutcomeShadowLogger,
     build_output_record,
@@ -5882,6 +5891,162 @@ def test_rejected_outcome_shadow_candle_cache_filters_after_timestamp() -> None:
     assert outcome.hypothetical_outcome == "WIN_TP1"
 
 
+def _pullback_candidate(side: str = "LONG", original_result: str = "LOSS") -> PullbackRetestCandidate:
+    entry = 100.0
+    sl = 98.0 if side == "LONG" else 102.0
+    tp1 = 102.0 if side == "LONG" else 98.0
+    tp2 = 104.0 if side == "LONG" else 96.0
+    return PullbackRetestCandidate(
+        canonical_signal_key=canonical_signal_key(symbol="TESTUSDT", side=side, timestamp="2026-01-01T00:00:00Z", entry=entry),
+        timestamp_utc="2026-01-01T00:00:00Z",
+        symbol="TESTUSDT",
+        side=side,
+        source_population="sent",
+        entry=entry,
+        sl=sl,
+        tp1=tp1,
+        tp2=tp2,
+        rr=2.0,
+        score=90,
+        confidence=85,
+        session="Asia",
+        original_outcome=original_result,
+        original_r=-1.0 if original_result == "LOSS" else 1.0,
+        atr=2.0,
+        support=99.0 if side == "LONG" else 0.0,
+        resistance=0.0 if side == "LONG" else 101.0,
+        sr_class="SKIP",
+        entry_timing_class="WAIT PULLBACK",
+        exhaustion_class="EXTENDED",
+        ema20_distance_atr=0.5,
+        ema50_distance_atr=1.0,
+        swing_distance_atr=2.5,
+        directional_run=4,
+        atr_expansion_ratio=1.1,
+    )
+
+
+def _pullback_candles(rows: list[tuple[str, float, float, float, float]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "open_time": pd.Timestamp(ts),
+                "close_time": pd.Timestamp(ts) + pd.Timedelta(minutes=15),
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+            }
+            for ts, open_, high, low, close in rows
+        ]
+    )
+
+
+def test_pullback_retest_targets_are_deterministic_and_no_lookahead() -> None:
+    candidate = _pullback_candidate("LONG")
+    first = pullback_strategy_target(candidate, "ATR_PULLBACK_0_50")
+    second = pullback_strategy_target(candidate, "ATR_PULLBACK_0_50")
+    future_a = _pullback_candles([("2026-01-01T00:00:00Z", 100, 101, 99, 100)])
+    future_b = _pullback_candles([("2026-01-01T00:00:00Z", 100, 120, 80, 100)])
+    assert first.target_entry == 99.0
+    assert second.target_entry == first.target_entry
+    assert evaluate_retest_fill(candidate, first.target_entry, future_a, 45).status == "RETEST_FILLED"
+    assert evaluate_retest_fill(candidate, first.target_entry, future_b, 45).status == "INVALIDATED_BEFORE_RETEST"
+
+
+def test_pullback_retest_fill_invalidation_and_no_retest_rules() -> None:
+    long_candidate = _pullback_candidate("LONG")
+    target = pullback_strategy_target(long_candidate, "ATR_PULLBACK_0_30").target_entry
+    invalidated = _pullback_candles([("2026-01-01T00:00:00Z", 100, 100.5, 97.5, 98)])
+    no_retest = _pullback_candles([("2026-01-01T00:00:00Z", 100, 103, 99.8, 102)])
+    filled = _pullback_candles(
+        [
+            ("2026-01-01T00:00:00Z", 100, 101, 99.4, 100),
+            ("2026-01-01T00:15:00Z", 100, 102.5, 99.3, 102),
+        ]
+    )
+    assert evaluate_retest_fill(long_candidate, target, invalidated, 45).status == "INVALIDATED_BEFORE_RETEST"
+    assert evaluate_retest_fill(long_candidate, target, no_retest, 45).status == "NO_RETEST"
+    assert evaluate_retest_fill(long_candidate, target, filled, 45).status == "RETEST_FILLED"
+
+    short_candidate = _pullback_candidate("SHORT")
+    short_target = pullback_strategy_target(short_candidate, "ATR_PULLBACK_0_30").target_entry
+    short_filled = _pullback_candles([("2026-01-01T00:00:00Z", 100, 100.7, 99, 100)])
+    assert short_target == 100.6
+    assert evaluate_retest_fill(short_candidate, short_target, short_filled, 45).status == "RETEST_FILLED"
+
+
+def test_pullback_retest_records_no_retest_not_win_and_loser_to_winner() -> None:
+    candidate = _pullback_candidate("LONG", original_result="LOSS")
+    candles = _pullback_candles(
+        [
+            ("2026-01-01T00:00:00Z", 100, 101, 99.0, 100),
+            ("2026-01-01T00:15:00Z", 100, 102.5, 98.8, 102),
+            ("2026-01-01T00:30:00Z", 102, 104.5, 101, 104),
+        ]
+    )
+    records = evaluate_pullback_candidate(candidate, candles, windows=[45], models=["ORIGINAL_STRUCTURE"])
+    atr_record = next(record for record in records if record["strategy"] == "ATR_PULLBACK_0_50")
+    assert atr_record["retest_status"] == "RETEST_FILLED"
+    assert atr_record["retest_outcome"] == "WIN_TP1"
+    assert atr_record["loser_to_winner"] == 1
+    summary = summarize_pullback_records(records)
+    assert int(summary["resolved_hypothetical"].sum()) >= 1
+
+    no_retest_records = evaluate_pullback_candidate(candidate, _pullback_candles([("2026-01-01T00:00:00Z", 100, 101, 99.9, 100)]), windows=[45], models=["ORIGINAL_STRUCTURE"])
+    no_retest = [record for record in no_retest_records if record["retest_status"] == "NO_RETEST"]
+    assert no_retest
+    assert all(float(record["retest_r"]) == 0.0 for record in no_retest)
+
+
+def test_pullback_retest_logger_dedupe_and_dry_run_no_write() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="pullback_retest_smoke_"))
+    try:
+        logs = temp_dir / "logs"
+        logs.mkdir()
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "symbol": "TESTUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "stop_loss": 98,
+                    "tp1": 102,
+                    "tp2": 104,
+                    "risk_reward": 2,
+                    "signal_status": "sent",
+                    "result": "LOSS",
+                    "score": 90,
+                    "setup_strength": 85,
+                    "market_session": "Asia",
+                }
+            ]
+        ).to_csv(logs / "signals.csv", index=False)
+
+        def provider(candidate: PullbackRetestCandidate, lookahead_hours: int) -> pd.DataFrame:
+            return _pullback_candles(
+                [
+                    ("2026-01-01T00:00:00Z", 100, 101, 99.0, 100),
+                    ("2026-01-01T00:15:00Z", 100, 104.5, 98.8, 104),
+                ]
+            )
+
+        output = logs / "pullback_retest_outcome_shadow.csv"
+        dry = run_pullback_retest_shadow(temp_dir, output, dry_run=True, limit=1, candle_provider=provider)
+        assert dry["candidates"] == 1
+        assert dry["written"] == 0
+        assert not output.exists()
+
+        live = run_pullback_retest_shadow(temp_dir, output, dry_run=False, limit=1, candle_provider=provider)
+        assert live["written"] > 0
+        second = run_pullback_retest_shadow(temp_dir, output, dry_run=False, limit=1, candle_provider=provider)
+        assert second["written"] == 0
+        assert PullbackRetestShadowLogger(output).existing_keys()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def _cluster_rejected_rows() -> list[dict]:
     return [
         {
@@ -6231,6 +6396,10 @@ def main() -> int:
     test_rejected_outcome_shadow_candidate_parsing_categories_and_open()
     test_rejected_outcome_shadow_backfill_dedupe_and_logger_schema()
     test_rejected_outcome_shadow_candle_cache_filters_after_timestamp()
+    test_pullback_retest_targets_are_deterministic_and_no_lookahead()
+    test_pullback_retest_fill_invalidation_and_no_retest_rules()
+    test_pullback_retest_records_no_retest_not_win_and_loser_to_winner()
+    test_pullback_retest_logger_dedupe_and_dry_run_no_write()
     test_cluster_representative_identity_clustering_and_population()
     test_cluster_representative_strategies_ties_and_outcome_independence()
     test_cluster_representative_production_zero_one_multiple_and_dedupe()
