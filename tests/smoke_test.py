@@ -55,6 +55,16 @@ from core.performance_analytics_v1 import build_complete_report, export_v1_outpu
 from core.performance_analytics_v2 import build_performance_v2, canonical_session, generate_performance_warnings
 from core.performance_analytics_v3 import build_performance_v3, shadow_filter_backtest
 from core.performance_analytics_v8 import build_root_cause_analytics
+from core.cluster_representative_shadow import (
+    STRATEGIES as CLUSTER_STRATEGIES,
+    build_shadow_rows as build_cluster_shadow_rows,
+    cluster_key as cluster_shadow_key,
+    normalize_production_sent,
+    normalize_rejected_outcomes,
+    quality_composite_v1,
+    run_shadow as run_cluster_shadow,
+    select_representative as select_cluster_representative,
+)
 from core.rejected_outcome_shadow import (
     RejectedOutcomeShadowLogger,
     build_output_record,
@@ -5872,6 +5882,244 @@ def test_rejected_outcome_shadow_candle_cache_filters_after_timestamp() -> None:
     assert outcome.hypothetical_outcome == "WIN_TP1"
 
 
+def _cluster_rejected_rows() -> list[dict]:
+    return [
+        {
+            "canonical_signal_key": canonical_signal_key(symbol="BTCUSDT", side="LONG", timestamp="2026-07-01T00:10:00Z", entry=100),
+            "timestamp_utc": "2026-07-01T00:10:00Z",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "entry": "100",
+            "score": "90",
+            "confidence": "80",
+            "tier": "B",
+            "rejection_reason": "CORRELATION",
+            "hypothetical_outcome": "WIN_TP1",
+            "hypothetical_r": "1",
+        },
+        {
+            "canonical_signal_key": canonical_signal_key(symbol="ETHUSDT", side="LONG", timestamp="2026-07-01T00:20:00Z", entry=200),
+            "timestamp_utc": "2026-07-01T00:20:00Z",
+            "symbol": "ETHUSDT",
+            "side": "LONG",
+            "entry": "200",
+            "score": "85",
+            "confidence": "95",
+            "tier": "A",
+            "rejection_reason": "CORRELATION",
+            "hypothetical_outcome": "LOSS",
+            "hypothetical_r": "-1",
+        },
+        {
+            "canonical_signal_key": canonical_signal_key(symbol="SOLUSDT", side="SHORT", timestamp="2026-07-01T00:30:00Z", entry=50),
+            "timestamp_utc": "2026-07-01T00:30:00Z",
+            "symbol": "SOLUSDT",
+            "side": "SHORT",
+            "entry": "50",
+            "score": "88",
+            "confidence": "88",
+            "tier": "C",
+            "rejection_reason": "CORRELATION",
+            "hypothetical_outcome": "WIN_TP2",
+            "hypothetical_r": "2",
+        },
+        {
+            "canonical_signal_key": canonical_signal_key(symbol="XRPUSDT", side="LONG", timestamp="2026-07-01T01:05:00Z", entry=1),
+            "timestamp_utc": "2026-07-01T01:05:00Z",
+            "symbol": "XRPUSDT",
+            "side": "LONG",
+            "entry": "1",
+            "score": "70",
+            "confidence": "70",
+            "tier": "B",
+            "rejection_reason": "QUALITY",
+            "hypothetical_outcome": "WIN_TP1",
+            "hypothetical_r": "1",
+        },
+    ]
+
+
+def _cluster_sent_rows() -> list[dict]:
+    return [
+        {
+            "timestamp": "2026-07-01T00:05:00Z",
+            "symbol": "BNBUSDT",
+            "side": "LONG",
+            "entry": 300,
+            "score": 82,
+            "confidence": 82,
+            "watchlist_tier": "A",
+            "signal_status": "sent",
+            "result": "WIN",
+            "hit_target": "TP1",
+            "net_r_estimate": "1",
+        },
+        {
+            "timestamp": "2026-07-01T00:15:00Z",
+            "symbol": "ADAUSDT",
+            "side": "LONG",
+            "entry": 0.5,
+            "score": 80,
+            "confidence": 85,
+            "watchlist_tier": "B",
+            "signal_status": "sent",
+            "result": "LOSS",
+            "hit_target": "SL",
+            "net_r_estimate": "-1",
+        },
+        {
+            "timestamp": "2026-07-01T00:20:00Z",
+            "symbol": "LTCUSDT",
+            "side": "SHORT",
+            "entry": 90,
+            "score": 75,
+            "confidence": 75,
+            "watchlist_tier": "B",
+            "signal_status": "sent",
+            "result": "OPEN",
+            "hit_target": "",
+            "net_r_estimate": "",
+        },
+    ]
+
+
+def test_cluster_representative_identity_clustering_and_population() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="cluster_shadow_smoke_"))
+    try:
+        rejected_path = temp_dir / "rejected_outcome_shadow.csv"
+        signals_path = temp_dir / "signals.csv"
+        pd.DataFrame(_cluster_rejected_rows()).to_csv(rejected_path, index=False)
+        pd.DataFrame(_cluster_sent_rows()).to_csv(signals_path, index=False)
+        rejected = normalize_rejected_outcomes(rejected_path)
+        production = normalize_production_sent(signals_path)
+        rows = build_cluster_shadow_rows(rejected, production)
+
+        assert set(rejected["rejection_reason"]) == {"CORRELATION"}
+        assert len(rejected) == 3
+        assert set(rejected["cluster_hour_utc"]) == {"2026-07-01T00:00:00Z"}
+        assert set(rejected["side"]) == {"LONG", "SHORT"}
+        assert cluster_shadow_key("2026-07-01T00:00:00Z", "LONG").startswith("cluster:v1:")
+        assert len(rows) == len(CLUSTER_STRATEGIES) * 2
+        assert set(rows["strategy"]) == set(CLUSTER_STRATEGIES)
+        assert rows[rows["side"].eq("LONG")]["cluster_size"].iloc[0] == 2
+        assert rows[rows["side"].eq("SHORT")]["cluster_size"].iloc[0] == 1
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_cluster_representative_strategies_ties_and_outcome_independence() -> None:
+    rejected = pd.DataFrame(_cluster_rejected_rows())
+    path = Path(tempfile.gettempdir()) / "cluster_strategy_rejected.csv"
+    try:
+        rejected.to_csv(path, index=False)
+        normalized = normalize_rejected_outcomes(path)
+        long_cluster = normalized[normalized["side"].eq("LONG")].copy()
+        assert select_cluster_representative(long_cluster, "BEST_SCORE")["symbol"] == "BTCUSDT"
+        assert select_cluster_representative(long_cluster, "BEST_CONFIDENCE")["symbol"] == "ETHUSDT"
+        assert select_cluster_representative(long_cluster, "SCORE_PLUS_CONFIDENCE")["symbol"] == "ETHUSDT"
+        assert select_cluster_representative(long_cluster, "TIER_SCORE_CONF")["symbol"] == "ETHUSDT"
+        assert select_cluster_representative(long_cluster, "QUALITY_COMPOSITE_V1")["symbol"] == "ETHUSDT"
+        assert quality_composite_v1(long_cluster[long_cluster["symbol"].eq("ETHUSDT")].iloc[0]) > 0
+
+        replaced = rejected.copy()
+        replaced["hypothetical_outcome"] = ["LOSS", "WIN_TP2", "LOSS", "LOSS"]
+        replaced["hypothetical_r"] = ["-1", "2", "-1", "-1"]
+        replaced.to_csv(path, index=False)
+        normalized_replaced = normalize_rejected_outcomes(path)
+        long_replaced = normalized_replaced[normalized_replaced["side"].eq("LONG")].copy()
+        for strategy in CLUSTER_STRATEGIES:
+            assert select_cluster_representative(long_cluster, strategy)["symbol"] == select_cluster_representative(long_replaced, strategy)["symbol"]
+
+        tied = normalized[normalized["side"].eq("LONG")].copy()
+        tied["score_num"] = 90
+        tied["confidence_num"] = 90
+        tied["tier_priority"] = 2
+        assert select_cluster_representative(tied, "BEST_SCORE")["symbol"] == "BTCUSDT"
+    finally:
+        if path.exists():
+            path.unlink()
+
+
+def test_cluster_representative_production_zero_one_multiple_and_dedupe() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="cluster_shadow_dedupe_"))
+    try:
+        rejected_path = temp_dir / "rejected_outcome_shadow.csv"
+        signals_path = temp_dir / "signals.csv"
+        output_path = temp_dir / "cluster_representative_shadow.csv"
+        pd.DataFrame(_cluster_rejected_rows()).to_csv(rejected_path, index=False)
+        pd.DataFrame(_cluster_sent_rows()).to_csv(signals_path, index=False)
+
+        rows, summary = run_cluster_shadow(
+            rejected_outcome_path=rejected_path,
+            signals_path=signals_path,
+            output_path=output_path,
+            dry_run=True,
+        )
+        assert not output_path.exists()
+        assert summary.clusters_evaluated == 2
+        assert summary.written == 0
+        long_rows = rows[rows["side"].eq("LONG")]
+        short_rows = rows[rows["side"].eq("SHORT")]
+        assert int(long_rows.iloc[0]["production_sent_count"]) == 2
+        assert int(short_rows.iloc[0]["production_sent_count"]) == 1
+        assert set(long_rows["production_sent_present"]) == {"YES"}
+
+        rows_written, summary_written = run_cluster_shadow(
+            rejected_outcome_path=rejected_path,
+            signals_path=signals_path,
+            output_path=output_path,
+            dry_run=False,
+        )
+        assert len(rows_written) == 10
+        assert summary_written.written == 10
+        _, summary_second = run_cluster_shadow(
+            rejected_outcome_path=rejected_path,
+            signals_path=signals_path,
+            output_path=output_path,
+            dry_run=False,
+        )
+        assert summary_second.written == 0
+
+        no_sent_path = temp_dir / "empty_signals.csv"
+        pd.DataFrame(columns=["timestamp", "symbol", "side", "entry", "signal_status"]).to_csv(no_sent_path, index=False)
+        no_sent_rows, _ = run_cluster_shadow(
+            rejected_outcome_path=rejected_path,
+            signals_path=no_sent_path,
+            output_path=temp_dir / "cluster_no_sent.csv",
+            dry_run=True,
+        )
+        assert set(no_sent_rows["production_sent_present"]) == {"NO"}
+        assert set(no_sent_rows["production_sent_count"]) == {0}
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_cluster_representative_fail_safe_malformed_missing_fields() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="cluster_shadow_malformed_"))
+    try:
+        rejected_path = temp_dir / "rejected_outcome_shadow.csv"
+        signals_path = temp_dir / "signals.csv"
+        pd.DataFrame(
+            [
+                {"timestamp_utc": "", "symbol": "", "side": "", "rejection_reason": "CORRELATION"},
+                {**_cluster_rejected_rows()[0], "canonical_signal_key": "", "entry": ""},
+                _cluster_rejected_rows()[2],
+            ]
+        ).to_csv(rejected_path, index=False)
+        pd.DataFrame(columns=["timestamp", "symbol", "side", "entry", "signal_status"]).to_csv(signals_path, index=False)
+        rows, summary = run_cluster_shadow(
+            rejected_outcome_path=rejected_path,
+            signals_path=signals_path,
+            output_path=temp_dir / "cluster.csv",
+            dry_run=True,
+        )
+        assert summary.clusters_evaluated == 1
+        assert len(rows) == len(CLUSTER_STRATEGIES)
+        assert set(rows["representative_symbol"]) == {"SOLUSDT"}
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -5983,6 +6231,10 @@ def main() -> int:
     test_rejected_outcome_shadow_candidate_parsing_categories_and_open()
     test_rejected_outcome_shadow_backfill_dedupe_and_logger_schema()
     test_rejected_outcome_shadow_candle_cache_filters_after_timestamp()
+    test_cluster_representative_identity_clustering_and_population()
+    test_cluster_representative_strategies_ties_and_outcome_independence()
+    test_cluster_representative_production_zero_one_multiple_and_dedupe()
+    test_cluster_representative_fail_safe_malformed_missing_fields()
     print("smoke tests passed")
     return 0
 
