@@ -40,6 +40,7 @@ from core.market_exhaustion_engine import (
     MarketExhaustionShadowLogger,
     evaluate_market_exhaustion,
 )
+from core.setup_strength_prospective_shadow import SetupStrengthProspectiveShadowLogger, classify_signal_setup_strength
 from core.sr_trade_weight_gate import SRGateConfig, SRTradeWeightShadowLogger, evaluate_sr_trade_weight
 from core.wave_structure_analyzer import calculate_wave_score
 import manual_live_pilot
@@ -60,6 +61,7 @@ SIGNAL_JOURNAL = LOG_DIR / "signals.csv"
 ENTRY_TIMING_JOURNAL = LOG_DIR / "entry_timing_engine.csv"
 SR_TRADE_WEIGHT_SHADOW_JOURNAL = LOG_DIR / "sr_trade_weight_shadow.csv"
 MARKET_EXHAUSTION_SHADOW_JOURNAL = LOG_DIR / "market_exhaustion_shadow.csv"
+SETUP_STRENGTH_PROSPECTIVE_SHADOW_JOURNAL = LOG_DIR / "setup_strength_prospective_shadow.csv"
 SIGNAL_VERSION = "internal-lab-v2"
 
 LOG_DIR.mkdir(exist_ok=True)
@@ -211,6 +213,8 @@ class ScannerConfig:
     sr_gate_caution_effective_rr: float
     sr_gate_hard_skip_atr: float
     sr_gate_caution_atr: float
+    setup_strength_shadow_enabled: bool
+    setup_strength_live_enabled: bool
     market_exhaustion_shadow_enabled: bool
     market_exhaustion_live_enabled: bool
     market_exhaustion_fresh_swing_atr: float
@@ -353,6 +357,8 @@ class ScannerConfig:
             sr_gate_caution_effective_rr=env_float("SR_GATE_CAUTION_EFFECTIVE_RR", 1.8),
             sr_gate_hard_skip_atr=env_float("SR_GATE_HARD_SKIP_ATR", 0.65),
             sr_gate_caution_atr=env_float("SR_GATE_CAUTION_ATR", 1.0),
+            setup_strength_shadow_enabled=env_bool("SETUP_STRENGTH_SHADOW_ENABLED", True),
+            setup_strength_live_enabled=env_bool("SETUP_STRENGTH_LIVE_ENABLED", False),
             market_exhaustion_shadow_enabled=env_bool("MARKET_EXHAUSTION_SHADOW_ENABLED", True),
             market_exhaustion_live_enabled=env_bool("MARKET_EXHAUSTION_LIVE_ENABLED", False),
             market_exhaustion_fresh_swing_atr=env_float("MARKET_EXHAUSTION_FRESH_SWING_ATR", 1.5),
@@ -420,6 +426,7 @@ class TradeSignal:
     btc_regime: str = "unclear"
     risk_mode: str = "normal"
     btc_regime_notes: str = ""
+    setup_strength: int | None = None
 
 
 @dataclass
@@ -904,6 +911,7 @@ class SignalScorer:
             sl=sl,
             rr=rr,
             confidence=confidence,
+            setup_strength=confidence,
             score=score,
             support=support,
             resistance=resistance,
@@ -1664,6 +1672,15 @@ class AgentRunner:
             caution_atr=config.sr_gate_caution_atr,
         )
         self.sr_gate_logger = SRTradeWeightShadowLogger(SR_TRADE_WEIGHT_SHADOW_JOURNAL)
+        self.setup_strength_shadow_logger: SetupStrengthProspectiveShadowLogger | None = None
+        if config.setup_strength_shadow_enabled:
+            try:
+                self.setup_strength_shadow_logger = SetupStrengthProspectiveShadowLogger(
+                    SETUP_STRENGTH_PROSPECTIVE_SHADOW_JOURNAL,
+                    os.getenv("SETUP_STRENGTH_PROSPECTIVE_START_UTC", "").strip() or None,
+                )
+            except Exception as exc:
+                LOGGER.warning("Setup Strength prospective shadow disabled after logger init failure: %s", exc)
         self.market_exhaustion_config = MarketExhaustionConfig(
             fresh_swing_atr=config.market_exhaustion_fresh_swing_atr,
             normal_swing_atr=config.market_exhaustion_normal_swing_atr,
@@ -1758,6 +1775,8 @@ class AgentRunner:
         )
         LOGGER.info("Market Exhaustion Shadow: %s", "ENABLED" if self.config.market_exhaustion_shadow_enabled else "DISABLED")
         LOGGER.info("Market Exhaustion Live: %s", "ENABLED (ignored in Phase 1)" if self.config.market_exhaustion_live_enabled else "DISABLED")
+        LOGGER.info("Setup Strength Prospective Shadow: %s", "ENABLED" if self.setup_strength_shadow_logger else "DISABLED")
+        LOGGER.info("Setup Strength Live: %s", "ENABLED (ignored in V1)" if self.config.setup_strength_live_enabled else "DISABLED")
         if self.config.run_once:
             self.scan_once()
             return
@@ -1811,6 +1830,30 @@ class AgentRunner:
             )
         except Exception as exc:
             LOGGER.warning("Entry Timing Engine shadow evaluation failed for %s: %s", signal.symbol, exc)
+
+    def evaluate_setup_strength_shadow(self, signal: TradeSignal, signal_status: str, rejection_reason: str = "") -> None:
+        if not self.setup_strength_shadow_logger:
+            return
+        try:
+            appended = self.setup_strength_shadow_logger.log_signal(
+                signal,
+                signal_status=signal_status,
+                rejection_reason=rejection_reason,
+            )
+            LOGGER.info(
+                "Setup Strength prospective shadow %s for %s %s: class=%s status=%s",
+                "logged" if appended else "duplicate skipped",
+                signal.symbol,
+                signal.direction,
+                classify_signal_setup_strength(signal),
+                signal_status,
+            )
+        except Exception as exc:
+            LOGGER.warning("Setup Strength prospective shadow failed for %s: %s", signal.symbol, exc)
+
+    def log_signal_status(self, signal: TradeSignal, signal_status: str = "sent", skip_reason: str = "") -> None:
+        self.journal.log_signal(signal, signal_status, skip_reason)
+        self.evaluate_setup_strength_shadow(signal, signal_status, skip_reason)
 
     def evaluate_sr_trade_weight_shadow(self, signal: TradeSignal, signal_status: str = "candidate") -> str:
         if not self.config.sr_gate_shadow_enabled:
@@ -1942,7 +1985,7 @@ class AgentRunner:
             )
             if risk_guard_active:
                 for signal in candidates:
-                    self.journal.log_signal(signal, "skipped_daily_risk_guard", risk_guard_reason)
+                    self.log_signal_status(signal, "skipped_daily_risk_guard", risk_guard_reason)
                 LOGGER.info("Daily risk guard active: %s", risk_guard_reason)
                 return
         cooldown_status = self.loss_cooldown.status()
@@ -1951,34 +1994,34 @@ class AgentRunner:
             reason = f"global_loss_cooldown_until_{pause_until}"
             for signal in candidates:
                 signal.risk_mode = "cooldown"
-                self.journal.log_signal(signal, "skipped_loss_cooldown", reason)
+                self.log_signal_status(signal, "skipped_loss_cooldown", reason)
             LOGGER.info("Loss cooldown active: %s", "; ".join(cooldown_status.notes or []))
             return
         btc_context = self.get_btc_context()
         eligible: list[TradeSignal] = []
         for signal in candidates:
             if signal.watchlist_tier == "C" and signal.score < 80:
-                self.journal.log_signal(signal, "logged_quality_filter", "tier_c_score_below_80")
+                self.log_signal_status(signal, "logged_quality_filter", "tier_c_score_below_80")
                 LOGGER.info("%s logged only: Tier C score %s below 80", signal.symbol, signal.score)
                 continue
             if signal.watchlist_tier == "C" and not signal.volume_spike and not signal.mfi_confirmed:
-                self.journal.log_signal(signal, "logged_quality_filter", "tier_c_needs_volume_or_mfi")
+                self.log_signal_status(signal, "logged_quality_filter", "tier_c_needs_volume_or_mfi")
                 LOGGER.info("%s logged only: Tier C requires volume spike or MFI confirmation", signal.symbol)
                 continue
             if signal.score < self.config.score_threshold:
-                self.journal.log_signal(signal, "logged_quality_filter", "score_below_threshold")
+                self.log_signal_status(signal, "logged_quality_filter", "score_below_threshold")
                 LOGGER.info("%s logged only: score %s below threshold %s", signal.symbol, signal.score, self.config.score_threshold)
                 continue
             if signal.confidence < self.config.min_confidence:
-                self.journal.log_signal(signal, "logged_quality_filter", "confidence_below_minimum")
+                self.log_signal_status(signal, "logged_quality_filter", "confidence_below_minimum")
                 LOGGER.info("%s logged only: confidence %s below minimum %s", signal.symbol, signal.confidence, self.config.min_confidence)
                 continue
             if signal.rr < self.config.min_rr:
-                self.journal.log_signal(signal, "logged_quality_filter", "rr_below_minimum")
+                self.log_signal_status(signal, "logged_quality_filter", "rr_below_minimum")
                 LOGGER.info("%s logged only: RR %.2f below minimum %.2f", signal.symbol, signal.rr, self.config.min_rr)
                 continue
             if self.journal.is_recent_loss(signal, self.config.loss_cooldown_minutes):
-                self.journal.log_signal(signal, "skipped_loss_cooldown", "recent_sl_same_symbol_direction")
+                self.log_signal_status(signal, "skipped_loss_cooldown", "recent_sl_same_symbol_direction")
                 LOGGER.info("%s skipped: loss cooldown active for %s", signal.symbol, signal.direction)
                 continue
             if self.config.use_losing_streak_protection and self.journal.symbol_loss_streak_active(
@@ -1986,7 +2029,7 @@ class AgentRunner:
                 self.config.max_symbol_loss_streak,
                 self.config.symbol_pause_after_loss_minutes,
             ):
-                self.journal.log_signal(signal, "skipped_losing_streak", "symbol_loss_streak_pause")
+                self.log_signal_status(signal, "skipped_losing_streak", "symbol_loss_streak_pause")
                 LOGGER.info("%s skipped: symbol losing streak pause", signal.symbol)
                 continue
             if self.apply_btc_regime_filter(signal, btc_context):
@@ -1996,12 +2039,12 @@ class AgentRunner:
         selected = self.select_top_candidates(eligible)
         for signal in selected:
             if self.is_in_cooldown(signal):
-                self.journal.log_signal(signal, "skipped_not_top_candidate", "send_cooldown_active")
+                self.log_signal_status(signal, "skipped_not_top_candidate", "send_cooldown_active")
                 LOGGER.info("%s skipped: cooldown active", signal.symbol)
                 continue
             position_advice = evaluate_new_signal(signal, self.journal.path)
             if not position_advice.should_send_signal:
-                self.journal.log_signal(signal, "skipped_position_management", position_advice.reason)
+                self.log_signal_status(signal, "skipped_position_management", position_advice.reason)
                 if position_advice.message:
                     self.notifier.send_position_message(position_advice.message)
                 LOGGER.info("%s skipped: position manager %s", signal.symbol, position_advice.action)
@@ -2013,21 +2056,21 @@ class AgentRunner:
             except Exception as exc:
                 LOGGER.warning("Chart export failed for %s: %s", signal.symbol, exc)
             if signal.market_session in self.config.session_report_only_sessions:
-                self.journal.log_signal(signal, "session_risk_report_only", "session_risk_experimental_report_only")
+                self.log_signal_status(signal, "session_risk_report_only", "session_risk_experimental_report_only")
                 self.evaluate_entry_timing_shadow(signal, "session_risk_report_only")
                 if self.notifier.send_session_risk_report_signal(signal) and not self.config.dry_run:
                     self.mark_sent(signal)
                 LOGGER.info("%s routed to reports only: session risk mode %s", signal.symbol, signal.market_session)
                 continue
             if signal.symbol in self.config.weak_symbol_report_only_symbols:
-                self.journal.log_signal(signal, "weak_symbol_report_only", "weak_symbol_experimental_report_only")
+                self.log_signal_status(signal, "weak_symbol_report_only", "weak_symbol_experimental_report_only")
                 self.evaluate_entry_timing_shadow(signal, "weak_symbol_report_only")
                 if self.notifier.send_weak_symbol_report_signal(signal) and not self.config.dry_run:
                     self.mark_sent(signal)
                 LOGGER.info("%s routed to reports only: weak symbol experimental mode", signal.symbol)
                 continue
             if signal.watchlist_tier == "C" and self.config.enable_tier_c_report_only:
-                self.journal.log_signal(signal, "tier_c_report_only", "tier_c_experimental_report_only")
+                self.log_signal_status(signal, "tier_c_report_only", "tier_c_experimental_report_only")
                 self.evaluate_entry_timing_shadow(signal, "tier_c_report_only")
                 if self.notifier.send_tier_c_report_signal(signal) and not self.config.dry_run:
                     self.mark_sent(signal)
@@ -2038,13 +2081,13 @@ class AgentRunner:
                 and signal.market_session == "London"
                 and signal.direction == "LONG"
             ):
-                self.journal.log_signal(signal, "london_long_report_only", "london_long_experimental_report_only")
+                self.log_signal_status(signal, "london_long_report_only", "london_long_experimental_report_only")
                 self.evaluate_entry_timing_shadow(signal, "london_long_report_only")
                 if self.notifier.send_london_long_report_signal(signal) and not self.config.dry_run:
                     self.mark_sent(signal)
                 LOGGER.info("%s routed to reports only: London LONG experimental mode", signal.symbol)
                 continue
-            self.journal.log_signal(signal, "sent", "")
+            self.log_signal_status(signal, "sent", "")
             self.evaluate_entry_timing_shadow(signal, "sent")
             if self.notifier.send_signal(signal) and not self.config.dry_run:
                 self.mark_sent(signal)
@@ -2090,7 +2133,7 @@ class AgentRunner:
             signal.risk_mode = "reduced"
             signal.reason += f"; BTC {btc_context.regime} opposite-direction penalty -{penalty}"
             if signal.confidence < self.config.min_confidence or signal.score < self.config.score_threshold:
-                self.journal.log_signal(signal, "skipped_btc_regime", f"btc_{btc_context.regime}_opposite_direction")
+                self.log_signal_status(signal, "skipped_btc_regime", f"btc_{btc_context.regime}_opposite_direction")
                 LOGGER.info("%s skipped: BTC %s opposite-direction filter", signal.symbol, btc_context.regime)
                 return True
 
@@ -2098,7 +2141,7 @@ class AgentRunner:
             signal.confidence = max(1, signal.confidence - self.config.btc_sideway_penalty)
             signal.reason += f"; BTC sideways penalty -{self.config.btc_sideway_penalty}"
             if signal.confidence < self.config.min_confidence:
-                self.journal.log_signal(signal, "skipped_btc_regime", "btc_sideways_confidence_below_minimum")
+                self.log_signal_status(signal, "skipped_btc_regime", "btc_sideways_confidence_below_minimum")
                 LOGGER.info("%s skipped: BTC sideways regime filter", signal.symbol)
                 return True
 
@@ -2108,7 +2151,7 @@ class AgentRunner:
             signal.reason += f"; BTC high-volatility risk reduction -{self.config.btc_sideway_penalty}"
             weak_signal = signal.confidence < self.config.min_confidence or signal.score < self.config.score_threshold
             if weak_signal:
-                self.journal.log_signal(signal, "skipped_btc_regime", "btc_high_volatility_weak_signal")
+                self.log_signal_status(signal, "skipped_btc_regime", "btc_high_volatility_weak_signal")
                 LOGGER.info("%s skipped: BTC high-volatility weak signal", signal.symbol)
                 return True
         return False
@@ -2133,15 +2176,15 @@ class AgentRunner:
             direction_count = direction_counts.get(signal.direction, 0)
             major_count = major_direction_counts.get(signal.direction, 0)
             if direction_count >= self.config.max_signals_per_direction_per_candle:
-                self.journal.log_signal(signal, "skipped_correlation", "max_signals_per_direction_per_candle")
+                self.log_signal_status(signal, "skipped_correlation", "max_signals_per_direction_per_candle")
                 LOGGER.info("%s skipped: direction cap/correlation filter", signal.symbol)
                 continue
             if signal.symbol in major_symbols and major_count >= self.config.max_major_correlated_signals:
-                self.journal.log_signal(signal, "skipped_correlation", "max_major_correlated_signals")
+                self.log_signal_status(signal, "skipped_correlation", "max_major_correlated_signals")
                 LOGGER.info("%s skipped: major correlation filter", signal.symbol)
                 continue
             if len(selected) >= self.config.max_signals_per_scan:
-                self.journal.log_signal(signal, "skipped_not_top_candidate", "not_in_top_candidates")
+                self.log_signal_status(signal, "skipped_not_top_candidate", "not_in_top_candidates")
                 LOGGER.info("%s skipped: not a top candidate", signal.symbol)
                 continue
             selected.append(signal)

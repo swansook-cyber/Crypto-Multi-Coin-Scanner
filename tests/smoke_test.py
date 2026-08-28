@@ -89,6 +89,14 @@ from core.rejected_outcome_shadow import (
     normalize_rejection_category,
     run_backfill,
 )
+from core.setup_strength_prospective_shadow import (
+    FIELDNAMES as SETUP_STRENGTH_SHADOW_FIELDS,
+    SetupStrengthProspectiveShadowLogger,
+    build_shadow_record as build_setup_strength_shadow_record,
+    build_prospective_report,
+    classify_signal_setup_strength,
+    classify_setup_strength,
+)
 from core.sr_trade_weight_gate import SRGateConfig, SRTradeWeightShadowLogger, evaluate_sr_trade_weight
 from core.signal_identity import canonical_signal_key, normalize_float, normalize_side, normalize_symbol, normalize_timestamp
 from core import wave_structure_analyzer as wave
@@ -6554,6 +6562,184 @@ def test_cluster_representative_fail_safe_malformed_missing_fields() -> None:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_setup_strength_prospective_classification_and_dedupe() -> None:
+    assert classify_setup_strength(79) == "LOW_SETUP_SHADOW"
+    assert classify_setup_strength("79.0") == "LOW_SETUP_SHADOW"
+    assert classify_setup_strength(80) == "NORMAL_SETUP_SHADOW"
+    assert classify_setup_strength("") == "UNKNOWN"
+
+    class SignalLike:
+        def __init__(self, setup_strength: object = "", confidence: object = "") -> None:
+            self.timestamp = datetime(2026, 8, 28, tzinfo=timezone.utc)
+            self.symbol = "BTCUSDT"
+            self.direction = "LONG"
+            self.entry = 100
+            self.sl = 99
+            self.tp1 = 101
+            self.tp2 = 102
+            self.score = 90
+            self.confidence = confidence
+            self.setup_strength = setup_strength
+            self.watchlist_tier = "A"
+            self.market_session = "Asia"
+
+    cases = [
+        (SignalLike(79, 95), "LOW_SETUP_SHADOW", "79"),
+        (SignalLike(80, 70), "NORMAL_SETUP_SHADOW", "80"),
+        (SignalLike("", 95), "UNKNOWN", ""),
+        (SignalLike("not-a-number", 95), "UNKNOWN", "not-a-number"),
+    ]
+    missing = SignalLike(confidence=70)
+    delattr(missing, "setup_strength")
+    cases.append((missing, "UNKNOWN", ""))
+
+    for signal_like, expected_class, expected_value in cases:
+        assert classify_signal_setup_strength(signal_like) == expected_class
+        record = build_setup_strength_shadow_record(
+            signal_like,
+            signal_status="sent",
+            prospective_start_timestamp_utc="2026-08-28T00:00:00Z",
+        )
+        assert record["setup_shadow_class"] == expected_class
+        assert str(record["setup_strength"]) == expected_value
+        assert record["setup_strength"] != str(getattr(signal_like, "confidence", ""))
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="setup_strength_shadow_"))
+    try:
+        path = temp_dir / "setup_strength_prospective_shadow.csv"
+        logger = SetupStrengthProspectiveShadowLogger(path, "2026-08-28T00:00:00Z")
+        signal = sample_signal()
+        signal.setup_strength = signal.confidence
+        before = signal.__dict__.copy()
+        assert logger.log_signal(signal, signal_status="sent") is True
+        assert logger.log_signal(signal, signal_status="sent") is False
+        assert signal.__dict__ == before
+        logged = pd.read_csv(path)
+        assert len(logged) == 1
+        assert list(logged.columns) == SETUP_STRENGTH_SHADOW_FIELDS
+        assert logged.loc[0, "setup_shadow_class"] == "NORMAL_SETUP_SHADOW"
+        assert logged.loc[0, "signal_status"] == "sent"
+        assert logged.loc[0, "shadow_version"] == "SETUP_STRENGTH_PROSPECTIVE_V1"
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_setup_strength_prospective_report_linkage_and_progress() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="setup_strength_report_"))
+    try:
+        shadow_path = temp_dir / "setup_strength_prospective_shadow.csv"
+        signals_path = temp_dir / "signals.csv"
+        rows = []
+        for idx, (strength, side, session, status, generated) in enumerate(
+            [
+                (79, "LONG", "Asia", "sent", "2026-08-28T01:00:00Z"),
+                (80, "SHORT", "London", "sent", "2026-08-28T01:05:00Z"),
+                (78, "SHORT", "Asia", "logged_quality_filter", "2026-08-28T01:10:00Z"),
+                (77, "LONG", "NewYork", "sent", "2026-08-27T23:00:00Z"),
+            ]
+        ):
+            timestamp = generated
+            symbol = f"TEST{idx}USDT"
+            key = canonical_signal_key(symbol=symbol, side=side, timestamp=timestamp, entry=100 + idx)
+            rows.append(
+                {
+                    "canonical_signal_key": key,
+                    "timestamp_utc": timestamp,
+                    "symbol": symbol,
+                    "side": side,
+                    "setup_strength": strength,
+                    "setup_shadow_class": classify_setup_strength(strength),
+                    "score": 90,
+                    "confidence": strength,
+                    "quality_tier": "B",
+                    "market_session": session,
+                    "signal_status": status,
+                    "rejection_reason": "",
+                    "entry": 100 + idx,
+                    "sl": 99 + idx,
+                    "tp1": 101 + idx,
+                    "tp2": 102 + idx,
+                    "shadow_version": "SETUP_STRENGTH_PROSPECTIVE_V1",
+                    "prospective_start_timestamp_utc": "2026-08-28T00:00:00Z",
+                    "generated_at_utc": generated,
+                    "sr_class": "",
+                    "market_exhaustion_class": "",
+                    "entry_timing_class": "",
+                    "btc_regime": "",
+                    "loss_cooldown_active": "",
+                    "daily_risk_state": "",
+                }
+            )
+        pd.DataFrame(rows, columns=SETUP_STRENGTH_SHADOW_FIELDS).to_csv(shadow_path, index=False)
+        pd.DataFrame(
+            [
+                {"timestamp": "2026-08-28T01:00:00Z", "symbol": "TEST0USDT", "side": "LONG", "entry": 100, "signal_status": "sent", "result": "WIN", "hit_target": "TP1", "net_r_estimate": 1},
+                {"timestamp": "2026-08-28T01:05:00Z", "symbol": "TEST1USDT", "side": "SHORT", "entry": 101, "signal_status": "sent", "result": "LOSS", "hit_target": "SL", "net_r_estimate": -1},
+                {"timestamp": "2026-08-28T01:10:00Z", "symbol": "TEST2USDT", "side": "SHORT", "entry": 102, "signal_status": "logged_quality_filter", "result": "SKIPPED"},
+                {"timestamp": "2026-08-27T23:00:00Z", "symbol": "TEST3USDT", "side": "LONG", "entry": 103, "signal_status": "sent", "result": "WIN", "hit_target": "TP1", "net_r_estimate": 1},
+            ]
+        ).to_csv(signals_path, index=False)
+
+        report = build_prospective_report(shadow_path, signals_path)
+        assert report.low_closed == 1
+        assert "Progress: 1 / 100" in report.text
+        assert "PROSPECTIVE LOW SETUP" in report.text
+        assert "- observed N: 2" in report.text
+        assert "- sent N: 1" in report.text
+        assert "- closed N: 1" in report.text
+        assert "- WR: 100.0%" in report.text
+        assert "- Asia: closed 1 WR 100.0% NetR 1.00" in report.text
+        assert "TEST3USDT" not in report.text
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_setup_strength_shadow_fail_open_and_live_flag_noop() -> None:
+    class BrokenLogger:
+        def log_signal(self, *args: object, **kwargs: object) -> bool:
+            raise OSError("disk unavailable")
+
+    runner = scanner.AgentRunner.__new__(scanner.AgentRunner)
+    runner.setup_strength_shadow_logger = BrokenLogger()
+    runner.evaluate_setup_strength_shadow(sample_signal(), "sent", "")
+
+    old_live = os.environ.get("SETUP_STRENGTH_LIVE_ENABLED")
+    try:
+        os.environ["SETUP_STRENGTH_LIVE_ENABLED"] = "1"
+        cfg = scanner.ScannerConfig.from_env()
+        assert cfg.setup_strength_live_enabled is True
+        assert cfg.min_confidence == scanner.ScannerConfig.from_env().min_confidence
+    finally:
+        if old_live is None:
+            os.environ.pop("SETUP_STRENGTH_LIVE_ENABLED", None)
+        else:
+            os.environ["SETUP_STRENGTH_LIVE_ENABLED"] = old_live
+
+
+def test_setup_strength_shadow_logging_uses_setup_strength_not_confidence() -> None:
+    class CapturingLogger:
+        def log_signal(self, *args: object, **kwargs: object) -> bool:
+            return True
+
+    signal = sample_signal()
+    signal.setup_strength = 79
+    signal.confidence = 95
+    runner = scanner.AgentRunner.__new__(scanner.AgentRunner)
+    runner.setup_strength_shadow_logger = CapturingLogger()
+
+    captured: list[tuple[str, tuple[object, ...]]] = []
+    original_info = scanner.LOGGER.info
+    try:
+        scanner.LOGGER.info = lambda message, *args, **kwargs: captured.append((str(message), args))  # type: ignore[method-assign]
+        runner.evaluate_setup_strength_shadow(signal, "sent", "")
+    finally:
+        scanner.LOGGER.info = original_info  # type: ignore[method-assign]
+
+    assert captured
+    assert any("LOW_SETUP_SHADOW" in [str(arg) for arg in args] for _, args in captured)
+    assert not any("NORMAL_SETUP_SHADOW" in [str(arg) for arg in args] for _, args in captured)
+
+
 def main() -> int:
     test_telegram_message()
     test_cornix_dry_run_format_and_signal_immutability()
@@ -6679,6 +6865,10 @@ def main() -> int:
     test_cluster_representative_strategies_ties_and_outcome_independence()
     test_cluster_representative_production_zero_one_multiple_and_dedupe()
     test_cluster_representative_fail_safe_malformed_missing_fields()
+    test_setup_strength_prospective_classification_and_dedupe()
+    test_setup_strength_prospective_report_linkage_and_progress()
+    test_setup_strength_shadow_fail_open_and_live_flag_noop()
+    test_setup_strength_shadow_logging_uses_setup_strength_not_confidence()
     print("smoke tests passed")
     return 0
 
