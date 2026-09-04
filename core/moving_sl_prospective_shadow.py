@@ -20,12 +20,14 @@ from typing import Any
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from core.signal_identity import canonical_signal_key, normalize_side, normalize_symbol, normalize_timestamp
 
 
+BASE_DIR = Path(__file__).resolve().parents[1]
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 TIMEFRAME = "15m"
 SHADOW_VERSION = "moving-sl-shadow-v1"
@@ -131,6 +133,38 @@ class MovingSLLifecycle:
     data_quality_notes: str
 
 
+@dataclass(frozen=True)
+class MovingSLCollectionSummary:
+    shadow_enabled: bool
+    live_enabled: bool
+    prospective_start_utc: str
+    sent_rows_total: int
+    prospective_sent_rows: int
+    valid_prospective_candidates: int
+    candidates_needing_candle_evaluation: int
+    terminal_rows_skipped: int
+    binance_request_count: int | str
+    output_rows: int
+    elapsed_seconds: float
+    dry_run: bool
+
+
+class CountingSession:
+    """Tiny requests.Session wrapper used for CLI diagnostics."""
+
+    def __init__(self, session: requests.Session) -> None:
+        self.session = session
+        self.request_count = 0
+
+    def get(self, *args: Any, **kwargs: Any) -> requests.Response:
+        self.request_count += 1
+        return self.session.get(*args, **kwargs)
+
+
+def load_project_env(base_dir: Path = BASE_DIR) -> None:
+    load_dotenv(base_dir / ".env")
+
+
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -182,6 +216,17 @@ def _format_minutes(value: float | None) -> str:
     if value is None or not math.isfinite(float(value)):
         return ""
     return f"{float(value):.1f}"
+
+
+def timestamp_on_or_after_prospective_start(timestamp: Any, prospective_start_utc: str = "") -> bool:
+    start_text = normalize_timestamp(prospective_start_utc)
+    if not start_text:
+        return True
+    signal_ts = pd.to_datetime(timestamp, utc=True, errors="coerce")
+    start_ts = pd.to_datetime(start_text, utc=True, errors="coerce")
+    if pd.isna(signal_ts) or pd.isna(start_ts):
+        return False
+    return bool(signal_ts >= start_ts)
 
 
 def _risk(candidate: MovingSLCandidate) -> float:
@@ -314,13 +359,74 @@ def evaluate_lifecycle(candidate: MovingSLCandidate, candles: pd.DataFrame) -> M
     )
 
 
+def evaluate_continuation_after_tp1(
+    candidate: MovingSLCandidate,
+    candles: pd.DataFrame,
+    tp1_reached_at: str,
+) -> MovingSLLifecycle:
+    tp1_at = normalize_timestamp(tp1_reached_at)
+    if not tp1_at:
+        return evaluate_lifecycle(candidate, candles)
+    if candles is None or candles.empty:
+        return MovingSLLifecycle(
+            True, tp1_at, "MOVE_SL_TO_BE", tp1_at, candidate.entry,
+            False, "", False, "", "TP1_REACHED_UNRESOLVED",
+            None, None, None, None, None, None, False, "missing_continuation_candle_data",
+        )
+    required = {"high", "low", "close_time"}
+    if not required.issubset(candles.columns):
+        return MovingSLLifecycle(
+            True, tp1_at, "MOVE_SL_TO_BE", tp1_at, candidate.entry,
+            False, "", False, "", "DATA_INSUFFICIENT",
+            None, None, None, None, None, None, False, "missing_required_candle_columns",
+        )
+
+    ordered = candles.copy()
+    if "open_time" in ordered.columns:
+        ordered = ordered.sort_values("open_time")
+    ordered = ordered.reset_index(drop=True)
+    mfe_price, mfe_r, mae_price, mae_r = _after_tp1_extremes(candidate, ordered)
+    for _, candle in ordered.iterrows():
+        close_time = pd.to_datetime(candle.get("close_time"), utc=True, errors="coerce")
+        close_text = "" if pd.isna(close_time) else close_time.isoformat()
+        be_hit, tp2_hit = _be_or_tp2(candidate, candle)
+        if be_hit and tp2_hit:
+            return MovingSLLifecycle(
+                True, tp1_at, "MOVE_SL_TO_BE", tp1_at, candidate.entry,
+                True, close_text, True, close_text, "AMBIGUOUS",
+                mfe_price, mfe_r, mae_price, mae_r,
+                _minutes_between(tp1_at, close_text),
+                _minutes_between(tp1_at, close_text),
+                True,
+                "be_and_tp2_same_candle_after_tp1",
+            )
+        if be_hit:
+            return MovingSLLifecycle(
+                True, tp1_at, "MOVE_SL_TO_BE", tp1_at, candidate.entry,
+                True, close_text, False, "", "BE_BEFORE_TP2",
+                mfe_price, mfe_r, mae_price, mae_r,
+                _minutes_between(tp1_at, close_text), None, False, "",
+            )
+        if tp2_hit:
+            return MovingSLLifecycle(
+                True, tp1_at, "MOVE_SL_TO_BE", tp1_at, candidate.entry,
+                False, "", True, close_text, "TP2_BEFORE_BE",
+                mfe_price, mfe_r, mae_price, mae_r,
+                None, _minutes_between(tp1_at, close_text), False, "",
+            )
+    return MovingSLLifecycle(
+        True, tp1_at, "MOVE_SL_TO_BE", tp1_at, candidate.entry,
+        False, "", False, "", "TP1_REACHED_UNRESOLVED",
+        mfe_price, mfe_r, mae_price, mae_r, None, None, False, "",
+    )
+
+
 def candidate_from_row(row: pd.Series, prospective_start_utc: str = "") -> MovingSLCandidate | None:
     status = _text(row.get("signal_status", "sent")).lower() or "sent"
     if status != "sent":
         return None
     timestamp = normalize_timestamp(row.get("timestamp"))
-    start = normalize_timestamp(prospective_start_utc)
-    if start and timestamp and timestamp < start:
+    if not timestamp_on_or_after_prospective_start(timestamp, prospective_start_utc):
         return None
     symbol = normalize_symbol(row.get("symbol"))
     side = normalize_side(row.get("side", row.get("direction", "")))
@@ -363,12 +469,42 @@ def candidate_from_row(row: pd.Series, prospective_start_utc: str = "") -> Movin
 
 
 def load_candidates(signals_path: Path, prospective_start_utc: str = "") -> list[MovingSLCandidate]:
+    return unique_candidates_from_frame(read_signals_csv(signals_path), prospective_start_utc)
+
+
+def read_signals_csv(signals_path: Path) -> pd.DataFrame:
     try:
-        data = pd.read_csv(signals_path, low_memory=False)
+        return pd.read_csv(signals_path, low_memory=False)
     except (FileNotFoundError, pd.errors.EmptyDataError):
-        return []
+        return pd.DataFrame()
+
+
+def sent_rows_total(data: pd.DataFrame) -> int:
+    if data.empty:
+        return 0
+    status = data.get("signal_status", pd.Series(["sent"] * len(data), index=data.index))
+    return int(status.fillna("").astype(str).str.strip().str.lower().replace("", "sent").eq("sent").sum())
+
+
+def prospective_sent_rows_total(data: pd.DataFrame, prospective_start_utc: str = "") -> int:
+    if data.empty:
+        return 0
+    count = 0
+    for _, row in data.iterrows():
+        status = _text(row.get("signal_status", "sent")).lower() or "sent"
+        if status != "sent":
+            continue
+        timestamp = normalize_timestamp(row.get("timestamp"))
+        if timestamp_on_or_after_prospective_start(timestamp, prospective_start_utc):
+            count += 1
+    return count
+
+
+def unique_candidates_from_frame(data: pd.DataFrame, prospective_start_utc: str = "") -> list[MovingSLCandidate]:
     candidates: list[MovingSLCandidate] = []
     seen: set[str] = set()
+    if data.empty:
+        return candidates
     for _, row in data.iterrows():
         candidate = candidate_from_row(row, prospective_start_utc)
         if candidate is None or candidate.canonical_signal_key in seen:
@@ -467,8 +603,10 @@ def candles_for_candidate(
     candidate: MovingSLCandidate,
     session: requests.Session,
     lookahead_hours: int = 0,
+    start_timestamp_utc: str = "",
 ) -> pd.DataFrame:
-    start = pd.to_datetime(candidate.timestamp_utc, utc=True, errors="coerce")
+    start_source = normalize_timestamp(start_timestamp_utc) or candidate.timestamp_utc
+    start = pd.to_datetime(start_source, utc=True, errors="coerce")
     if pd.isna(start):
         return pd.DataFrame()
     now = pd.Timestamp.now(tz="UTC")
@@ -580,6 +718,17 @@ class MovingSLProspectiveShadowStore:
             if str(row.get("canonical_signal_key", "")).strip()
         }
 
+    def existing_record_by_key(self) -> dict[str, dict[str, Any]]:
+        data = self.read()
+        if data.empty:
+            return {}
+        records: dict[str, dict[str, Any]] = {}
+        for _, row in data.iterrows():
+            key = str(row.get("canonical_signal_key", "")).strip()
+            if key:
+                records[key] = row.to_dict()
+        return records
+
 
 def candidates_for_collection(
     candidates: list[MovingSLCandidate],
@@ -603,14 +752,32 @@ def observe_candidates(
     lookahead_hours: int = 0,
     candle_provider: Any | None = None,
     prospective_start_utc: str = "",
+    existing_record_by_key: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     http = session or build_session()
     generated_at = utc_now_text()
+    existing_records = existing_record_by_key or {}
     for candidate in candidates:
         try:
-            candles = candle_provider(candidate) if candle_provider else candles_for_candidate(candidate, http, lookahead_hours)
-            lifecycle = evaluate_lifecycle(candidate, candles)
+            existing = existing_records.get(candidate.canonical_signal_key, {})
+            existing_lifecycle = str(existing.get("lifecycle_class", "")).strip().upper()
+            tp1_reached_at = normalize_timestamp(existing.get("tp1_reached_at", ""))
+            continuation_only = existing_lifecycle == "TP1_REACHED_UNRESOLVED" and bool(tp1_reached_at)
+            if candle_provider:
+                candles = candle_provider(candidate)
+            else:
+                candles = candles_for_candidate(
+                    candidate,
+                    http,
+                    lookahead_hours,
+                    start_timestamp_utc=tp1_reached_at if continuation_only else "",
+                )
+            lifecycle = (
+                evaluate_continuation_after_tp1(candidate, candles, tp1_reached_at)
+                if continuation_only
+                else evaluate_lifecycle(candidate, candles)
+            )
             records.append(build_record(candidate, lifecycle, prospective_start_utc, generated_at))
             if candle_provider is None:
                 time.sleep(0.05)
@@ -741,18 +908,97 @@ def run_shadow(
     limit: int = 0,
     candle_provider: Any | None = None,
 ) -> pd.DataFrame:
-    store = MovingSLProspectiveShadowStore(output_path)
-    candidates = load_candidates(signals_path, prospective_start_utc)
-    candidates = candidates_for_collection(candidates, store.existing_state_by_key())
-    if limit > 0:
-        candidates = candidates[:limit]
-    records = observe_candidates(
-        candidates,
-        lookahead_hours=lookahead_hours,
-        candle_provider=candle_provider,
+    data, _summary = collect_shadow(
+        signals_path,
+        output_path,
         prospective_start_utc=prospective_start_utc,
+        lookahead_hours=lookahead_hours,
+        dry_run=dry_run,
+        limit=limit,
+        candle_provider=candle_provider,
     )
-    return store.upsert(records, dry_run=dry_run)
+    return data
+
+
+def collect_shadow(
+    signals_path: Path,
+    output_path: Path,
+    *,
+    prospective_start_utc: str = "",
+    lookahead_hours: int = 0,
+    dry_run: bool = False,
+    limit: int = 0,
+    candle_provider: Any | None = None,
+    session: requests.Session | None = None,
+) -> tuple[pd.DataFrame, MovingSLCollectionSummary]:
+    started = time.perf_counter()
+    normalized_start = normalize_timestamp(prospective_start_utc)
+    signals = read_signals_csv(signals_path)
+    store = MovingSLProspectiveShadowStore(output_path)
+    candidates = unique_candidates_from_frame(signals, normalized_start)
+    existing_state = store.existing_state_by_key()
+    candidates_to_evaluate = candidates_for_collection(candidates, existing_state)
+    terminal_skipped = len(candidates) - len(candidates_to_evaluate)
+    if limit > 0:
+        candidates_to_evaluate = candidates_to_evaluate[:limit]
+
+    counting_session: CountingSession | requests.Session | None = session
+    if candidates_to_evaluate and candle_provider is None and session is None:
+        counting_session = CountingSession(build_session())
+
+    records: list[dict[str, Any]] = []
+    if candidates_to_evaluate:
+        records = observe_candidates(
+            candidates_to_evaluate,
+            session=counting_session,
+            lookahead_hours=lookahead_hours,
+            candle_provider=candle_provider,
+            prospective_start_utc=normalized_start,
+            existing_record_by_key=store.existing_record_by_key(),
+        )
+    data = store.upsert(records, dry_run=dry_run)
+    request_count: int | str = 0
+    if candidates_to_evaluate and candle_provider is not None:
+        request_count = "custom_provider"
+    elif counting_session is not None and hasattr(counting_session, "request_count"):
+        request_count = int(getattr(counting_session, "request_count", 0))
+    summary = MovingSLCollectionSummary(
+        shadow_enabled=env_bool("MOVING_SL_SHADOW_ENABLED", True),
+        live_enabled=env_bool("MOVING_SL_LIVE_ENABLED", False),
+        prospective_start_utc=normalized_start,
+        sent_rows_total=sent_rows_total(signals),
+        prospective_sent_rows=prospective_sent_rows_total(signals, normalized_start),
+        valid_prospective_candidates=len(candidates),
+        candidates_needing_candle_evaluation=len(candidates_to_evaluate),
+        terminal_rows_skipped=terminal_skipped,
+        binance_request_count=request_count,
+        output_rows=len(data),
+        elapsed_seconds=time.perf_counter() - started,
+        dry_run=dry_run,
+    )
+    return data, summary
+
+
+def format_collection_summary(summary: MovingSLCollectionSummary) -> str:
+    live_mode = "true (NO-OP)" if summary.live_enabled else "false"
+    return "\n".join(
+        [
+            "Moving-SL Prospective Shadow Run",
+            "================================",
+            f"shadow enabled: {str(summary.shadow_enabled).lower()}",
+            f"live enabled: {live_mode}",
+            f"prospective start UTC: {summary.prospective_start_utc or 'N/A'}",
+            f"sent rows total: {summary.sent_rows_total}",
+            f"prospective sent rows: {summary.prospective_sent_rows}",
+            f"valid prospective candidates: {summary.valid_prospective_candidates}",
+            f"candidates needing candle evaluation: {summary.candidates_needing_candle_evaluation}",
+            f"terminal rows skipped: {summary.terminal_rows_skipped}",
+            f"Binance request count: {summary.binance_request_count}",
+            f"output rows: {summary.output_rows}",
+            f"dry run: {str(summary.dry_run).lower()}",
+            f"elapsed seconds: {summary.elapsed_seconds:.3f}",
+        ]
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -769,6 +1015,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    load_project_env()
     args = parse_args()
     if not env_bool("MOVING_SL_SHADOW_ENABLED", True):
         print("Prospective Moving-SL Shadow V1 disabled by MOVING_SL_SHADOW_ENABLED")
@@ -779,7 +1026,7 @@ def main() -> int:
         print(build_report(MovingSLProspectiveShadowStore(args.output).read()))
         return 0
     if args.run:
-        data = run_shadow(
+        _data, summary = collect_shadow(
             args.signals,
             args.output,
             prospective_start_utc=args.prospective_start_utc,
@@ -787,7 +1034,7 @@ def main() -> int:
             dry_run=args.dry_run,
             limit=args.limit,
         )
-        print(f"Moving-SL prospective shadow rows: {len(data)}")
+        print(format_collection_summary(summary))
         return 0
     print("No action selected. Use --run to collect/update or --report to print the existing report.")
     return 0

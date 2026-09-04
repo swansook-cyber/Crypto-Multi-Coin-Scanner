@@ -14,6 +14,7 @@ import tempfile
 import sys
 import os
 import shutil
+import subprocess
 import time
 
 import pandas as pd
@@ -58,10 +59,13 @@ from core.moving_sl_prospective_shadow import (
     build_record as build_moving_sl_record,
     candidates_for_collection as moving_sl_candidates_for_collection,
     candidate_from_row as moving_sl_candidate_from_row,
+    collect_shadow as collect_moving_sl_shadow,
     evaluate_lifecycle as evaluate_moving_sl_lifecycle,
     fetch_futures_klines_range as fetch_moving_sl_klines_range,
     load_candidates as load_moving_sl_candidates,
+    load_project_env as load_moving_sl_project_env,
     run_shadow as run_moving_sl_shadow,
+    timestamp_on_or_after_prospective_start as moving_sl_on_or_after_start,
 )
 import core.moving_sl_prospective_shadow as moving_sl_shadow
 from core.performance_analytics_v1 import build_complete_report, export_v1_outputs
@@ -6225,6 +6229,231 @@ def test_moving_sl_collection_selection_and_paginated_closed_candles() -> None:
     assert terminal["lifecycle_class"] == "TP2_BEFORE_BE"
 
 
+def test_moving_sl_zero_prospective_rows_make_zero_candle_calls() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="moving_sl_zero_boundary_"))
+    try:
+        signals_path = temp_dir / "signals.csv"
+        output_path = temp_dir / "moving_sl_prospective_shadow.csv"
+        rows = []
+        for idx in range(146):
+            rows.append(
+                {
+                    "timestamp": f"2026-09-03T{idx % 24:02d}:00:00Z",
+                    "symbol": f"T{idx}USDT",
+                    "side": "LONG",
+                    "entry": 100 + idx,
+                    "stop_loss": 98 + idx,
+                    "tp1": 102 + idx,
+                    "tp2": 104 + idx,
+                    "signal_status": "sent",
+                }
+            )
+        pd.DataFrame(rows).to_csv(signals_path, index=False)
+        before = signals_path.read_bytes()
+        calls = 0
+
+        def provider(_candidate: MovingSLCandidate) -> pd.DataFrame:
+            nonlocal calls
+            calls += 1
+            return pd.DataFrame()
+
+        data, summary = collect_moving_sl_shadow(
+            signals_path,
+            output_path,
+            prospective_start_utc="2026-09-04T14:21:27Z",
+            candle_provider=provider,
+        )
+        assert calls == 0
+        assert summary.sent_rows_total == 146
+        assert summary.prospective_sent_rows == 0
+        assert summary.candidates_needing_candle_evaluation == 0
+        assert summary.binance_request_count == 0
+        assert len(data) == 0
+        assert not output_path.exists()
+        assert signals_path.read_bytes() == before
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_moving_sl_only_post_boundary_sent_rows_fetch_candles() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="moving_sl_one_boundary_"))
+    try:
+        signals_path = temp_dir / "signals.csv"
+        output_path = temp_dir / "moving_sl_prospective_shadow.csv"
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-09-04T14:21:26Z",
+                    "symbol": "OLDUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "stop_loss": 98,
+                    "tp1": 102,
+                    "tp2": 104,
+                    "signal_status": "sent",
+                },
+                {
+                    "timestamp": "2026-09-04T14:21:27+00:00",
+                    "symbol": "NEWUSDT",
+                    "side": "SHORT",
+                    "entry": 100,
+                    "stop_loss": 102,
+                    "tp1": 98,
+                    "tp2": 96,
+                    "signal_status": "sent",
+                },
+            ]
+        ).to_csv(signals_path, index=False)
+        calls: list[str] = []
+
+        def provider(candidate: MovingSLCandidate) -> pd.DataFrame:
+            calls.append(candidate.symbol)
+            return _shadow_candles([("2026-09-04T14:30:00Z", 101, 97)])
+
+        data, summary = collect_moving_sl_shadow(
+            signals_path,
+            output_path,
+            prospective_start_utc="2026-09-04T14:21:27Z",
+            candle_provider=provider,
+        )
+        assert calls == ["NEWUSDT"]
+        assert summary.sent_rows_total == 2
+        assert summary.prospective_sent_rows == 1
+        assert summary.valid_prospective_candidates == 1
+        assert summary.candidates_needing_candle_evaluation == 1
+        assert len(data) == 1
+        assert data.iloc[0]["symbol"] == "NEWUSDT"
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_moving_sl_env_start_loaded_and_timezone_boundary_compares() -> None:
+    assert moving_sl_on_or_after_start("2026-09-04T14:21:27.000000+00:00", "2026-09-04T14:21:27Z")
+    assert not moving_sl_on_or_after_start("2026-09-04T14:21:26.999999Z", "2026-09-04T14:21:27+00:00")
+    assert moving_sl_on_or_after_start("2026-09-04T21:21:27+07:00", "2026-09-04T14:21:27Z")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="moving_sl_env_"))
+    old_value = os.environ.get("MOVING_SL_PROSPECTIVE_START_UTC")
+    try:
+        os.environ.pop("MOVING_SL_PROSPECTIVE_START_UTC", None)
+        (temp_dir / ".env").write_text("MOVING_SL_PROSPECTIVE_START_UTC=2026-09-04T14:21:27Z\n", encoding="utf-8")
+        load_moving_sl_project_env(temp_dir)
+        assert os.getenv("MOVING_SL_PROSPECTIVE_START_UTC") == "2026-09-04T14:21:27Z"
+    finally:
+        if old_value is None:
+            os.environ.pop("MOVING_SL_PROSPECTIVE_START_UTC", None)
+        else:
+            os.environ["MOVING_SL_PROSPECTIVE_START_UTC"] = old_value
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_moving_sl_terminal_skips_and_unresolved_rechecks() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="moving_sl_terminal_skip_"))
+    try:
+        signals_path = temp_dir / "signals.csv"
+        output_path = temp_dir / "moving_sl_prospective_shadow.csv"
+        row = {
+            "timestamp": "2026-09-04T15:00:00Z",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "entry": 100,
+            "stop_loss": 98,
+            "tp1": 102,
+            "tp2": 104,
+            "signal_status": "sent",
+        }
+        pd.DataFrame([row]).to_csv(signals_path, index=False)
+        candidate = load_moving_sl_candidates(signals_path, "2026-09-04T14:21:27Z")[0]
+        terminal = build_moving_sl_record(
+            candidate,
+            evaluate_moving_sl_lifecycle(
+                candidate,
+                _shadow_candles(
+                    [
+                        ("2026-09-04T15:15:00Z", 102.5, 100.2),
+                        ("2026-09-04T15:30:00Z", 104.5, 101.0),
+                    ]
+                ),
+            ),
+        )
+        MovingSLProspectiveShadowStore(output_path).upsert([terminal])
+        calls = 0
+
+        def provider(_candidate: MovingSLCandidate) -> pd.DataFrame:
+            nonlocal calls
+            calls += 1
+            return pd.DataFrame()
+
+        _data, summary = collect_moving_sl_shadow(
+            signals_path,
+            output_path,
+            prospective_start_utc="2026-09-04T14:21:27Z",
+            candle_provider=provider,
+        )
+        assert calls == 0
+        assert summary.terminal_rows_skipped == 1
+        assert summary.candidates_needing_candle_evaluation == 0
+
+        unresolved_output_path = temp_dir / "moving_sl_unresolved_shadow.csv"
+        unresolved = {**terminal, "lifecycle_class": "TP1_REACHED_UNRESOLVED", "tp2_reached_after_tp1": 0, "tp2_reached_at": ""}
+        MovingSLProspectiveShadowStore(unresolved_output_path).upsert([unresolved])
+        _data, summary = collect_moving_sl_shadow(
+            signals_path,
+            unresolved_output_path,
+            prospective_start_utc="2026-09-04T14:21:27Z",
+            candle_provider=provider,
+        )
+        assert calls == 1
+        assert summary.candidates_needing_candle_evaluation == 1
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_moving_sl_report_cli_does_not_collect_or_call_api() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="moving_sl_report_cli_"))
+    try:
+        signals_path = temp_dir / "signals.csv"
+        output_path = temp_dir / "moving_sl_prospective_shadow.csv"
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-09-04T15:00:00Z",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": 100,
+                    "stop_loss": 98,
+                    "tp1": 102,
+                    "tp2": 104,
+                    "signal_status": "sent",
+                }
+            ]
+        ).to_csv(signals_path, index=False)
+        before = signals_path.read_bytes()
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "core.moving_sl_prospective_shadow",
+                "--report",
+                "--signals",
+                str(signals_path),
+                "--output",
+                str(output_path),
+            ],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert result.returncode == 0
+        assert "Prospective Moving-SL Shadow V1" in result.stdout
+        assert not output_path.exists()
+        assert signals_path.read_bytes() == before
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def _pullback_candidate(side: str = "LONG", original_result: str = "LOSS") -> PullbackRetestCandidate:
     entry = 100.0
     sl = 98.0 if side == "LONG" else 102.0
@@ -7175,6 +7404,11 @@ def main() -> int:
     test_moving_sl_candidate_dedupe_persistence_and_report_no_side_effect()
     test_moving_sl_prospective_start_and_rerun_semantics_no_signal_write()
     test_moving_sl_collection_selection_and_paginated_closed_candles()
+    test_moving_sl_zero_prospective_rows_make_zero_candle_calls()
+    test_moving_sl_only_post_boundary_sent_rows_fetch_candles()
+    test_moving_sl_env_start_loaded_and_timezone_boundary_compares()
+    test_moving_sl_terminal_skips_and_unresolved_rechecks()
+    test_moving_sl_report_cli_does_not_collect_or_call_api()
     test_pullback_retest_targets_are_deterministic_and_no_lookahead()
     test_pullback_retest_fill_invalidation_and_no_retest_rules()
     test_pullback_retest_records_no_retest_not_win_and_loser_to_winner()

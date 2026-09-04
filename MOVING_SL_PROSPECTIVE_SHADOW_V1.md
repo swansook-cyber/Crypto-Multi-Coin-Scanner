@@ -56,7 +56,8 @@ The collector:
 
 - reads production `logs/signals.csv`
 - selects `signal_status == sent` only
-- enforces `MOVING_SL_PROSPECTIVE_START_UTC`
+- loads the project `.env` before reading `MOVING_SL_PROSPECTIVE_START_UTC`
+- enforces `MOVING_SL_PROSPECTIVE_START_UTC` before any candle retrieval
 - discovers new sent signals
 - re-evaluates unresolved rows on later runs
 - leaves resolved rows idempotent
@@ -65,6 +66,37 @@ The collector:
   the 1000-kline limit
 - never writes to `logs/signals.csv`
 - never sends Telegram or Cornix messages
+
+The collector pipeline is intentionally ordered for production safety:
+
+```text
+read signals.csv
+-> signal_status == sent
+-> parse/normalize UTC timestamp
+-> timestamp >= MOVING_SL_PROSPECTIVE_START_UTC
+-> canonical/dedupe
+-> skip terminal shadow records
+-> fetch Binance candles only for remaining candidates
+```
+
+If there are zero sent signals on or after the prospective start boundary, the
+collector exits successfully with zero Binance requests. In that case it does
+not create a historical output row. If the shadow CSV does not already exist, it
+is left absent rather than creating a header-only file.
+
+Each `--run` prints a compact summary:
+
+- shadow enabled
+- live enabled (`NO-OP` if true)
+- prospective start UTC
+- sent rows total
+- prospective sent rows
+- valid prospective candidates
+- candidates needing candle evaluation
+- terminal rows skipped
+- Binance request count
+- output rows
+- elapsed seconds
 
 `--lookahead-hours 0` means evaluate from signal timestamp through the latest
 closed candle available now. A positive value caps analysis to that many hours.
@@ -158,10 +190,12 @@ No live Cornix recommendation should be made from this V1 shadow alone.
 The module is standalone analytics. It can run as a separate recurring pass and
 does not need to run inside the scanner loop.
 
-It performs one Binance Futures kline request per observed candidate unless a
-test or future caller supplies a candle provider. Longer lifecycles may require
-additional paginated requests because Binance returns a maximum of 1000 candles
-per request.
+It performs zero Binance requests when no prospective candidates need
+evaluation. It skips terminal lifecycle rows on repeated runs. New prospective
+rows fetch from the signal timestamp. `TP1_REACHED_UNRESOLVED` rows with a saved
+`tp1_reached_at` fetch only the continuation range from that TP1 timestamp.
+Longer lifecycles may require additional paginated requests because Binance
+returns a maximum of 1000 candles per request.
 
 ## Deployment Model
 
