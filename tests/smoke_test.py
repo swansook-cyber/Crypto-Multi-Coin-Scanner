@@ -38,6 +38,7 @@ import position_watcher_state_cleanup
 import production_reset
 import production_health
 import production_v1_readiness
+from core import position_reconciliation_diagnostic
 import review_signals
 import shadow_linkage_coverage
 import stats_dashboard
@@ -124,6 +125,32 @@ watchdog_monitor = importlib.util.module_from_spec(WATCHDOG_SPEC)
 assert WATCHDOG_SPEC and WATCHDOG_SPEC.loader
 sys.modules["velahub_watchdog_monitor"] = watchdog_monitor
 WATCHDOG_SPEC.loader.exec_module(watchdog_monitor)
+
+
+class _ReconciliationFakeResponse:
+    def __init__(self, server_time_ms: int, status_code: int = 200) -> None:
+        self.server_time_ms = server_time_ms
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self) -> dict[str, int]:
+        return {"serverTime": self.server_time_ms}
+
+
+class _ReconciliationFakeSession:
+    def __init__(self, server_time_ms: int | None = None, fail: bool = False) -> None:
+        self.server_time_ms = server_time_ms
+        self.fail = fail
+        self.calls = 0
+
+    def get(self, *_args: object, **_kwargs: object) -> _ReconciliationFakeResponse:
+        self.calls += 1
+        if self.fail or self.server_time_ms is None:
+            raise RuntimeError("binance unavailable")
+        return _ReconciliationFakeResponse(self.server_time_ms)
 
 
 def sample_signal() -> scanner.TradeSignal:
@@ -4905,6 +4932,300 @@ def _restore_env(original: dict[str, str | None]) -> None:
             os.environ[key] = value
 
 
+def test_position_reconciliation_clock_thresholds_and_unavailable() -> None:
+    now = datetime(2026, 9, 5, 0, 0, 0, tzinfo=timezone.utc)
+    base_ms = int(now.timestamp() * 1000)
+
+    ok = position_reconciliation_diagnostic.check_clock_health(
+        session=_ReconciliationFakeSession(base_ms - 4000),
+        now=now,
+    )
+    warning = position_reconciliation_diagnostic.check_clock_health(
+        session=_ReconciliationFakeSession(base_ms - 20000),
+        now=now,
+    )
+    stale = position_reconciliation_diagnostic.check_clock_health(
+        session=_ReconciliationFakeSession(base_ms - 45000),
+        now=now,
+    )
+    unknown = position_reconciliation_diagnostic.check_clock_health(
+        session=_ReconciliationFakeSession(fail=True),
+        now=now,
+    )
+
+    assert ok.status == "OK"
+    assert warning.status == "WARNING"
+    assert stale.status == "STALE"
+    assert unknown.status == "UNKNOWN"
+    assert ok.details["drift_seconds"] == 4.0
+
+
+def test_position_reconciliation_signals_stale_duplicates_and_conflicts() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="position_reconciliation_signals_"))
+    try:
+        logs_dir = temp_dir / "logs"
+        logs_dir.mkdir()
+        signals_path = logs_dir / "signals.csv"
+        rows = [
+            {
+                "timestamp": "2026-09-04T00:00:00Z",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "entry": "100",
+                "stop_loss": "99",
+                "tp1": "101",
+                "tp2": "102",
+                "signal_status": "sent",
+                "result": "OPEN",
+                "hit_target": "",
+                "closed_at": "",
+            },
+            {
+                "timestamp": "2026-09-01T00:00:00Z",
+                "symbol": "ETHUSDT",
+                "side": "SHORT",
+                "entry": "200",
+                "stop_loss": "202",
+                "tp1": "198",
+                "tp2": "196",
+                "signal_status": "sent",
+                "result": "OPEN",
+                "hit_target": "TP1",
+                "closed_at": "2026-09-01T01:00:00Z",
+            },
+            {
+                "timestamp": "2026-09-02T00:00:00Z",
+                "symbol": "SOLUSDT",
+                "side": "LONG",
+                "entry": "50",
+                "stop_loss": "49",
+                "tp1": "51",
+                "tp2": "52",
+                "signal_status": "sent",
+                "result": "WIN",
+                "hit_target": "TP1",
+                "closed_at": "2026-09-01T23:00:00Z",
+            },
+            {
+                "timestamp": "2026-09-03T00:00:00Z",
+                "symbol": "XRPUSDT",
+                "side": "LONG",
+                "entry": "1.0",
+                "stop_loss": "0.9",
+                "tp1": "1.1",
+                "tp2": "1.2",
+                "signal_status": "sent",
+                "result": "WIN",
+                "hit_target": "TP1",
+                "closed_at": "2026-09-03T01:00:00Z",
+            },
+            {
+                "timestamp": "2026-09-03T00:00:00.999999Z",
+                "symbol": "XRP/USDT",
+                "side": "BUY",
+                "entry": "1.000000",
+                "stop_loss": "0.9",
+                "tp1": "1.1",
+                "tp2": "1.2",
+                "signal_status": "sent",
+                "result": "LOSS",
+                "hit_target": "SL",
+                "closed_at": "2026-09-03T01:05:00Z",
+            },
+            {
+                "timestamp": "2026-09-06T00:00:00Z",
+                "symbol": "BNBUSDT",
+                "side": "LONG",
+                "entry": "600",
+                "stop_loss": "590",
+                "tp1": "610",
+                "tp2": "620",
+                "signal_status": "sent",
+                "result": "OPEN",
+                "hit_target": "",
+                "closed_at": "",
+            },
+        ]
+        pd.DataFrame(rows).to_csv(signals_path, index=False)
+        now = datetime(2026, 9, 5, 0, 0, 0, tzinfo=timezone.utc)
+
+        signal_check = position_reconciliation_diagnostic.check_signals_csv(signals_path, now)
+        open_check = position_reconciliation_diagnostic.check_stale_open(signals_path, now)
+        outcome_check = position_reconciliation_diagnostic.check_outcome_consistency(signals_path, now)
+
+        assert signal_check.status == "CONFLICT"
+        assert signal_check.details["sent_rows"] == 6
+        assert signal_check.details["open_rows"] == 3
+        assert signal_check.details["duplicate_terminal_outcome_keys"] == 2
+        assert signal_check.details["future_timestamp_rows"] == 1
+        assert open_check.status == "STALE"
+        assert open_check.details["stale_open_rows"] >= 1
+        assert outcome_check.status == "CONFLICT"
+        reasons = {item["reason"] for item in outcome_check.items}
+        assert "outcome fields exist while result remains OPEN" in reasons
+        assert "closed_at before signal timestamp" in reasons
+        assert "multiple terminal outcomes for canonical signal" in reasons
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_position_reconciliation_zero_open_rows_and_missing_optional_state() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="position_reconciliation_zero_"))
+    try:
+        logs_dir = temp_dir / "logs"
+        logs_dir.mkdir()
+        signals_path = logs_dir / "signals.csv"
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-09-05T00:00:00Z",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": "100",
+                    "signal_status": "sent",
+                    "result": "WIN",
+                    "hit_target": "TP1",
+                    "closed_at": "2026-09-05T01:00:00Z",
+                }
+            ]
+        ).to_csv(signals_path, index=False)
+
+        open_check = position_reconciliation_diagnostic.check_stale_open(signals_path)
+        watcher_check = position_reconciliation_diagnostic.check_watcher_state(temp_dir)
+
+        assert open_check.status == "OK"
+        assert open_check.details["open_rows"] == 0
+        assert watcher_check.status == "UNKNOWN"
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_position_reconciliation_moving_sl_and_future_timestamp_sanity() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="position_reconciliation_moving_sl_"))
+    try:
+        logs_dir = temp_dir / "logs"
+        logs_dir.mkdir()
+        (temp_dir / ".env").write_text(
+            "MOVING_SL_SHADOW_ENABLED=true\n"
+            "MOVING_SL_LIVE_ENABLED=false\n"
+            "MOVING_SL_PROSPECTIVE_START_UTC=2026-09-04T14:21:27Z\n"
+            "SETUP_STRENGTH_PROSPECTIVE_START_UTC=bad-time\n",
+            encoding="utf-8",
+        )
+        pd.DataFrame(
+            [
+                {
+                    "canonical_signal_key": "sig:v1:BTCUSDT|LONG|2026-09-04T14:21:27Z|100.000000",
+                    "timestamp_utc": "2026-09-04T14:21:26Z",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": "100",
+                    "lifecycle_class": "TP2_BEFORE_BE",
+                },
+                {
+                    "canonical_signal_key": "sig:v1:ETHUSDT|LONG|2026-09-04T15:00:00Z|200.000000",
+                    "timestamp_utc": "2026-09-04T15:00:00Z",
+                    "symbol": "ETHUSDT",
+                    "side": "LONG",
+                    "entry": "200",
+                    "lifecycle_class": "BE_BEFORE_TP2",
+                },
+                {
+                    "canonical_signal_key": "sig:v1:ETHUSDT|LONG|2026-09-04T15:00:00Z|200.000000",
+                    "timestamp_utc": "2026-09-04T15:00:00Z",
+                    "symbol": "ETHUSDT",
+                    "side": "LONG",
+                    "entry": "200",
+                    "lifecycle_class": "BE_BEFORE_TP2",
+                },
+            ]
+        ).to_csv(logs_dir / "moving_sl_prospective_shadow.csv", index=False)
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-09-06T00:00:00Z",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": "100",
+                    "signal_status": "sent",
+                    "result": "OPEN",
+                    "closed_at": "",
+                    "tp1_alert_at": "not-a-time",
+                }
+            ]
+        ).to_csv(logs_dir / "signals.csv", index=False)
+
+        env_values = position_reconciliation_diagnostic.parse_env_file(temp_dir / ".env")
+        moving = position_reconciliation_diagnostic.check_moving_sl_shadow(temp_dir, env_values)
+        timestamp_sanity = position_reconciliation_diagnostic.check_timestamp_sanity(
+            temp_dir,
+            env_values,
+            datetime(2026, 9, 5, 0, 0, 0, tzinfo=timezone.utc),
+        )
+
+        assert moving.status == "CONFLICT"
+        assert moving.details["rows_before_prospective_start"] == 1
+        assert moving.details["duplicate_canonical_lifecycle_rows"] == 2
+        assert timestamp_sanity.status == "WARNING"
+        assert any(item["reason"] == "future timestamp rows" for item in timestamp_sanity.items)
+        assert any(item["reason"] == "invalid timezone/timestamp" for item in timestamp_sanity.items)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_position_reconciliation_json_schema_and_read_only_inputs() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="position_reconciliation_readonly_"))
+    try:
+        logs_dir = temp_dir / "logs"
+        logs_dir.mkdir()
+        signals_path = logs_dir / "signals.csv"
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-09-05T00:00:00Z",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": "100",
+                    "stop_loss": "99",
+                    "tp1": "101",
+                    "tp2": "102",
+                    "signal_status": "sent",
+                    "result": "OPEN",
+                    "hit_target": "",
+                    "closed_at": "",
+                }
+            ]
+        ).to_csv(signals_path, index=False)
+        before = signals_path.read_bytes()
+        now = datetime(2026, 9, 5, 0, 0, 0, tzinfo=timezone.utc)
+        session = _ReconciliationFakeSession(int(now.timestamp() * 1000))
+
+        first = position_reconciliation_diagnostic.run_diagnostic(temp_dir, session=session, now=now)
+        second = position_reconciliation_diagnostic.run_diagnostic(temp_dir, session=session, now=now)
+        payload = first.to_dict()
+        rendered = position_reconciliation_diagnostic.format_text_report(first, verbose=True)
+
+        assert signals_path.read_bytes() == before
+        assert payload["version"] == position_reconciliation_diagnostic.VERSION
+        assert payload["checked_at_utc"] == "2026-09-05T00:00:00Z"
+        assert "overall_status" in payload
+        assert isinstance(payload["checks"], list)
+        assert isinstance(payload["summary"], dict)
+        assert json.loads(json.dumps(payload))["version"] == position_reconciliation_diagnostic.VERSION
+        assert "Position Reconciliation Diagnostic V1" in rendered
+        assert first.to_dict()["summary"] == second.to_dict()["summary"]
+        assert session.calls == 2
+
+        source = (Path(__file__).resolve().parents[1] / "core" / "position_reconciliation_diagnostic.py").read_text(
+            encoding="utf-8"
+        )
+        assert "import telegram" not in source.lower()
+        assert "telegram_sender" not in source
+        assert "sendMessage" not in source
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def test_manual_live_pilot_defaults_disabled_and_paper() -> None:
     original = _with_pilot_env({"TRADING_MODE": None, "LIVE_PILOT_ENABLED": None})
     try:
@@ -7377,6 +7698,11 @@ def main() -> int:
     test_system_status_exit_codes_json_and_helpers()
     test_system_status_read_only_and_missing_optional_inputs()
     test_system_status_systemctl_backup_and_compaction()
+    test_position_reconciliation_clock_thresholds_and_unavailable()
+    test_position_reconciliation_signals_stale_duplicates_and_conflicts()
+    test_position_reconciliation_zero_open_rows_and_missing_optional_state()
+    test_position_reconciliation_moving_sl_and_future_timestamp_sanity()
+    test_position_reconciliation_json_schema_and_read_only_inputs()
     test_manual_live_pilot_defaults_disabled_and_paper()
     test_manual_live_pilot_policy_blocks_and_allows_core_tiers()
     test_manual_live_pilot_limits_duplicates_and_losses()
