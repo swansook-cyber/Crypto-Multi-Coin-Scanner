@@ -4960,6 +4960,23 @@ def test_position_reconciliation_clock_thresholds_and_unavailable() -> None:
     assert ok.details["drift_seconds"] == 4.0
 
 
+def test_position_reconciliation_overall_unknown_semantics() -> None:
+    checks = [
+        position_reconciliation_diagnostic.CheckResult("clock", "OK"),
+        position_reconciliation_diagnostic.CheckResult("signals", "UNKNOWN"),
+    ]
+    assert position_reconciliation_diagnostic.overall_status_from_checks(checks) == "WARNING"
+    assert position_reconciliation_diagnostic.overall_status_from_checks(
+        [position_reconciliation_diagnostic.CheckResult("clock", "OK")]
+    ) == "OK"
+    assert position_reconciliation_diagnostic.overall_status_from_checks(
+        checks + [position_reconciliation_diagnostic.CheckResult("open", "STALE")]
+    ) == "STALE"
+    assert position_reconciliation_diagnostic.overall_status_from_checks(
+        checks + [position_reconciliation_diagnostic.CheckResult("outcome", "CONFLICT")]
+    ) == "CONFLICT"
+
+
 def test_position_reconciliation_signals_stale_duplicates_and_conflicts() -> None:
     temp_dir = Path(tempfile.mkdtemp(prefix="position_reconciliation_signals_"))
     try:
@@ -5074,7 +5091,11 @@ def test_position_reconciliation_zero_open_rows_and_missing_optional_state() -> 
     try:
         logs_dir = temp_dir / "logs"
         logs_dir.mkdir()
+        (temp_dir / "watchdog").mkdir()
         signals_path = logs_dir / "signals.csv"
+        moving_path = logs_dir / "moving_sl_prospective_shadow.csv"
+        signal_state_path = temp_dir / "signal_state.json"
+        watchdog_state_path = temp_dir / "watchdog" / "state.json"
         pd.DataFrame(
             [
                 {
@@ -5173,12 +5194,95 @@ def test_position_reconciliation_moving_sl_and_future_timestamp_sanity() -> None
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_position_reconciliation_moving_sl_absent_zero_observations_is_expected() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="position_reconciliation_moving_sl_absent_"))
+    try:
+        logs_dir = temp_dir / "logs"
+        logs_dir.mkdir()
+        (temp_dir / ".env").write_text(
+            "MOVING_SL_SHADOW_ENABLED=true\n"
+            "MOVING_SL_LIVE_ENABLED=false\n"
+            "MOVING_SL_PROSPECTIVE_START_UTC=2026-09-04T14:21:27Z\n",
+            encoding="utf-8",
+        )
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-09-04T14:21:26Z",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": "100",
+                    "signal_status": "sent",
+                    "result": "WIN",
+                },
+                {
+                    "timestamp": "2026-09-04T14:21:27Z",
+                    "symbol": "ETHUSDT",
+                    "side": "LONG",
+                    "entry": "200",
+                    "signal_status": "logged_quality_filter",
+                    "result": "SKIPPED",
+                },
+            ]
+        ).to_csv(logs_dir / "signals.csv", index=False)
+        env_values = position_reconciliation_diagnostic.parse_env_file(temp_dir / ".env")
+
+        check = position_reconciliation_diagnostic.check_moving_sl_shadow(temp_dir, env_values)
+
+        assert check.status == "OK"
+        assert check.details["read_status"] == "missing"
+        assert check.details["prospective_sent_rows"] == 0
+        assert check.details["rows"] == 0
+        assert "no prospective observations yet" in check.messages
+        assert not (logs_dir / "moving_sl_prospective_shadow.csv").exists()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_position_reconciliation_moving_sl_absent_with_observations_unknown() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="position_reconciliation_moving_sl_unknown_"))
+    try:
+        logs_dir = temp_dir / "logs"
+        logs_dir.mkdir()
+        (temp_dir / ".env").write_text(
+            "MOVING_SL_SHADOW_ENABLED=true\n"
+            "MOVING_SL_LIVE_ENABLED=false\n"
+            "MOVING_SL_PROSPECTIVE_START_UTC=2026-09-04T14:21:27Z\n",
+            encoding="utf-8",
+        )
+        pd.DataFrame(
+            [
+                {
+                    "timestamp": "2026-09-04T14:21:27Z",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": "100",
+                    "signal_status": "sent",
+                    "result": "OPEN",
+                }
+            ]
+        ).to_csv(logs_dir / "signals.csv", index=False)
+        env_values = position_reconciliation_diagnostic.parse_env_file(temp_dir / ".env")
+
+        check = position_reconciliation_diagnostic.check_moving_sl_shadow(temp_dir, env_values)
+
+        assert check.status == "UNKNOWN"
+        assert check.details["read_status"] == "missing"
+        assert check.details["prospective_sent_rows"] == 1
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def test_position_reconciliation_json_schema_and_read_only_inputs() -> None:
     temp_dir = Path(tempfile.mkdtemp(prefix="position_reconciliation_readonly_"))
     try:
         logs_dir = temp_dir / "logs"
         logs_dir.mkdir()
+        (temp_dir / "watchdog").mkdir()
         signals_path = logs_dir / "signals.csv"
+        moving_path = logs_dir / "moving_sl_prospective_shadow.csv"
+        signal_state_path = temp_dir / "signal_state.json"
+        watchdog_state_path = temp_dir / "watchdog" / "state.json"
         pd.DataFrame(
             [
                 {
@@ -5196,7 +5300,26 @@ def test_position_reconciliation_json_schema_and_read_only_inputs() -> None:
                 }
             ]
         ).to_csv(signals_path, index=False)
-        before = signals_path.read_bytes()
+        pd.DataFrame(
+            [
+                {
+                    "canonical_signal_key": "sig:v1:BTCUSDT|LONG|2026-09-05T00:00:00Z|100.000000",
+                    "timestamp_utc": "2026-09-05T00:00:00Z",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "entry": "100",
+                    "lifecycle_class": "TP1_REACHED_UNRESOLVED",
+                }
+            ]
+        ).to_csv(moving_path, index=False)
+        signal_state_path.write_text('{"cooldowns":{}}\n', encoding="utf-8")
+        watchdog_state_path.write_text('{"service":{"status":"online"}}\n', encoding="utf-8")
+        before = {
+            signals_path: signals_path.read_bytes(),
+            moving_path: moving_path.read_bytes(),
+            signal_state_path: signal_state_path.read_bytes(),
+            watchdog_state_path: watchdog_state_path.read_bytes(),
+        }
         now = datetime(2026, 9, 5, 0, 0, 0, tzinfo=timezone.utc)
         session = _ReconciliationFakeSession(int(now.timestamp() * 1000))
 
@@ -5205,12 +5328,15 @@ def test_position_reconciliation_json_schema_and_read_only_inputs() -> None:
         payload = first.to_dict()
         rendered = position_reconciliation_diagnostic.format_text_report(first, verbose=True)
 
-        assert signals_path.read_bytes() == before
+        for path, content in before.items():
+            assert path.read_bytes() == content
         assert payload["version"] == position_reconciliation_diagnostic.VERSION
         assert payload["checked_at_utc"] == "2026-09-05T00:00:00Z"
         assert "overall_status" in payload
+        assert payload["overall_status"] == "WARNING"
         assert isinstance(payload["checks"], list)
         assert isinstance(payload["summary"], dict)
+        assert payload["summary"]["unknown"] > 0
         assert json.loads(json.dumps(payload))["version"] == position_reconciliation_diagnostic.VERSION
         assert "Position Reconciliation Diagnostic V1" in rendered
         assert first.to_dict()["summary"] == second.to_dict()["summary"]
@@ -5224,6 +5350,29 @@ def test_position_reconciliation_json_schema_and_read_only_inputs() -> None:
         assert "sendMessage" not in source
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_position_reconciliation_static_read_only_no_write_paths() -> None:
+    source = (Path(__file__).resolve().parents[1] / "core" / "position_reconciliation_diagnostic.py").read_text(
+        encoding="utf-8"
+    )
+    forbidden_tokens = [
+        ".write_text(",
+        ".write_bytes(",
+        ".to_csv(",
+        ".unlink(",
+        ".mkdir(",
+        ".open(",
+        "open(\"w",
+        "open('w",
+        "sendMessage",
+        "telegram_sender",
+        "send_telegram",
+        "cornix_agent",
+        "review_signals",
+    ]
+    for token in forbidden_tokens:
+        assert token not in source
 
 
 def test_manual_live_pilot_defaults_disabled_and_paper() -> None:
@@ -7699,10 +7848,14 @@ def main() -> int:
     test_system_status_read_only_and_missing_optional_inputs()
     test_system_status_systemctl_backup_and_compaction()
     test_position_reconciliation_clock_thresholds_and_unavailable()
+    test_position_reconciliation_overall_unknown_semantics()
     test_position_reconciliation_signals_stale_duplicates_and_conflicts()
     test_position_reconciliation_zero_open_rows_and_missing_optional_state()
     test_position_reconciliation_moving_sl_and_future_timestamp_sanity()
+    test_position_reconciliation_moving_sl_absent_zero_observations_is_expected()
+    test_position_reconciliation_moving_sl_absent_with_observations_unknown()
     test_position_reconciliation_json_schema_and_read_only_inputs()
+    test_position_reconciliation_static_read_only_no_write_paths()
     test_manual_live_pilot_defaults_disabled_and_paper()
     test_manual_live_pilot_policy_blocks_and_allows_core_tiers()
     test_manual_live_pilot_limits_duplicates_and_losses()

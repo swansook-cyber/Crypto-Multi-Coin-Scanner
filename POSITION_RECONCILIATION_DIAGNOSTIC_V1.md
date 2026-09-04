@@ -74,9 +74,12 @@ Statuses are diagnostic labels only:
 
 Overall status uses severity ordering:
 
-`CONFLICT > STALE > WARNING > OK`
+`CONFLICT > STALE > WARNING > UNKNOWN/incomplete health > OK`
 
-`UNKNOWN` is reported explicitly and is never treated as healthy.
+The public overall enum intentionally remains `OK`, `WARNING`, `STALE`, or
+`CONFLICT`. If any unresolved check is `UNKNOWN` and no higher-severity issue is
+present, the overall status is `WARNING`. This prevents incomplete health from
+being reported as fully healthy.
 
 ## Clock Thresholds
 
@@ -163,6 +166,14 @@ Checks:
 - duplicate canonical lifecycle rows
 
 It does not trigger collection and never calls `--run`.
+
+If the output file does not exist while Moving-SL shadow is enabled, live mode is
+disabled, the prospective boundary is valid, and `logs/signals.csv` contains zero
+`signal_status == sent` rows on or after the boundary, the diagnostic reports
+`OK` with the message `no prospective observations yet`. It does not create the
+output file. If prospective sent rows exist but the output file is absent, the
+state remains `UNKNOWN` because absence cannot be safely distinguished from a
+collector failure.
 
 ### Clock-Sensitive Timestamp Sanity
 

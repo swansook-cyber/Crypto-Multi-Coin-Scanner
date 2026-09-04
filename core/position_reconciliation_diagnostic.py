@@ -111,6 +111,25 @@ def status_max(*statuses: str) -> str:
     return max(present, key=lambda value: SEVERITY_ORDER.get(value, 1))
 
 
+def overall_status_from_checks(checks: list[CheckResult]) -> str:
+    """Collapse check statuses to the public overall enum.
+
+    The public overall status intentionally stays within OK/WARNING/STALE/CONFLICT.
+    Unresolved UNKNOWN checks are therefore surfaced as overall WARNING so an
+    incomplete diagnostic can never look fully healthy.
+    """
+    statuses = [check.status for check in checks]
+    if any(status == "CONFLICT" for status in statuses):
+        return "CONFLICT"
+    if any(status == "STALE" for status in statuses):
+        return "STALE"
+    if any(status == "WARNING" for status in statuses):
+        return "WARNING"
+    if any(status == "UNKNOWN" for status in statuses):
+        return "WARNING"
+    return "OK"
+
+
 def read_csv_safely(path: Path) -> tuple[pd.DataFrame | None, str]:
     try:
         if not path.exists():
@@ -525,9 +544,40 @@ def check_moving_sl_shadow(base_dir: Path = BASE_DIR, env_file_values: dict[str,
         status = status_max(status, "WARNING")
         items.append({"status": "WARNING", "reason": "MOVING_SL_PROSPECTIVE_START_UTC missing or invalid"})
 
+    prospective_sent_rows: int | None = None
+    if start_norm:
+        signals_df, signals_read_status = read_csv_safely(base_dir / "logs" / "signals.csv")
+        details["signals_read_status"] = signals_read_status
+        if signals_df is not None:
+            if signals_df.empty or "timestamp" not in signals_df.columns:
+                prospective_sent_rows = 0
+            else:
+                statuses = signals_df.get("signal_status", pd.Series([""] * len(signals_df))).fillna("").astype(str).str.lower()
+                timestamps = pd.to_datetime(signals_df["timestamp"], utc=True, errors="coerce")
+                start_ts = parse_timestamp(start_norm)
+                if start_ts is not None:
+                    prospective_sent_rows = int(((statuses == "sent") & timestamps.notna() & (timestamps >= start_ts)).sum())
+            details["prospective_sent_rows"] = prospective_sent_rows
+
     df, read_status = read_csv_safely(output_path)
     details["read_status"] = read_status
     if df is None:
+        if (
+            read_status == "missing"
+            and shadow_enabled
+            and not live_enabled
+            and start_norm
+            and prospective_sent_rows == 0
+            and status != "CONFLICT"
+        ):
+            details.update({"rows": 0, "rows_before_prospective_start": 0, "duplicate_canonical_lifecycle_rows": 0})
+            return CheckResult(
+                "moving_sl_shadow",
+                status,
+                details,
+                items,
+                messages=["no prospective observations yet"],
+            )
         return CheckResult("moving_sl_shadow", status_max(status, "UNKNOWN"), details, items)
     if df.empty:
         details.update({"rows": 0, "rows_before_prospective_start": 0, "duplicate_canonical_lifecycle_rows": 0})
@@ -610,8 +660,7 @@ def run_diagnostic(
         check_moving_sl_shadow(base_dir, env_file_values),
         check_timestamp_sanity(base_dir, env_file_values, checked_at),
     ]
-    visible_statuses = [check.status for check in checks if check.status != "UNKNOWN"]
-    overall = status_max(*visible_statuses) if visible_statuses else "UNKNOWN"
+    overall = overall_status_from_checks(checks)
     summary = {
         "ok": sum(1 for check in checks if check.status == "OK"),
         "warnings": sum(1 for check in checks if check.status == "WARNING"),
