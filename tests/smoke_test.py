@@ -51,6 +51,19 @@ from core.market_exhaustion_engine import (
     evaluate_market_exhaustion,
     shadow_key_for_signal as market_exhaustion_shadow_key,
 )
+from core.moving_sl_prospective_shadow import (
+    MovingSLCandidate,
+    MovingSLProspectiveShadowStore,
+    build_report as build_moving_sl_report,
+    build_record as build_moving_sl_record,
+    candidates_for_collection as moving_sl_candidates_for_collection,
+    candidate_from_row as moving_sl_candidate_from_row,
+    evaluate_lifecycle as evaluate_moving_sl_lifecycle,
+    fetch_futures_klines_range as fetch_moving_sl_klines_range,
+    load_candidates as load_moving_sl_candidates,
+    run_shadow as run_moving_sl_shadow,
+)
+import core.moving_sl_prospective_shadow as moving_sl_shadow
 from core.performance_analytics_v1 import build_complete_report, export_v1_outputs
 from core.performance_analytics_v2 import build_performance_v2, canonical_session, generate_performance_warnings
 from core.performance_analytics_v3 import build_performance_v3, shadow_filter_backtest
@@ -5905,6 +5918,313 @@ def test_rejected_outcome_shadow_candle_cache_filters_after_timestamp() -> None:
     assert outcome.hypothetical_outcome == "WIN_TP1"
 
 
+def _moving_sl_candidate(side: str = "LONG", **overrides: object) -> MovingSLCandidate:
+    values = {
+        "timestamp_utc": "2026-07-01T00:00:00Z",
+        "symbol": "BTCUSDT",
+        "side": side,
+        "entry": 100.0 if side == "LONG" else 200.0,
+        "original_sl": 98.0 if side == "LONG" else 202.0,
+        "tp1": 102.0 if side == "LONG" else 198.0,
+        "tp2": 104.0 if side == "LONG" else 196.0,
+        "signal_status": "sent",
+        "original_result": "OPEN",
+        "original_hit_target": "",
+        "market_session": "Asia",
+        "watchlist_tier": "A",
+        "setup_strength": "82",
+        "score": "90",
+        "confidence": "82",
+    }
+    values.update(overrides)
+    key = canonical_signal_key(
+        symbol=values["symbol"],
+        side=values["side"],
+        timestamp=values["timestamp_utc"],
+        entry=values["entry"],
+    )
+    return MovingSLCandidate(canonical_signal_key=key, **values)
+
+
+def test_moving_sl_lifecycle_classes_and_mirror_logic() -> None:
+    long_candidate = _moving_sl_candidate("LONG")
+    assert evaluate_moving_sl_lifecycle(
+        long_candidate,
+        _shadow_candles([("2026-07-01T00:15:00+00:00", 101.0, 97.9)]),
+    ).lifecycle_class == "SL_BEFORE_TP1"
+
+    long_tp2 = evaluate_moving_sl_lifecycle(
+        long_candidate,
+        _shadow_candles(
+            [
+                ("2026-07-01T00:15:00+00:00", 102.5, 100.2),
+                ("2026-07-01T00:30:00+00:00", 104.2, 101.0),
+            ]
+        ),
+    )
+    assert long_tp2.lifecycle_class == "TP2_BEFORE_BE"
+    assert long_tp2.tp1_reached
+    assert long_tp2.tp2_reached_after_tp1
+    assert long_tp2.shadow_action == "MOVE_SL_TO_BE"
+
+    long_be = evaluate_moving_sl_lifecycle(
+        long_candidate,
+        _shadow_candles(
+            [
+                ("2026-07-01T00:15:00+00:00", 102.5, 100.2),
+                ("2026-07-01T00:30:00+00:00", 103.0, 99.9),
+            ]
+        ),
+    )
+    assert long_be.lifecycle_class == "BE_BEFORE_TP2"
+    assert long_be.be_reached_after_tp1
+
+    unresolved = evaluate_moving_sl_lifecycle(
+        long_candidate,
+        _shadow_candles([("2026-07-01T00:15:00+00:00", 102.5, 100.2)]),
+    )
+    assert unresolved.lifecycle_class == "TP1_REACHED_UNRESOLVED"
+
+    ambiguous = evaluate_moving_sl_lifecycle(
+        long_candidate,
+        _shadow_candles([("2026-07-01T00:15:00+00:00", 102.5, 97.9)]),
+    )
+    assert ambiguous.lifecycle_class == "AMBIGUOUS"
+    assert ambiguous.ambiguous_same_candle
+
+    missing = evaluate_moving_sl_lifecycle(long_candidate, pd.DataFrame())
+    assert missing.lifecycle_class == "DATA_INSUFFICIENT"
+
+    short_candidate = _moving_sl_candidate("SHORT")
+    short_tp2 = evaluate_moving_sl_lifecycle(
+        short_candidate,
+        _shadow_candles(
+            [
+                ("2026-07-01T00:15:00+00:00", 199.8, 197.5),
+                ("2026-07-01T00:30:00+00:00", 199.0, 195.8),
+            ]
+        ),
+    )
+    assert short_tp2.lifecycle_class == "TP2_BEFORE_BE"
+    short_be = evaluate_moving_sl_lifecycle(
+        short_candidate,
+        _shadow_candles(
+            [
+                ("2026-07-01T00:15:00+00:00", 199.8, 197.5),
+                ("2026-07-01T00:30:00+00:00", 200.1, 197.0),
+            ]
+        ),
+    )
+    assert short_be.lifecycle_class == "BE_BEFORE_TP2"
+
+
+def test_moving_sl_candidate_dedupe_persistence_and_report_no_side_effect() -> None:
+    row = pd.Series(
+        {
+            "timestamp": "2026-07-01T00:00:00+00:00",
+            "symbol": "BTC/USDT",
+            "side": "LONG",
+            "entry": "100.0",
+            "stop_loss": "98",
+            "tp1": "102",
+            "tp2": "104",
+            "signal_status": "sent",
+            "result": "WIN",
+            "hit_target": "TP1",
+            "market_session": "London",
+            "watchlist_tier": "B",
+            "setup_strength": "79",
+            "score": "88",
+            "confidence": "91",
+        }
+    )
+    candidate = moving_sl_candidate_from_row(row)
+    assert candidate is not None
+    assert candidate.symbol == "BTCUSDT"
+    assert candidate.signal_status == "sent"
+    rejected = pd.Series({**row.to_dict(), "signal_status": "logged_quality_filter"})
+    assert moving_sl_candidate_from_row(rejected) is None
+
+    lifecycle = evaluate_moving_sl_lifecycle(
+        candidate,
+        _shadow_candles(
+            [
+                ("2026-07-01T00:15:00+00:00", 102.5, 100.2),
+                ("2026-07-01T00:30:00+00:00", 104.2, 101.0),
+            ]
+        ),
+    )
+    record = build_moving_sl_record(candidate, lifecycle, "2026-07-01T00:00:00Z", "2026-07-01T01:00:00Z")
+    assert record["lifecycle_class"] == "TP2_BEFORE_BE"
+    assert record["shadow_action"] == "MOVE_SL_TO_BE"
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="moving_sl_shadow_"))
+    try:
+        path = temp_dir / "moving_sl_prospective_shadow.csv"
+        store = MovingSLProspectiveShadowStore(path)
+        first = store.upsert([record])
+        second = store.upsert([record])
+        assert len(first) == 1
+        assert len(second) == 1
+        restarted = MovingSLProspectiveShadowStore(path)
+        assert len(restarted.upsert([record])) == 1
+        saved = pd.read_csv(path)
+        assert len(saved) == 1
+        assert saved.loc[0, "canonical_signal_key"] == candidate.canonical_signal_key
+
+        report = build_moving_sl_report(saved)
+        assert "Prospective Moving-SL Shadow V1" in report
+        assert "No Net R improvement" in report
+        assert "KEEP RESEARCH" in report
+
+        old_live = os.environ.get("MOVING_SL_LIVE_ENABLED")
+        os.environ["MOVING_SL_LIVE_ENABLED"] = "true"
+        try:
+            live_flag_lifecycle = evaluate_moving_sl_lifecycle(
+                candidate,
+                _shadow_candles(
+                    [
+                        ("2026-07-01T00:15:00+00:00", 102.5, 100.2),
+                        ("2026-07-01T00:30:00+00:00", 104.2, 101.0),
+                    ]
+                ),
+            )
+            assert live_flag_lifecycle.lifecycle_class == lifecycle.lifecycle_class
+            assert not hasattr(moving_sl_shadow, "send_telegram_message")
+            assert "Cornix" not in build_moving_sl_report(saved)
+        finally:
+            if old_live is None:
+                os.environ.pop("MOVING_SL_LIVE_ENABLED", None)
+            else:
+                os.environ["MOVING_SL_LIVE_ENABLED"] = old_live
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_moving_sl_prospective_start_and_rerun_semantics_no_signal_write() -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix="moving_sl_run_semantics_"))
+    try:
+        signals_path = temp_dir / "signals.csv"
+        output_path = temp_dir / "moving_sl_prospective_shadow.csv"
+        old_row = {
+            "timestamp": "2026-06-30T23:00:00+00:00",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "entry": 100,
+            "stop_loss": 98,
+            "tp1": 102,
+            "tp2": 104,
+            "signal_status": "sent",
+        }
+        new_row = {**old_row, "timestamp": "2026-07-01T00:00:00+00:00", "symbol": "ETHUSDT"}
+        rejected_row = {**new_row, "timestamp": "2026-07-01T01:00:00+00:00", "symbol": "SOLUSDT", "signal_status": "logged_quality_filter"}
+        pd.DataFrame([old_row, new_row, rejected_row]).to_csv(signals_path, index=False)
+        before = signals_path.read_text(encoding="utf-8")
+
+        candidates = load_moving_sl_candidates(signals_path, "2026-07-01T00:00:00Z")
+        assert [candidate.symbol for candidate in candidates] == ["ETHUSDT"]
+
+        def unresolved_provider(candidate: MovingSLCandidate) -> pd.DataFrame:
+            return _shadow_candles([("2026-07-01T00:15:00+00:00", 102.5, 100.2)])
+
+        first = run_moving_sl_shadow(
+            signals_path,
+            output_path,
+            prospective_start_utc="2026-07-01T00:00:00Z",
+            candle_provider=unresolved_provider,
+        )
+        assert len(first) == 1
+        assert first.iloc[0]["lifecycle_class"] == "TP1_REACHED_UNRESOLVED"
+
+        def resolved_provider(candidate: MovingSLCandidate) -> pd.DataFrame:
+            return _shadow_candles(
+                [
+                    ("2026-07-01T00:15:00+00:00", 102.5, 100.2),
+                    ("2026-07-01T00:30:00+00:00", 104.5, 101.0),
+                ]
+            )
+
+        second = run_moving_sl_shadow(
+            signals_path,
+            output_path,
+            prospective_start_utc="2026-07-01T00:00:00Z",
+            candle_provider=resolved_provider,
+        )
+        assert len(second) == 1
+        assert second.iloc[0]["lifecycle_class"] == "TP2_BEFORE_BE"
+
+        third = run_moving_sl_shadow(
+            signals_path,
+            output_path,
+            prospective_start_utc="2026-07-01T00:00:00Z",
+            candle_provider=unresolved_provider,
+        )
+        assert len(third) == 1
+        assert third.iloc[0]["lifecycle_class"] == "TP2_BEFORE_BE"
+        assert signals_path.read_text(encoding="utf-8") == before
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_moving_sl_collection_selection_and_paginated_closed_candles() -> None:
+    candidate = _moving_sl_candidate("LONG")
+    unresolved = build_moving_sl_record(
+        candidate,
+        evaluate_moving_sl_lifecycle(
+            candidate,
+            _shadow_candles([("2026-07-01T00:15:00+00:00", 102.5, 100.2)]),
+        ),
+    )
+    terminal = {**unresolved, "lifecycle_class": "TP2_BEFORE_BE"}
+    assert moving_sl_candidates_for_collection([candidate], {}) == [candidate]
+    assert moving_sl_candidates_for_collection([candidate], {candidate.canonical_signal_key: "TP1_REACHED_UNRESOLVED"}) == [candidate]
+    assert moving_sl_candidates_for_collection([candidate], {candidate.canonical_signal_key: "DATA_INSUFFICIENT"}) == [candidate]
+    assert moving_sl_candidates_for_collection([candidate], {candidate.canonical_signal_key: "TP2_BEFORE_BE"}) == []
+
+    class FakeResponse:
+        def __init__(self, payload: list[list[object]]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> list[list[object]]:
+            return self.payload
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def get(self, _url: str, params: dict[str, object], timeout: int) -> FakeResponse:
+            self.calls.append(dict(params))
+            call_index = len(self.calls)
+            base_ms = int(pd.Timestamp("2026-07-01T00:00:00Z").timestamp() * 1000) + (call_index - 1) * 15 * 60 * 1000
+            row = [
+                base_ms,
+                "100",
+                "101",
+                "99",
+                "100",
+                "1",
+                base_ms + 15 * 60 * 1000 - 1,
+                "1",
+                1,
+                "1",
+                "1",
+                "0",
+            ]
+            return FakeResponse([row] if call_index <= 2 else [])
+
+    fake = FakeSession()
+    candles = fetch_moving_sl_klines_range(
+        fake, "BTCUSDT", pd.Timestamp("2026-07-01T00:00:00Z"), pd.Timestamp("2026-07-01T01:00:00Z")
+    )
+    assert len(fake.calls) >= 2
+    assert len(candles) == 2
+    assert list(candles["open_time"]) == sorted(candles["open_time"].tolist())
+    assert terminal["lifecycle_class"] == "TP2_BEFORE_BE"
+
+
 def _pullback_candidate(side: str = "LONG", original_result: str = "LOSS") -> PullbackRetestCandidate:
     entry = 100.0
     sl = 98.0 if side == "LONG" else 102.0
@@ -6851,6 +7171,10 @@ def main() -> int:
     test_rejected_outcome_shadow_candidate_parsing_categories_and_open()
     test_rejected_outcome_shadow_backfill_dedupe_and_logger_schema()
     test_rejected_outcome_shadow_candle_cache_filters_after_timestamp()
+    test_moving_sl_lifecycle_classes_and_mirror_logic()
+    test_moving_sl_candidate_dedupe_persistence_and_report_no_side_effect()
+    test_moving_sl_prospective_start_and_rerun_semantics_no_signal_write()
+    test_moving_sl_collection_selection_and_paginated_closed_candles()
     test_pullback_retest_targets_are_deterministic_and_no_lookahead()
     test_pullback_retest_fill_invalidation_and_no_retest_rules()
     test_pullback_retest_records_no_retest_not_win_and_loser_to_winner()
