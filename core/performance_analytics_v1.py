@@ -15,6 +15,17 @@ import pandas as pd
 from core.performance_analytics_v2 import build_performance_v2
 from core.performance_analytics_v3 import build_performance_v3, format_table as format_v3_table
 from core.performance_analytics_v8 import build_root_cause_analytics
+from core.reporting_truth import (
+    ANALYTICS_V3,
+    LIVE_SENT_PERFORMANCE,
+    PERFORMANCE_QUALIFIED_RESEARCH_SYMBOLS,
+    PERFORMANCE_V1,
+    RESEARCH_ALL_STATUS_PERFORMANCE,
+    live_sent_rows,
+    research_all_status_rows,
+    routing_summary,
+    status_counts,
+)
 
 
 NA = "N/A"
@@ -23,6 +34,8 @@ SMALL_SAMPLE_CLOSED_TRADES = 30
 
 DAILY_PERFORMANCE_COLUMNS = [
     "date",
+    "production_population",
+    "production_formula_version",
     "total_sent_signals",
     "closed_signals",
     "open_signals",
@@ -627,11 +640,14 @@ def build_complete_report(
     history: pd.DataFrame,
     external: pd.DataFrame,
     date: str | None = None,
+    routing_universe: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, pd.DataFrame]]:
     scanner_all = combine_scanner_sources(journal, history)
     report_date = latest_report_date(scanner_all, date)
     scanner_day = filter_report_day(scanner_all, report_date)
-    sent_day = sent_signals(scanner_day)
+    # Keep the V1 primary production arithmetic unchanged, with its sent-only
+    # input population made explicit for every consumer.
+    sent_day = live_sent_rows(scanner_day)
     tier_c_report = scanner_day[
         scanner_day["signal_status"].fillna("").astype(str).str.lower().eq("tier_c_report_only")
     ].copy() if not scanner_day.empty else scanner_day
@@ -672,6 +688,14 @@ def build_complete_report(
 
     report: dict[str, Any] = {
         "date": report_date,
+        "production_population": LIVE_SENT_PERFORMANCE,
+        "production_formula_version": PERFORMANCE_V1,
+        "research_population": RESEARCH_ALL_STATUS_PERFORMANCE,
+        "research_formula_version": ANALYTICS_V3,
+        "research_statuses_included": status_counts(research_all_status_rows(scanner_day)),
+        "performance_qualified_population": PERFORMANCE_QUALIFIED_RESEARCH_SYMBOLS,
+        "live_routing_summary": routing_summary(routing_universe),
+        "live_routing_universe": routing_universe or {"population": "LIVE_ROUTING_UNIVERSE", "source": "unavailable"},
         "total_sent_signals": int(len(sent_day)),
         "closed_signals": int(len(closed)),
         "open_signals": int(len(open_signals)),
@@ -765,13 +789,15 @@ def build_complete_report(
     report["strategy_filter_simulator"] = format_v3_table(v3["strategy_filter_simulator"], limit=20)
     report["top_strategy_candidates"] = format_v3_table(v3["top_strategy_candidates"], limit=8)
     report["strategy_filter_recommendations"] = "\n".join(v3["strategy_filter_recommendations"]) if v3["strategy_filter_recommendations"] else NA
-    report["production_universe_ranking"] = format_v3_table(v3["production_universe_ranking"], limit=20)
-    report["production_universe_tier_s"] = classification_symbols(v3["production_universe_ranking"], "Tier S")
-    report["production_universe_tier_a"] = classification_symbols(v3["production_universe_ranking"], "Tier A")
-    report["production_universe_watch"] = classification_symbols(v3["production_universe_ranking"], "Watch")
-    report["production_universe_report_only"] = classification_symbols(v3["production_universe_ranking"], "Report Only")
-    report["post_filter_live_performance"] = format_v3_table(v3["post_filter_live_performance"], limit=5)
-    report["production_universe_performance"] = format_v3_table(v3["production_universe_performance"], limit=8)
+    # V3 ranking is retrospective across all statuses; it is research evidence,
+    # never the configured live-routing universe.
+    report["performance_qualified_research_ranking"] = format_v3_table(v3["production_universe_ranking"], limit=20)
+    report["performance_qualified_research_tier_s"] = classification_symbols(v3["production_universe_ranking"], "Tier S")
+    report["performance_qualified_research_tier_a"] = classification_symbols(v3["production_universe_ranking"], "Tier A")
+    report["performance_qualified_research_watch"] = classification_symbols(v3["production_universe_ranking"], "Watch")
+    report["performance_qualified_research_report_only"] = classification_symbols(v3["production_universe_ranking"], "Report Only")
+    report["research_status_comparison"] = format_v3_table(v3["post_filter_live_performance"], limit=5)
+    report["performance_qualified_research_performance"] = format_v3_table(v3["production_universe_performance"], limit=8)
     report["shadow_filter_backtest"] = format_v3_table(v3["shadow_filter_backtest"], limit=12)
     report["recommended_actions"] = format_v3_table(v3["recommended_actions"], limit=12)
     report["root_score_session"] = format_v3_table(v8["root_score_session"], limit=12)
@@ -785,6 +811,7 @@ def build_complete_report(
 
     tables = {
         "symbol_performance": performance_by(sent_day, "symbol").drop(columns=["win_rate_sort"], errors="ignore"),
+        "sent_only_production_symbol_performance": performance_by(sent_day, "symbol").drop(columns=["win_rate_sort"], errors="ignore"),
         "tier_performance": performance_by(sent_day, "tier").drop(columns=["win_rate_sort"], errors="ignore"),
         "session_performance": performance_by(sent_day, "session").drop(columns=["win_rate_sort"], errors="ignore"),
         "btc_regime_performance": performance_by(sent_day, "btc_regime").drop(columns=["win_rate_sort"], errors="ignore"),
@@ -813,9 +840,9 @@ def build_complete_report(
         "score_calibration_report": v3["score_calibration_report"],
         "strategy_filter_simulator": v3["strategy_filter_simulator"],
         "top_strategy_candidates": v3["top_strategy_candidates"],
-        "production_universe_ranking": v3["production_universe_ranking"],
-        "post_filter_live_performance": v3["post_filter_live_performance"],
-        "production_universe_performance": v3["production_universe_performance"],
+        "performance_qualified_research_ranking": v3["production_universe_ranking"],
+        "research_status_comparison": v3["post_filter_live_performance"],
+        "performance_qualified_research_performance": v3["production_universe_performance"],
         "shadow_filter_backtest": v3["shadow_filter_backtest"],
         "recommended_actions": v3["recommended_actions"],
         "root_score_session": v8["root_score_session"],
@@ -835,6 +862,7 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
     paths = {
         "daily_performance": logs_dir / "daily_performance.csv",
         "symbol_performance": logs_dir / "symbol_performance.csv",
+        "sent_only_production_symbol_performance": logs_dir / "sent_only_production_symbol_performance.csv",
         "source_performance": logs_dir / "source_performance.csv",
         "position_management": logs_dir / "position_management.csv",
         "symbol_performance_v2": logs_dir / "symbol_performance_v2.csv",
@@ -856,9 +884,9 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
         "score_calibration_report": logs_dir / "score_calibration_report.csv",
         "strategy_filter_simulator": logs_dir / "strategy_filter_simulator.csv",
         "top_strategy_candidates": logs_dir / "top_strategy_candidates.csv",
-        "production_universe_ranking": logs_dir / "production_universe_ranking.csv",
-        "post_filter_live_performance": logs_dir / "post_filter_live_performance.csv",
-        "production_universe_performance": logs_dir / "production_universe_performance.csv",
+        "performance_qualified_research_ranking": logs_dir / "performance_qualified_research_ranking.csv",
+        "research_status_comparison": logs_dir / "research_status_comparison.csv",
+        "performance_qualified_research_performance": logs_dir / "performance_qualified_research_performance.csv",
         "shadow_filter_backtest": logs_dir / "shadow_filter_backtest.csv",
         "recommended_actions": logs_dir / "recommended_actions.csv",
         "root_score_session": logs_dir / "root_score_session.csv",
@@ -882,6 +910,7 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
     daily.to_csv(paths["daily_performance"], index=False)
 
     tables.get("symbol_performance", pd.DataFrame()).to_csv(paths["symbol_performance"], index=False)
+    tables.get("sent_only_production_symbol_performance", pd.DataFrame()).to_csv(paths["sent_only_production_symbol_performance"], index=False)
     tables.get("source_performance", pd.DataFrame()).to_csv(paths["source_performance"], index=False)
     tables.get("symbol_performance_v2", pd.DataFrame()).to_csv(paths["symbol_performance_v2"], index=False)
     tables.get("session_performance_v2", pd.DataFrame()).to_csv(paths["session_performance_v2"], index=False)
@@ -902,9 +931,9 @@ def export_v1_outputs(report: dict[str, Any], tables: dict[str, pd.DataFrame], l
     tables.get("score_calibration_report", pd.DataFrame()).to_csv(paths["score_calibration_report"], index=False)
     tables.get("strategy_filter_simulator", pd.DataFrame()).to_csv(paths["strategy_filter_simulator"], index=False)
     tables.get("top_strategy_candidates", pd.DataFrame()).to_csv(paths["top_strategy_candidates"], index=False)
-    tables.get("production_universe_ranking", pd.DataFrame()).to_csv(paths["production_universe_ranking"], index=False)
-    tables.get("post_filter_live_performance", pd.DataFrame()).to_csv(paths["post_filter_live_performance"], index=False)
-    tables.get("production_universe_performance", pd.DataFrame()).to_csv(paths["production_universe_performance"], index=False)
+    tables.get("performance_qualified_research_ranking", pd.DataFrame()).to_csv(paths["performance_qualified_research_ranking"], index=False)
+    tables.get("research_status_comparison", pd.DataFrame()).to_csv(paths["research_status_comparison"], index=False)
+    tables.get("performance_qualified_research_performance", pd.DataFrame()).to_csv(paths["performance_qualified_research_performance"], index=False)
     tables.get("shadow_filter_backtest", pd.DataFrame()).to_csv(paths["shadow_filter_backtest"], index=False)
     tables.get("recommended_actions", pd.DataFrame()).to_csv(paths["recommended_actions"], index=False)
     tables.get("root_score_session", pd.DataFrame()).to_csv(paths["root_score_session"], index=False)

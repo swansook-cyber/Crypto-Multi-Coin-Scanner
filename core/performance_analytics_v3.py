@@ -550,12 +550,12 @@ def strategy_filter_simulator(df: pd.DataFrame) -> pd.DataFrame:
         ("Tier A/B only", tier.isin(["A", "B"])),
         ("Tier A/B + Score >=80", tier.isin(["A", "B"]) & score.ge(80)),
         ("Tier A/B + Score 75-89", tier.isin(["A", "B"]) & score.ge(75) & score.le(89)),
-        ("Production Universe only", production_mask),
-        ("Production Universe + Score >=80", production_mask & score.ge(80)),
-        ("Production Universe + Score 75-89", production_mask & score.ge(75) & score.le(89)),
-        ("Production Universe + No NewYork", production_mask & session.ne("NewYork")),
-        ("Production Universe + No London+NewYork", production_mask & session.ne("London+NewYork")),
-        ("Production Universe + Score 75-89 + No NewYork", production_mask & score.ge(75) & score.le(89) & session.ne("NewYork")),
+        ("Performance-Qualified Research Symbols only", production_mask),
+        ("Performance-Qualified Research Symbols + Score >=80", production_mask & score.ge(80)),
+        ("Performance-Qualified Research Symbols + Score 75-89", production_mask & score.ge(75) & score.le(89)),
+        ("Performance-Qualified Research Symbols + No NewYork", production_mask & session.ne("NewYork")),
+        ("Performance-Qualified Research Symbols + No London+NewYork", production_mask & session.ne("London+NewYork")),
+        ("Performance-Qualified Research Symbols + Score 75-89 + No NewYork", production_mask & score.ge(75) & score.le(89) & session.ne("NewYork")),
     ]
     rows = [_strategy_summary(base[mask.fillna(False)].copy(), name, current_win_rate, current_net_r) for name, mask in scenarios]
     table = pd.DataFrame(rows, columns=columns)
@@ -725,8 +725,8 @@ def post_filter_live_performance(df: pd.DataFrame) -> pd.DataFrame:
     if data.empty:
         return pd.DataFrame(columns=columns)
     status = data["signal_status"].fillna("sent").astype(str).str.lower()
-    historical = _closed_pool_summary(data, "Historical")
-    post_filter = _closed_pool_summary(data[~status.isin(REPORT_ONLY_STATUSES)].copy(), "Post-Filter Live Pool")
+    historical = _closed_pool_summary(data, "All-status research")
+    post_filter = _closed_pool_summary(data[~status.isin(REPORT_ONLY_STATUSES)].copy(), "Non-report-only research")
     improvement = {
         "Pool": "Improvement",
         "Closed Trades": int(post_filter["Closed Trades"] - historical["Closed Trades"]),
@@ -772,10 +772,10 @@ def production_universe_performance(df: pd.DataFrame) -> pd.DataFrame:
         for classification in ["Tier S", "Tier A", "Watch", "Report Only"]
     }
     pools = [
-        ("Tier S symbols only", classified["Tier S"]),
-        ("Tier S + Tier A symbols", classified["Tier S"] | classified["Tier A"]),
-        ("Watch symbols", classified["Watch"]),
-        ("Report-only symbols", classified["Report Only"]),
+        ("Research Tier S symbols only", classified["Tier S"]),
+        ("Research Tier S + Tier A symbols", classified["Tier S"] | classified["Tier A"]),
+        ("Research Watch symbols", classified["Watch"]),
+        ("Research Report-only symbols", classified["Report Only"]),
     ]
     rows = []
     for label, symbols in pools:

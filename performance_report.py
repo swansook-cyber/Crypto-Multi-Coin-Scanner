@@ -17,6 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 import manual_live_pilot
+from cornix_agent import ScannerConfig
 from core.analytics_reporting import load_csv_safely
 from core.entry_timing_engine import format_entry_timing_summary, summarize_entry_timing
 from core.performance_analytics_v1 import (
@@ -26,6 +27,13 @@ from core.performance_analytics_v1 import (
     format_minutes,
     format_value,
 )
+from core.reporting_truth import (
+    SnapshotConflictError,
+    build_snapshot_manifest,
+    routing_snapshot_from_config,
+    stable_sha256,
+    write_snapshot_manifest,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -34,6 +42,7 @@ HISTORY = BASE_DIR / "logs" / "signals_history.csv"
 EXTERNAL = BASE_DIR / "logs" / "external_signals.csv"
 ENTRY_TIMING = BASE_DIR / "logs" / "entry_timing_engine.csv"
 LOGS_DIR = BASE_DIR / "logs"
+REPORT_SNAPSHOTS_DIR = LOGS_DIR / "report_snapshots"
 REPORTS_DIR = BASE_DIR / "reports"
 SMALL_SAMPLE_CLOSED_TRADES = 30
 TELEGRAM_MESSAGE_LIMIT = 3900
@@ -172,7 +181,8 @@ def build_full_report(
     external: pd.DataFrame,
     date: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, pd.DataFrame]]:
-    return build_complete_report(journal, history, external, date)
+    routing_universe = routing_snapshot_from_config(ScannerConfig.from_env())
+    return build_complete_report(journal, history, external, date, routing_universe=routing_universe)
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -195,6 +205,9 @@ def format_report(report: dict[str, Any]) -> str:
         f"Trading Mode: {pilot_config.trading_mode}\n"
         f"Pilot Enabled: {pilot_config.enabled}\n"
         f"Effective Status: {'DISABLED' if manual_live_pilot.pilot_disabled(pilot_config) else 'ENABLED'}\n\n"
+        "Production Performance (Sent Only)\n"
+        f"Population: {report.get('production_population', 'LIVE_SENT_PERFORMANCE')}\n"
+        f"Formula: {report.get('production_formula_version', 'performance_v1')}\n"
         f"Total sent signals: {report['total_sent_signals']}\n"
         f"Closed signals: {report['closed_signals']}\n"
         f"Open signals: {report['open_signals']}\n"
@@ -241,7 +254,7 @@ def format_report(report: dict[str, Any]) -> str:
         f"{report.get('external_top_rejected_symbols') or NA}\n\n"
         "Performance Analytics V2 Warnings:\n"
         f"{report.get('performance_warnings') or NA}\n\n"
-        "Performance Analytics V3\n"
+        "Performance Analytics V3 (Sent Only)\n"
         "By Symbol:\n"
         f"{report.get('performance_v3_symbol') or NA}\n\n"
         "By Session:\n"
@@ -275,21 +288,27 @@ def format_report(report: dict[str, Any]) -> str:
         f"{report.get('top_strategy_candidates') or NA}\n\n"
         "Strategy Filter Recommendations\n"
         f"{report.get('strategy_filter_recommendations') or NA}\n\n"
-        "Production Universe Ranking\n"
-        f"{report.get('production_universe_ranking') or NA}\n\n"
-        "Recommended Production Universe\n"
+        "Live Routing Universe\n"
+        f"{report.get('live_routing_summary') or NA}\n\n"
+        "Research Analytics (All Status)\n"
+        f"Population: {report.get('research_population', 'RESEARCH_ALL_STATUS_PERFORMANCE')}\n"
+        f"Formula: {report.get('research_formula_version', 'analytics_v3')}\n"
+        f"Statuses included: {report.get('research_statuses_included') or NA}\n\n"
+        "Performance-Qualified Research Symbols (Retrospective)\n"
+        f"{report.get('performance_qualified_research_ranking') or NA}\n\n"
+        "Research Classifications (not live routing)\n"
         "Tier S:\n"
-        f"{report.get('production_universe_tier_s') or NA}\n\n"
+        f"{report.get('performance_qualified_research_tier_s') or NA}\n\n"
         "Tier A:\n"
-        f"{report.get('production_universe_tier_a') or NA}\n\n"
+        f"{report.get('performance_qualified_research_tier_a') or NA}\n\n"
         "Watch:\n"
-        f"{report.get('production_universe_watch') or NA}\n\n"
+        f"{report.get('performance_qualified_research_watch') or NA}\n\n"
         "Report Only:\n"
-        f"{report.get('production_universe_report_only') or NA}\n\n"
-        "Post-Filter Live Performance\n"
-        f"{report.get('post_filter_live_performance') or NA}\n\n"
-        "Production Universe Performance\n"
-        f"{report.get('production_universe_performance') or NA}\n\n"
+        f"{report.get('performance_qualified_research_report_only') or NA}\n\n"
+        "Research Status Comparison (not production performance)\n"
+        f"{report.get('research_status_comparison') or NA}\n\n"
+        "Performance-Qualified Research Symbol Performance\n"
+        f"{report.get('performance_qualified_research_performance') or NA}\n\n"
         "Shadow Filter Backtest\n"
         f"{report.get('shadow_filter_backtest') or NA}\n\n"
         "Recommended Actions\n"
@@ -457,8 +476,8 @@ def _extract_symbols(value: Any, limit: int = 8) -> str:
     return ", ".join(symbols) if symbols else _compact_value(text, 90)
 
 
-def _core_universe_metrics(report: dict[str, Any]) -> tuple[str, str, str, str]:
-    table = str(report.get("production_universe_performance") or "")
+def _research_qualified_metrics(report: dict[str, Any]) -> tuple[str, str, str, str]:
+    table = str(report.get("performance_qualified_research_performance") or "")
     core_wr = NA
     core_net_r = NA
     for line in table.splitlines():
@@ -470,16 +489,16 @@ def _core_universe_metrics(report: dict[str, Any]) -> tuple[str, str, str, str]:
             if len(numbers) >= 5:
                 core_net_r = f"{float(numbers[4]):.2f}R"
             break
-    core_symbols = ", ".join(
+    qualified_symbols = ", ".join(
         item
         for item in [
-            _extract_symbols(report.get("production_universe_tier_s"), 6),
-            _extract_symbols(report.get("production_universe_tier_a"), 6),
+            _extract_symbols(report.get("performance_qualified_research_tier_s"), 6),
+            _extract_symbols(report.get("performance_qualified_research_tier_a"), 6),
         ]
         if item != NA
     ) or NA
-    report_only = _extract_symbols(report.get("production_universe_report_only"), 8)
-    return core_wr, core_net_r, core_symbols, report_only
+    report_only = _extract_symbols(report.get("performance_qualified_research_report_only"), 8)
+    return core_wr, core_net_r, qualified_symbols, report_only
 
 
 def build_executive_decisions(report: dict[str, Any], timing: dict[str, Any] | None = None) -> list[str]:
@@ -523,20 +542,21 @@ def format_executive_report(
     counts = timing["counts"]
     warnings = _executive_warnings(report, 4)
     url = (dashboard_url or os.getenv("ANALYTICS_DASHBOARD_URL", "")).strip()
-    core_wr, core_net_r, core_symbols, report_only_symbols = _core_universe_metrics(report)
+    qualified_wr, qualified_net_r, qualified_symbols, report_only_symbols = _research_qualified_metrics(report)
     decisions = build_executive_decisions(report, timing)
 
     lines = [
         "Daily Performance Summary",
         f"Date: {report.get('date', 'ALL')}",
         "",
-        "Performance",
+        "Production Performance (Sent Only)",
         f"- Trading Mode: {pilot_config.trading_mode}",
         f"- Pilot: {'DISABLED' if manual_live_pilot.pilot_disabled(pilot_config) else 'ENABLED'}",
         f"- Closed: {report.get('closed_signals', 0)}",
         f"- Wins / Losses: {report.get('wins', 0)} / {report.get('losses', 0)}",
         f"- Win Rate: {format_value(report.get('win_rate'), '%')}",
         f"- Net R: {report.get('net_r_estimate', 0.0):.2f}R",
+        f"- Formula: {report.get('production_formula_version', 'performance_v1')}",
         f"- TP1 / TP2: {report.get('tp1_hits', 0)} / {report.get('tp2_hits', 0)}",
         f"- Avg TP / SL time: {format_minutes(report.get('avg_time_to_tp'))} / {format_minutes(report.get('avg_time_to_sl'))}",
         "",
@@ -549,11 +569,15 @@ def format_executive_report(
         "Watch",
         *[f"- {item}" for item in warnings[:4]],
         "",
-        "Production Universe",
-        f"- Core WR: {core_wr}",
-        f"- Core Net R: {core_net_r}",
-        f"- Core symbols: {core_symbols}",
-        f"- Report Only: {report_only_symbols}",
+        "Live Routing Universe",
+        f"- {report.get('live_routing_summary', NA)}",
+        "",
+        "Research Analytics (All Status; retrospective)",
+        f"- Formula: {report.get('research_formula_version', 'analytics_v3')}",
+        f"- Performance-qualified WR: {qualified_wr}",
+        f"- Performance-qualified Net R: {qualified_net_r}",
+        f"- Tier S/A research symbols: {qualified_symbols}",
+        f"- Research Report Only: {report_only_symbols}",
         "",
         "Entry Timing Shadow",
         f"- Evaluated: {timing['total']}",
@@ -728,6 +752,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history", type=Path, default=HISTORY, help="Path to signals_history.csv.")
     parser.add_argument("--external", type=Path, default=EXTERNAL, help="Path to external_signals.csv.")
     parser.add_argument("--entry-timing", type=Path, default=ENTRY_TIMING, help="Path to entry_timing_engine.csv.")
+    parser.add_argument("--snapshot-dir", type=Path, default=REPORT_SNAPSHOTS_DIR, help="Immutable report-snapshot directory.")
     return parser.parse_args()
 
 
@@ -739,10 +764,42 @@ def run_report(args: argparse.Namespace, session: requests.Session | None = None
     report, tables = build_full_report(journal, history, external, args.date)
     report["entry_timing_shadow_summary"] = format_entry_timing_summary(entry_timing)
     tables["entry_timing_shadow_summary"] = summarize_entry_timing(entry_timing)
+    full_message = format_report(report)
+    if str(report["date"]).upper() == "ALL":
+        # ALL is a mutable aggregate view, not finalized daily evidence.
+        LOGGER.info("REPORT SNAPSHOT SKIPPED: Date=ALL is not an immutable daily snapshot")
+    else:
+        source_path = args.journal if not journal.empty else args.history
+        source_rows = journal if not journal.empty else history
+        snapshot_rows = source_rows
+        if "timestamp" in source_rows.columns:
+            timestamp = pd.to_datetime(source_rows["timestamp"], utc=True, errors="coerce")
+            snapshot_rows = source_rows[timestamp.dt.strftime("%Y-%m-%d").eq(str(report["date"]))].copy()
+        snapshot = build_snapshot_manifest(
+            report_date_utc=str(report["date"]),
+            source_path=source_path,
+            source_rows=snapshot_rows,
+            routing=report.get("live_routing_universe"),
+            output_hashes={"full_report_text_sha256": stable_sha256(full_message)},
+            base_dir=BASE_DIR,
+            source_file_row_count=len(source_rows),
+        )
+        try:
+            snapshot_dir = getattr(args, "snapshot_dir", Path(args.journal).parent / "report_snapshots")
+            snapshot_result = write_snapshot_manifest(snapshot, snapshot_dir)
+            if snapshot_result.status == "conflict":
+                LOGGER.warning(
+                    "REPORT SNAPSHOT CONFLICT preserved=%s conflict=%s; continuing report delivery",
+                    snapshot_result.path,
+                    snapshot_result.conflict_path,
+                )
+            else:
+                LOGGER.info("REPORT SNAPSHOT %s: %s", snapshot_result.status.upper(), snapshot_result.path)
+        except SnapshotConflictError as exc:
+            LOGGER.warning("REPORT SNAPSHOT UNVERIFIABLE: %s; continuing report delivery", exc)
     export_v1_outputs(report, tables, LOGS_DIR)
     tables["entry_timing_shadow_summary"].to_csv(LOGS_DIR / "entry_timing_shadow_summary.csv", index=False)
     persist_report(report)
-    full_message = format_report(report)
     write_full_web_report(full_message)
     executive_message = format_executive_report(report, entry_timing)
     if getattr(args, "executive", False):

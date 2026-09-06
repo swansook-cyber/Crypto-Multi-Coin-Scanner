@@ -1761,10 +1761,10 @@ def test_daily_performance_report_metrics() -> None:
     assert "Strategy Filter Simulator" in message
     assert "Top Strategy Candidates" in message
     assert "Strategy Filter Recommendations" in message
-    assert "Production Universe Ranking" in message
-    assert "Recommended Production Universe" in message
-    assert "Post-Filter Live Performance" in message
-    assert "Production Universe Performance" in message
+    assert "Live Routing Universe" in message
+    assert "Performance-Qualified Research Symbols" in message
+    assert "Research Status Comparison" in message
+    assert "Performance-Qualified Research Symbol Performance" in message
     assert "Session Risk Experimental Performance" in message
     assert "London Long Experimental Performance" in message
 
@@ -1826,10 +1826,10 @@ def test_executive_report_v2_entry_timing_and_decisions() -> None:
         "long_win_rate": 60.0,
         "short_win_rate": 50.0,
         "performance_warnings": "warning\nSEIUSDT Trades 6 Win Rate 33.3",
-        "production_universe_tier_s": "BTCUSDT ETHUSDT",
-        "production_universe_tier_a": "SOLUSDT LINKUSDT",
-        "production_universe_report_only": "SEIUSDT WIFUSDT",
-        "production_universe_performance": "Pool Closed Trades Wins Losses Win Rate Net R\nTier S + Tier A 10 6 4 60.0 3.5",
+        "performance_qualified_research_tier_s": "BTCUSDT ETHUSDT",
+        "performance_qualified_research_tier_a": "SOLUSDT LINKUSDT",
+        "performance_qualified_research_report_only": "SEIUSDT WIFUSDT",
+        "performance_qualified_research_performance": "Pool Closed Trades Wins Losses Win Rate Net R\nResearch Tier S + Tier A 10 6 4 60.0 3.5",
         "session_risk_report_count": 0,
     }
     collecting = pd.DataFrame({"recommendation": ["ENTER NOW", "WAIT FOR PULLBACK", "SKIP (poor timing)"]})
@@ -1841,8 +1841,8 @@ def test_executive_report_v2_entry_timing_and_decisions() -> None:
     assert "WAIT PULLBACK: 1" in message
     assert "SKIP: 1" in message
     assert "Market Timing: COLLECTING DATA" in message
-    assert "Core WR: 60.0%" in message
-    assert "Core Net R: 3.50R" in message
+    assert "Performance-qualified WR: 60.0%" in message
+    assert "Performance-qualified Net R: 3.50R" in message
     assert "Full analytics: https://scanner.velalab.net/report" in message
     assert "Score Deep Audit" not in message
     assert "Strategy Filter Simulator" not in message
@@ -1938,6 +1938,7 @@ def test_scheduled_performance_report_reaches_reports_channel_path() -> None:
             history=history,
             external=external,
             entry_timing=entry_timing,
+            snapshot_dir=Path(f"{journal}.snapshots"),
         )
         assert performance_report.run_report(args, session=FakeSession()) == 0
         assert calls
@@ -2048,6 +2049,7 @@ def test_executive_cli_prints_without_telegram_send() -> None:
             history=history,
             external=external,
             entry_timing=entry_timing,
+            snapshot_dir=Path(f"{journal}.snapshots"),
         )
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -2118,6 +2120,7 @@ def test_performance_report_send_failure_exits_nonzero() -> None:
             history=history,
             external=external,
             entry_timing=entry_timing,
+            snapshot_dir=Path(f"{journal}.snapshots"),
         )
         assert performance_report.run_report(args, session=FailingSession()) == 1
         assert calls and calls[0][0] == "reports"
@@ -2481,9 +2484,9 @@ def test_complete_performance_analytics_v1_outputs() -> None:
         assert paths["score_calibration_report"].exists()
         assert paths["strategy_filter_simulator"].exists()
         assert paths["top_strategy_candidates"].exists()
-        assert paths["production_universe_ranking"].exists()
-        assert paths["post_filter_live_performance"].exists()
-        assert paths["production_universe_performance"].exists()
+        assert paths["performance_qualified_research_ranking"].exists()
+        assert paths["research_status_comparison"].exists()
+        assert paths["performance_qualified_research_performance"].exists()
     finally:
         for path in export_dir.glob("*.csv"):
             try:
@@ -2725,7 +2728,7 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
     assert v3["score_calibration_recommendations"]
     simulator = v3["strategy_filter_simulator"]
     assert not simulator.empty
-    assert "Production Universe + Score 75-89 + No NewYork" in simulator["Scenario"].tolist()
+    assert "Performance-Qualified Research Symbols + Score 75-89 + No NewYork" in simulator["Scenario"].tolist()
     assert "Diff vs Current Win Rate" in simulator.columns
     assert "Diff vs Current Net R" in simulator.columns
     current_strategy = simulator[simulator["Scenario"] == "Current"].iloc[0]
@@ -2747,15 +2750,15 @@ def test_performance_analytics_v3_shadow_filters_and_recommendations() -> None:
     assert int(weak_rank["Closed Trades"]) == 5
     post_filter = v3["post_filter_live_performance"]
     assert not post_filter.empty
-    historical = post_filter[post_filter["Pool"] == "Historical"].iloc[0]
-    live_pool = post_filter[post_filter["Pool"] == "Post-Filter Live Pool"].iloc[0]
+    historical = post_filter[post_filter["Pool"] == "All-status research"].iloc[0]
+    live_pool = post_filter[post_filter["Pool"] == "Non-report-only research"].iloc[0]
     improvement = post_filter[post_filter["Pool"] == "Improvement"].iloc[0]
     assert int(historical["Closed Trades"]) == 16
     assert int(live_pool["Closed Trades"]) == 11
     assert float(improvement["Net R"]) == 5.0
     universe_perf = v3["production_universe_performance"]
-    assert "Tier S + Tier A symbols" in universe_perf["Pool"].tolist()
-    assert "Report-only symbols" in universe_perf["Pool"].tolist()
+    assert "Research Tier S + Tier A symbols" in universe_perf["Pool"].tolist()
+    assert "Research Report-only symbols" in universe_perf["Pool"].tolist()
     score_symbol = v3["score_symbol_audit"]
     assert "GOODUSDT" in score_symbol["Symbol"].tolist()
     assert "WEAKUSDT" in score_symbol["Symbol"].tolist()
