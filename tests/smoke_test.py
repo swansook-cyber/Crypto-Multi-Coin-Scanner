@@ -5128,6 +5128,10 @@ def test_position_reconciliation_zero_open_rows_and_missing_optional_state() -> 
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+@patch.dict(os.environ, {
+    "SETUP_STRENGTH_PROSPECTIVE_START_UTC": "bad-time",
+    "MOVING_SL_PROSPECTIVE_START_UTC": "2026-09-04T14:21:27Z",
+}, clear=False)
 def test_position_reconciliation_moving_sl_and_future_timestamp_sanity() -> None:
     temp_dir = Path(tempfile.mkdtemp(prefix="position_reconciliation_moving_sl_"))
     try:
