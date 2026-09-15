@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 import argparse
 import contextlib
 import importlib.util
@@ -3008,9 +3009,12 @@ def test_dashboard_v2_handles_missing_and_empty_data() -> None:
         output.unlink(missing_ok=True)
 
 
-def test_dashboard_v2_active_positions_reviews_and_source_split() -> None:
-    older = (datetime.now(timezone.utc) - pd.Timedelta(hours=7)).isoformat()
-    newer = (datetime.now(timezone.utc) - pd.Timedelta(hours=1)).isoformat()
+@patch.object(dashboard, "_now_utc", return_value=datetime(2026, 9, 6, 12, tzinfo=timezone.utc))
+def test_dashboard_v2_active_positions_reviews_and_source_split(fixture_clock) -> None:
+    # Keep the age checks and Today category on the same fixed UTC clock.
+    now = fixture_clock.return_value
+    older = (now - pd.Timedelta(hours=7)).isoformat()
+    newer = (now - pd.Timedelta(hours=1)).isoformat()
     df = performance_report.normalize(
         pd.DataFrame(
             [

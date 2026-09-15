@@ -16,6 +16,8 @@ reports/
 backups/
 archive/
 signal_state.json
+state/binance_execution_truth_v1.json
+.env.binance-readonly
 
 *.bak
 cornix_agent.backup_*.py
