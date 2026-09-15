@@ -4870,22 +4870,85 @@ def test_system_status_exit_codes_json_and_helpers() -> None:
 
 
 def test_system_status_read_only_and_missing_optional_inputs() -> None:
-    before = {}
-    for path in [system_status.JOURNAL, system_status.ENTRY_TIMING]:
-        if path.exists():
-            before[path] = path.stat().st_mtime_ns
-
     class NoTelegramSession:
         def post(self, *_args, **_kwargs):
             raise AssertionError("system_status must not send Telegram")
 
     assert NoTelegramSession
-    status = system_status.build_status(include_services=False)
-    assert "final_status" in status
-    assert status["entry_timing"]["mode"] == "SHADOW"
-    assert status["release"]["release"]
-    for path, mtime in before.items():
-        assert path.stat().st_mtime_ns == mtime
+    original_journal = system_status.JOURNAL
+    original_entry_timing = system_status.ENTRY_TIMING
+    original_report_journal = performance_report.JOURNAL
+    original_pilot_journal = manual_live_pilot.JOURNAL
+    original_entry_timing_status = system_status.entry_timing_status
+    original_pilot_load_journal = manual_live_pilot.load_journal
+    original_report_load_csv = performance_report.load_csv_safely
+    original_status_load_csv = system_status.load_csv
+
+    with tempfile.TemporaryDirectory(prefix="system_status_read_only_smoke_") as temp_name:
+        temp_dir = Path(temp_name)
+        temp_journal = temp_dir / "signals.csv"
+        temp_entry_timing = temp_dir / "entry_timing_engine.csv"
+        for source, destination in [
+            (original_journal, temp_journal),
+            (original_entry_timing, temp_entry_timing),
+        ]:
+            if source.exists():
+                shutil.copy2(source, destination)
+            else:
+                destination.touch()
+
+        assert temp_journal.resolve() != original_journal.resolve()
+        assert temp_entry_timing.resolve() != original_entry_timing.resolve()
+        observed_reads: list[Path] = []
+
+        def report_load_csv(path: Path) -> pd.DataFrame:
+            observed_reads.append(path.resolve())
+            return original_report_load_csv(path)
+
+        def status_load_csv(path: Path) -> pd.DataFrame:
+            observed_reads.append(path.resolve())
+            return original_status_load_csv(path)
+
+        def isolated_entry_timing_status() -> dict:
+            return original_entry_timing_status(temp_entry_timing, temp_journal)
+
+        def isolated_pilot_load_journal() -> pd.DataFrame:
+            observed_reads.append(temp_journal.resolve())
+            return original_pilot_load_journal(temp_journal)
+
+        with (
+            patch.object(system_status, "JOURNAL", temp_journal),
+            patch.object(system_status, "ENTRY_TIMING", temp_entry_timing),
+            patch.object(performance_report, "JOURNAL", temp_journal),
+            patch.object(manual_live_pilot, "JOURNAL", temp_journal),
+            patch.object(performance_report, "load_csv_safely", side_effect=report_load_csv),
+            patch.object(system_status, "load_csv", side_effect=status_load_csv),
+            patch.object(system_status, "entry_timing_status", side_effect=isolated_entry_timing_status),
+            patch.object(manual_live_pilot, "load_journal", side_effect=isolated_pilot_load_journal),
+        ):
+            before = {
+                path: path.stat().st_mtime_ns
+                for path in [temp_journal, temp_entry_timing]
+            }
+            status = system_status.build_status(include_services=False)
+            assert "final_status" in status
+            assert status["entry_timing"]["mode"] == "SHADOW"
+            assert status["release"]["release"]
+            assert temp_journal.resolve() in observed_reads
+            assert temp_entry_timing.resolve() in observed_reads
+            assert original_journal.resolve() not in observed_reads
+            assert original_entry_timing.resolve() not in observed_reads
+            for path, mtime in before.items():
+                assert path.stat().st_mtime_ns == mtime
+
+    assert system_status.JOURNAL == original_journal
+    assert system_status.ENTRY_TIMING == original_entry_timing
+    assert performance_report.JOURNAL == original_report_journal
+    assert manual_live_pilot.JOURNAL == original_pilot_journal
+    assert system_status.entry_timing_status is original_entry_timing_status
+    assert manual_live_pilot.load_journal is original_pilot_load_journal
+    assert performance_report.load_csv_safely is original_report_load_csv
+    assert system_status.load_csv is original_status_load_csv
 
     missing = Path(tempfile.gettempdir()) / "missing_entry_timing_status_smoke.csv"
     entry = system_status.entry_timing_status(missing, missing)
