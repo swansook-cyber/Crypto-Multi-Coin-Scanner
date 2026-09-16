@@ -5450,16 +5450,18 @@ def test_position_reconciliation_static_read_only_no_write_paths() -> None:
 
 
 def test_manual_live_pilot_defaults_disabled_and_paper() -> None:
-    original = _with_pilot_env({"TRADING_MODE": None, "LIVE_PILOT_ENABLED": None})
-    try:
+    with (
+        patch.dict(os.environ, {}, clear=False),
+        patch.object(manual_live_pilot, "load_dotenv", return_value=False),
+    ):
+        os.environ.pop("TRADING_MODE", None)
+        os.environ.pop("LIVE_PILOT_ENABLED", None)
         config = manual_live_pilot.load_config()
         assert config.trading_mode == manual_live_pilot.PAPER
         assert config.enabled is False
         verdict = manual_live_pilot.evaluate_signal_pilot(sample_signal(), config=config, journal=pd.DataFrame())
         assert verdict.status == "BLOCKED"
         assert "TRADING_MODE is PAPER" in verdict.reasons
-    finally:
-        _restore_env(original)
 
 
 def test_manual_live_pilot_policy_blocks_and_allows_core_tiers() -> None:
