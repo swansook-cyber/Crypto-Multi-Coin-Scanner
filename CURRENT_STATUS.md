@@ -43,6 +43,7 @@
 - External Signal Inbox polling via `telegram_external_inbox.py`
 - External inbox VPS listener loop via `telegram_external_inbox.py --loop`
 - Production Health command via `production_health.py`
+- Read-only Binance Execution Truth collector health diagnostic via `python -m core.binance_execution_truth_health`
 - Data Integrity Audit via `data_integrity_audit.py`
 - Runtime backup command via `backup_runtime_data.py`
 - Entry Timing operational summary via `entry_timing_operational_summary.py`
