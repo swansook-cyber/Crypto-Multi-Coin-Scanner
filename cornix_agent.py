@@ -33,6 +33,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from core.btc_regime_filter import detect_btc_regime
+from core.cross_scan_exposure_shadow import (
+    CrossScanExposureShadowLogger,
+    ShadowRule,
+    timestamped_close_series,
+)
 from core.entry_timing_engine import EntryTimingEngine, EntryTimingLogger
 from core.loss_cooldown import LossCooldownTracker
 from core.market_exhaustion_engine import (
@@ -62,6 +67,9 @@ ENTRY_TIMING_JOURNAL = LOG_DIR / "entry_timing_engine.csv"
 SR_TRADE_WEIGHT_SHADOW_JOURNAL = LOG_DIR / "sr_trade_weight_shadow.csv"
 MARKET_EXHAUSTION_SHADOW_JOURNAL = LOG_DIR / "market_exhaustion_shadow.csv"
 SETUP_STRENGTH_PROSPECTIVE_SHADOW_JOURNAL = LOG_DIR / "setup_strength_prospective_shadow.csv"
+CROSS_SCAN_EXPOSURE_SHADOW_JOURNAL = LOG_DIR / "cross_scan_exposure_shadow_v1.csv"
+CROSS_SCAN_EXPOSURE_SHADOW_STATE = LOG_DIR / "cross_scan_exposure_shadow_v1.state.json"
+BINANCE_EXECUTION_TRUTH_JOURNAL = LOG_DIR / "binance_execution_truth_v1.csv"
 SIGNAL_VERSION = "internal-lab-v2"
 
 LOG_DIR.mkdir(exist_ok=True)
@@ -1697,6 +1705,28 @@ class AgentRunner:
             max_opposite_wick_ratio=config.max_opposite_wick_ratio,
         )
         self.market_exhaustion_logger = MarketExhaustionShadowLogger(MARKET_EXHAUSTION_SHADOW_JOURNAL)
+        self.cross_scan_exposure_shadow_logger: CrossScanExposureShadowLogger | None = None
+        self.cross_scan_price_history: dict[str, pd.Series] = {}
+        if env_bool("CROSS_SCAN_EXPOSURE_SHADOW_ENABLED", True):
+            try:
+                self.cross_scan_exposure_shadow_logger = CrossScanExposureShadowLogger(
+                    CROSS_SCAN_EXPOSURE_SHADOW_JOURNAL,
+                    CROSS_SCAN_EXPOSURE_SHADOW_STATE,
+                    SIGNAL_JOURNAL,
+                    execution_path=BINANCE_EXECUTION_TRUTH_JOURNAL,
+                    rule=ShadowRule(
+                        correlation_threshold=env_float("CROSS_SCAN_EXPOSURE_CORRELATION_THRESHOLD", 0.75),
+                        correlation_lookback_bars=env_int("CROSS_SCAN_EXPOSURE_LOOKBACK_BARS", 72),
+                        correlation_min_observations=env_int("CROSS_SCAN_EXPOSURE_MIN_OBSERVATIONS", 48),
+                        max_correlated_open_positions=env_int("CROSS_SCAN_EXPOSURE_MAX_OPEN", 1),
+                        stale_after_hours=env_float("CROSS_SCAN_EXPOSURE_STALE_HOURS", 24.0),
+                    ),
+                    prospective_start_timestamp_utc=(
+                        os.getenv("CROSS_SCAN_EXPOSURE_SHADOW_START_UTC", "").strip() or None
+                    ),
+                )
+            except Exception as exc:
+                LOGGER.warning("Cross-scan exposure shadow disabled after logger init failure: %s", exc)
         self.state = self._load_state()
         self.fear_greed_value: int | None = None
 
@@ -1777,6 +1807,10 @@ class AgentRunner:
         LOGGER.info("Market Exhaustion Live: %s", "ENABLED (ignored in Phase 1)" if self.config.market_exhaustion_live_enabled else "DISABLED")
         LOGGER.info("Setup Strength Prospective Shadow: %s", "ENABLED" if self.setup_strength_shadow_logger else "DISABLED")
         LOGGER.info("Setup Strength Live: %s", "ENABLED (ignored in V1)" if self.config.setup_strength_live_enabled else "DISABLED")
+        LOGGER.info(
+            "Cross-scan Exposure Shadow: %s",
+            "ENABLED (observational only)" if self.cross_scan_exposure_shadow_logger else "DISABLED",
+        )
         if self.config.run_once:
             self.scan_once()
             return
@@ -1790,6 +1824,12 @@ class AgentRunner:
     def scan_once(self) -> None:
         self.maybe_send_daily_summary()
         self.ai_commentary.reset_run_budget()
+        self.cross_scan_price_history = {}
+        if self.cross_scan_exposure_shadow_logger:
+            try:
+                self.cross_scan_exposure_shadow_logger.refresh_outcomes()
+            except Exception as exc:
+                LOGGER.warning("Cross-scan exposure outcome refresh failed: %s", exc)
         if self.config.use_fear_greed:
             try:
                 self.fear_greed_value = self.data_client.fetch_fear_greed()
@@ -1830,6 +1870,25 @@ class AgentRunner:
             )
         except Exception as exc:
             LOGGER.warning("Entry Timing Engine shadow evaluation failed for %s: %s", signal.symbol, exc)
+
+    def evaluate_cross_scan_exposure_shadow(self, signal: TradeSignal) -> None:
+        if not self.cross_scan_exposure_shadow_logger:
+            return
+        try:
+            record = self.cross_scan_exposure_shadow_logger.log_candidate(
+                signal,
+                self.cross_scan_price_history,
+            )
+            LOGGER.info(
+                "Cross-scan exposure shadow %s for %s %s: correlated=%s max_corr=%s; live send unchanged",
+                record.get("shadow_decision", ""),
+                signal.symbol,
+                signal.direction,
+                record.get("correlated_open_count", 0),
+                record.get("max_pair_correlation", "N/A") or "N/A",
+            )
+        except Exception as exc:
+            LOGGER.warning("Cross-scan exposure shadow failed open for %s: %s", signal.symbol, exc)
 
     def evaluate_setup_strength_shadow(self, signal: TradeSignal, signal_status: str, rejection_reason: str = "") -> None:
         if not self.setup_strength_shadow_logger:
@@ -1960,6 +2019,9 @@ class AgentRunner:
 
     def scan_symbol(self, symbol: str) -> TradeSignal | None:
         df_1h = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.trend_timeframe, 200))
+        timestamped_closes = timestamped_close_series(df_1h)
+        if not timestamped_closes.empty:
+            self.cross_scan_price_history[SymbolFormatter.to_binance_symbol(symbol)] = timestamped_closes
         df_15m = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.entry_timeframe, 200))
         df_htf = None
         if self.config.use_4h_regime_filter:
@@ -2087,6 +2149,7 @@ class AgentRunner:
                     self.mark_sent(signal)
                 LOGGER.info("%s routed to reports only: London LONG experimental mode", signal.symbol)
                 continue
+            self.evaluate_cross_scan_exposure_shadow(signal)
             self.log_signal_status(signal, "sent", "")
             self.evaluate_entry_timing_shadow(signal, "sent")
             if self.notifier.send_signal(signal) and not self.config.dry_run:
