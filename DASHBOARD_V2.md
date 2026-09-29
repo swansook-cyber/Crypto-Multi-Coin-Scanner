@@ -5,6 +5,93 @@ scanner activity, signal quality, open positions, performance, and system health
 It does not send Telegram messages, call Binance, place orders, modify CSV logs,
 or change scanner strategy.
 
+## Dashboard V2.1 Executive Layout
+
+Dashboard V2.1 keeps the same data sources and calculations but changes the
+first-screen layout so an operator can answer four questions quickly:
+
+- Is the scanner working?
+- How did today perform?
+- What positions are open?
+- Is anything unhealthy or stale?
+
+The top of the page is ordered as:
+
+1. Today's Performance
+   - Signals Today
+   - Win
+   - Loss
+   - Open
+   - Today's R
+   - Need Review
+2. Production KPI
+   - Total Signals
+   - Win Rate
+   - Net R
+   - Closed Trades
+   - Profit Factor
+   - Average RR
+3. Active Positions
+   - compact position cards with direction badge, entry, current price, PnL,
+     TP1 progress, TP1, SL, open duration, and review/online status.
+4. Scanner Health
+   - scanner status, database status, freshness, last scan, next scan, and
+     latest log time.
+
+Advanced details are now grouped under `Advanced Analytics`, including source
+split, 7D/30D performance, signal funnel, logs timeline, raw logs, V3 analytics,
+symbol/tier/session/direction tables, and CSV previews.
+
+All dashboard-displayed times are formatted in `Asia/Bangkok` / `ICT` for
+operator readability. CSV timestamps remain unchanged and are still parsed as
+UTC internally.
+
+## Dashboard V3 Production Control Center
+
+V3 keeps the V2.1 compact cards and read-only calculations, and organizes the
+Streamlit app into four mobile-friendly views:
+
+1. `HOME` (Overview): scanner freshness, today's local-day counts, open positions,
+   Execution Truth, collector health, and the latest signals.
+2. `SIGNALS`: compact recent-signal cards with setup strength, modeled R, and
+   execution linkage status; price and target details stay in an expander.
+3. `PERF` (Performance): modeled scanner outcomes, authoritative execution-only
+   performance, and a separately labeled `PROVISIONAL` funding view.
+4. `SYSTEM`: raw UTC values, service state, artifact existence, prospective
+   boundary, high-water mark, reconciliation counts, and diagnostic details.
+
+The Overview intentionally uses short `HH:MM` times and relative collector age.
+Raw ISO/UTC timestamps are confined to System. “Today” follows the
+`Asia/Bangkok` calendar day rather than the UTC calendar boundary.
+
+### Execution Truth
+
+The dashboard reads these artifacts only:
+
+- `logs/binance_execution_truth_v1.csv`
+- `state/binance_execution_truth_v1.json`
+- `logs/binance_execution_truth_v1.evidence.json`
+
+It delegates eligibility and totals to the existing collector
+`report_records` implementation. Authoritative execution performance uses the
+execution-complete matched population and shows eligible sample size, gross
+realized PnL, commission, execution PnL, gross R, and execution net R. Funding
+is never merged into that headline; the separate funding panel is always
+marked `PROVISIONAL`.
+
+Missing or malformed optional artifacts render as `Unavailable`, `Waiting for
+evidence`, or `Collecting execution evidence`. They never fabricate a zero
+value and never prevent scanner-only views from rendering.
+
+### Refresh and caching
+
+- Scanner CSV inputs: 30-second cache.
+- Execution Truth and health: 20-second cache.
+- Local service probes: 15-second cache.
+
+The caches are in-memory Streamlit caches only. The dashboard does not write
+scanner journals, collector state, evidence, or execution CSV data.
+
 ## Run
 
 ```bash

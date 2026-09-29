@@ -8,25 +8,35 @@ places trades, calls exchange APIs, or mutates log files.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from html import escape
 from pathlib import Path
 from typing import Any
+import csv
+import json
 import os
 import re
 import shutil
 import subprocess
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from dotenv import load_dotenv
 
 from core.analytics_reporting import load_csv_safely
+from core.binance_execution_truth_collector import report_records
+from core.binance_execution_truth_health import HealthConfig, evaluate_health, probe_systemd
 from core.performance_analytics_v2 import build_performance_v2, generate_performance_warnings
+from core.signal_identity import identity_from_record
 from performance_report import build_report, estimate_r, normalize, sent_signals
 
 BASE_DIR = Path(__file__).resolve().parent
 LOGS_DIR = BASE_DIR / "logs"
 REPORTS_DIR = BASE_DIR / "reports"
+STATE_DIR = BASE_DIR / "state"
 DASHBOARD_HTML = REPORTS_DIR / "dashboard.html"
 STALE_DATA_THRESHOLD_MINUTES = 90
+DISPLAY_TZ = ZoneInfo("Asia/Bangkok")
+DISPLAY_TZ_LABEL = "ICT"
 
 DATA_PATHS = {
     "signals": LOGS_DIR / "signals.csv",
@@ -46,6 +56,13 @@ LOG_PATHS = [
     LOGS_DIR / "cornix_agent.log",
     BASE_DIR / "cornix_agent.log",
 ]
+
+EXECUTION_PATHS = {
+    "csv": LOGS_DIR / "binance_execution_truth_v1.csv",
+    "state": STATE_DIR / "binance_execution_truth_v1.json",
+    "evidence": LOGS_DIR / "binance_execution_truth_v1.evidence.json",
+    "lock": LOGS_DIR / "binance_execution_truth_v1.lock",
+}
 
 
 def _series(df: pd.DataFrame, column: str, default: Any = "") -> pd.Series:
@@ -75,7 +92,84 @@ def _fmt_dt(value: Any) -> str:
     parsed = pd.to_datetime(pd.Series([value]), utc=True, errors="coerce").iloc[0]
     if pd.isna(parsed):
         return "N/A"
-    return parsed.isoformat()
+    local = parsed.tz_convert(DISPLAY_TZ)
+    return f"{local.strftime('%d %b %Y')}<br>{local.strftime('%H:%M')} {DISPLAY_TZ_LABEL}"
+
+
+def _fmt_dt_plain(value: Any) -> str:
+    return _fmt_dt(value).replace("<br>", " ")
+
+
+def _fmt_time(value: Any) -> str:
+    parsed = pd.to_datetime(pd.Series([value]), utc=True, errors="coerce").iloc[0]
+    if pd.isna(parsed):
+        return "Unavailable"
+    return parsed.tz_convert(DISPLAY_TZ).strftime("%H:%M")
+
+
+def _fmt_date(value: Any) -> str:
+    parsed = pd.to_datetime(pd.Series([value]), utc=True, errors="coerce").iloc[0]
+    if pd.isna(parsed):
+        return "Unavailable"
+    return parsed.tz_convert(DISPLAY_TZ).strftime("%d %b %Y")
+
+
+def _fmt_utc_compact(value: Any) -> str:
+    parsed = pd.to_datetime(pd.Series([value]), utc=True, errors="coerce").iloc[0]
+    if pd.isna(parsed):
+        return "Unavailable"
+    return f"{parsed.strftime('%Y-%m-%d')}<br>{parsed.strftime('%H:%M:%SZ')}"
+
+
+def _relative_time(value: Any, now: datetime | None = None) -> str:
+    parsed = pd.to_datetime(pd.Series([value]), utc=True, errors="coerce").iloc[0]
+    if pd.isna(parsed):
+        return "Unavailable"
+    reference = pd.Timestamp(now or _now_utc()).tz_convert("UTC")
+    seconds = int((reference - parsed).total_seconds())
+    future = seconds < 0
+    seconds = abs(seconds)
+    if seconds < 60:
+        text = "just now"
+    elif seconds < 3600:
+        value_minutes = seconds // 60
+        text = f"{value_minutes} min"
+    elif seconds < 86400:
+        value_hours = seconds // 3600
+        text = f"{value_hours}h"
+    else:
+        value_days = seconds // 86400
+        text = f"{value_days}d"
+    if text == "just now":
+        return text
+    return f"in {text}" if future else f"{text} ago"
+
+
+def _signed_number(value: Any, suffix: str = "", decimals: int = 2) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric) or numeric in [float("inf"), float("-inf")]:
+        return "Waiting for evidence"
+    return f"{float(numeric):+,.{decimals}f}{suffix}"
+
+
+def _local_day_frame(df: pd.DataFrame, now: datetime | None = None) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    timestamps = _timestamp_series(df)
+    local_dates = timestamps.dt.tz_convert(DISPLAY_TZ).dt.date
+    reference = (now or _now_utc()).astimezone(DISPLAY_TZ).date()
+    return df[local_dates == reference].copy()
+
+
+def _fmt_duration_hours(value: Any) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric) or numeric in [float("inf"), float("-inf")]:
+        return "N/A"
+    minutes = int(round(float(numeric) * 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h {mins:02d}m" if mins else f"{hours}h"
 
 
 def _fmt_percent(value: Any) -> str:
@@ -121,6 +215,12 @@ def _systemctl_state(service: str = "crypto-scanner.service") -> str | None:
     if state:
         return state.upper()
     return None
+
+
+def _dashboard_systemd_runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    """Bound collector health probes so a broken systemctl cannot stall HOME."""
+    kwargs["timeout"] = min(float(kwargs.get("timeout", 2)), 2.0)
+    return subprocess.run(args, **kwargs)
 
 
 def _ensure_columns(df: pd.DataFrame, defaults: dict[str, Any]) -> pd.DataFrame:
@@ -200,6 +300,185 @@ def load_dashboard_data(paths: dict[str, Path] | None = None) -> dict[str, pd.Da
     return data
 
 
+def _empty_execution_snapshot(paths: dict[str, Path], message: str = "Execution artifacts unavailable") -> dict[str, Any]:
+    return {
+        "available": False,
+        "collector_health": "UNAVAILABLE",
+        "message": message,
+        "last_success_utc": None,
+        "last_success_age_seconds": None,
+        "matched": None,
+        "authoritative_n": None,
+        "gross_realized_pnl_usdt": None,
+        "commission_usdt": None,
+        "execution_pnl_usdt": None,
+        "gross_r": None,
+        "execution_net_r": None,
+        "invalid": None,
+        "ambiguous": None,
+        "funding_rows": None,
+        "funding_usdt": None,
+        "funding_adjusted_pnl_usdt": None,
+        "pending_reconciliation": None,
+        "boundary": None,
+        "high_water_utc": None,
+        "state_age_seconds": None,
+        "provenance": {},
+        "rows": [],
+        "checks": {},
+        "artifacts": {name: path.exists() for name, path in paths.items()},
+    }
+
+
+def load_execution_truth_snapshot(
+    paths: dict[str, Path] | None = None,
+    *,
+    now: datetime | None = None,
+    health_result: Any | None = None,
+) -> dict[str, Any]:
+    """Read collector artifacts without calling Binance or mutating runtime state."""
+    selected = {**EXECUTION_PATHS, **(paths or {})}
+    snapshot = _empty_execution_snapshot(selected)
+    core_artifacts = [selected["csv"], selected["state"], selected["evidence"]]
+    if not any(path.exists() for path in core_artifacts):
+        return snapshot
+
+    rows: list[dict[str, str]] = []
+    state: dict[str, Any] = {}
+    errors: list[str] = []
+    try:
+        with selected["csv"].open("r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, UnicodeError, csv.Error) as exc:
+        errors.append(f"CSV: {type(exc).__name__}: {exc}")
+    try:
+        loaded_state = json.loads(selected["state"].read_text(encoding="utf-8"))
+        if isinstance(loaded_state, dict):
+            state = loaded_state
+        else:
+            errors.append("State: root is not an object")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        errors.append(f"State: {type(exc).__name__}: {exc}")
+
+    report: dict[str, Any] | None = None
+    if not errors:
+        try:
+            report = report_records(rows, str(state.get("prospective_start_utc") or "UNKNOWN"))
+        except (AssertionError, KeyError, TypeError, ValueError) as exc:
+            errors.append(f"Accounting report: {type(exc).__name__}: {exc}")
+
+    if health_result is None:
+        try:
+            health_result = evaluate_health(
+                HealthConfig(
+                    state_path=selected["state"],
+                    csv_path=selected["csv"],
+                    evidence_path=selected["evidence"],
+                    lock_path=selected["lock"],
+                ),
+                now=now,
+                systemd_probe=lambda timer, service: probe_systemd(
+                    timer,
+                    service,
+                    runner=_dashboard_systemd_runner,
+                ),
+            )
+        except Exception as exc:  # Diagnostic failure must never take down the dashboard.
+            errors.append(f"Health: {type(exc).__name__}: {exc}")
+
+    checks: dict[str, Any] = {}
+    health_metrics: dict[str, Any] = {}
+    health_status = "FAILED"
+    if health_result is not None:
+        raw_health = health_result.as_dict() if hasattr(health_result, "as_dict") else dict(health_result)
+        checks = raw_health.get("checks", {})
+        health_metrics = raw_health.get("metrics", {})
+        health_status = {"OK": "HEALTHY", "WARNING": "WARNING", "FAIL": "FAILED"}.get(
+            str(raw_health.get("overall", "FAIL")).upper(), "FAILED"
+        )
+    artifact_check = checks.get("artifacts", {})
+    artifact_status = str(artifact_check.get("status", "")).upper() if isinstance(artifact_check, dict) else ""
+    if artifact_status == "FAIL":
+        detail = str(artifact_check.get("detail") or "collector artifacts failed validation")
+        errors.append(f"Artifacts: {detail}")
+        report = None
+
+    snapshot.update(
+        {
+            "available": report is not None,
+            "collector_health": health_status,
+            "message": "; ".join(errors) if errors else "Collector artifacts loaded",
+            "last_success_utc": health_metrics.get("last_success_utc") or state.get("last_successful_collection_utc"),
+            "last_success_age_seconds": health_metrics.get("last_success_age_seconds"),
+            "invalid": health_metrics.get("invalid_count"),
+            "ambiguous": health_metrics.get("ambiguous_count"),
+            "boundary": state.get("prospective_start_utc"),
+            "high_water_utc": (state.get("endpoint_high_water") or {}).get("scanned_through_utc")
+            if isinstance(state.get("endpoint_high_water"), dict)
+            else None,
+            "state_age_seconds": health_metrics.get("state_age_seconds"),
+            "provenance": pd.Series(
+                [
+                    row.get("lifecycle_provenance")
+                    for row in rows
+                    if row.get("data_source") == "BINANCE_USDM_PROSPECTIVE"
+                    and row.get("lifecycle_provenance")
+                ],
+                dtype="object",
+            ).value_counts().to_dict(),
+            "rows": rows,
+            "checks": checks,
+            "artifacts": {name: path.exists() for name, path in selected.items()},
+        }
+    )
+    if report is None:
+        return snapshot
+
+    authoritative = report["execution_complete_matched"]
+    funding = report["funding_reconciled_matched"]
+    snapshot.update(
+        {
+            "matched": report["matched_scanner_lifecycles"],
+            "authoritative_n": authoritative["rows"],
+            "gross_realized_pnl_usdt": authoritative["gross_realized_pnl_usdt"],
+            "commission_usdt": authoritative["commission_usdt"],
+            "execution_pnl_usdt": authoritative["execution_pnl_usdt"],
+            "gross_r": authoritative["gross_realized_r"],
+            "execution_net_r": authoritative["execution_r"],
+            "invalid": snapshot["invalid"] if snapshot["invalid"] is not None else report["invalid_accounting_evidence"]["rows"],
+            "ambiguous": snapshot["ambiguous"] if snapshot["ambiguous"] is not None else report["ambiguous"],
+            "funding_rows": funding["rows"],
+            "funding_usdt": funding["funding_usdt"],
+            "funding_adjusted_pnl_usdt": funding["funding_adjusted_pnl_usdt"],
+            "pending_reconciliation": report["pending_execution_accounting"]["rows"],
+        }
+    )
+    return snapshot
+
+
+def execution_status_for_signal(row: pd.Series | dict[str, Any], execution_rows: list[dict[str, str]]) -> str:
+    key = identity_from_record(row).canonical_key
+    if not key:
+        return "Unavailable"
+    matches = [item for item in execution_rows if item.get("canonical_signal_key") == key]
+    if not matches:
+        for item in execution_rows:
+            try:
+                candidates = json.loads(item.get("candidate_signal_keys") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(candidates, list) and key in candidates:
+                matches.append(item)
+    if not matches:
+        return "Waiting"
+    statuses = {str(item.get("match_status") or "UNKNOWN").upper() for item in matches}
+    if "AMBIGUOUS" in statuses:
+        return "AMBIGUOUS"
+    if len(statuses) > 1:
+        return "AMBIGUOUS"
+    return statuses.pop()
+
+
 def _empty_report() -> dict[str, Any]:
     return {
         "total_sent_signals": 0,
@@ -245,7 +524,7 @@ def scanner_status_snapshot(paths: dict[str, Path] | None = None) -> dict[str, A
         "last_scan": latest.isoformat() if latest else "N/A",
         "next_scan": (latest + timedelta(hours=1)).isoformat() if latest else "N/A",
         "server_time": _now_utc().isoformat(),
-        "timezone": "UTC",
+        "timezone": "Asia/Bangkok",
         "data_age_minutes": round(age_minutes, 1) if age_minutes is not None else None,
         "stale_warning": (
             f"Latest scanner data is older than {STALE_DATA_THRESHOLD_MINUTES} minutes"
@@ -255,7 +534,11 @@ def scanner_status_snapshot(paths: dict[str, Path] | None = None) -> dict[str, A
     }
 
 
-def overview_metrics(data: dict[str, pd.DataFrame], paths: dict[str, Path] | None = None) -> dict[str, Any]:
+def overview_metrics(
+    data: dict[str, pd.DataFrame],
+    paths: dict[str, Path] | None = None,
+    status_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     sent = data.get("sent", pd.DataFrame())
     active = active_positions(sent)
     now = _now_utc()
@@ -271,7 +554,7 @@ def overview_metrics(data: dict[str, pd.DataFrame], paths: dict[str, Path] | Non
         regimes = regimes[regimes.str.strip() != ""]
         if not regimes.empty:
             latest_regime = regimes.iloc[-1]
-    snapshot = scanner_status_snapshot(paths)
+    snapshot = status_snapshot or scanner_status_snapshot(paths)
     return {
         **snapshot,
         "market_regime": latest_regime,
@@ -538,7 +821,10 @@ def performance_windows(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return {"performance": pd.DataFrame(rows)}
 
 
-def health_snapshot(paths: dict[str, Path] | None = None) -> dict[str, Any]:
+def health_snapshot(
+    paths: dict[str, Path] | None = None,
+    status_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     load_dotenv(BASE_DIR / ".env")
     source_paths = paths or DATA_PATHS
     signals_path = source_paths.get("signals", DATA_PATHS["signals"])
@@ -554,7 +840,7 @@ def health_snapshot(paths: dict[str, Path] | None = None) -> dict[str, Any]:
         disk_usage = f"{(disk.used / disk.total * 100):.1f}%"
     except OSError:
         disk_usage = "N/A"
-    status = scanner_status_snapshot(source_paths)
+    status = status_snapshot or scanner_status_snapshot(source_paths)
     return {
         "Process Status": status["status"],
         "Data Freshness": status["stale_warning"],
@@ -1015,10 +1301,10 @@ def apply_filters(
     if data.empty:
         return data
     if "timestamp" in data.columns and (start_date or end_date):
-        timestamps = pd.to_datetime(data["timestamp"], utc=True, errors="coerce")
+        timestamps = pd.to_datetime(data["timestamp"], utc=True, errors="coerce").dt.tz_convert(DISPLAY_TZ)
         if start_date:
             data = data[timestamps.dt.date >= start_date]
-            timestamps = pd.to_datetime(data["timestamp"], utc=True, errors="coerce")
+            timestamps = pd.to_datetime(data["timestamp"], utc=True, errors="coerce").dt.tz_convert(DISPLAY_TZ)
         if end_date:
             data = data[timestamps.dt.date <= end_date]
     if symbols:
@@ -1124,13 +1410,72 @@ def _format_metric(value: Any) -> str:
 def _badge(status: str) -> str:
     value = str(status or "N/A")
     cls = "neutral"
-    if value.upper() in {"RUNNING", "PASS", "POSITIVE", "APPROVED"}:
+    normalized = value.upper()
+    if normalized in {"RUNNING", "ONLINE", "PASS", "POSITIVE", "APPROVED", "LONG", "HEALTHY", "WIN", "MATCHED"}:
         cls = "positive"
-    elif value.upper() in {"DEGRADED", "WARNING", "DATA STALE"}:
+    elif normalized in {"DEGRADED", "WARNING", "DATA STALE", "REVIEW", "SHORT", "PROVISIONAL", "WAITING", "PARTIAL"}:
         cls = "warning"
-    elif value.upper() in {"STOPPED", "FAIL", "DANGER", "ERROR"}:
+    elif normalized in {"STOPPED", "FAIL", "FAILED", "DANGER", "ERROR", "LOSS", "INVALID", "AMBIGUOUS"}:
         cls = "danger"
-    return f"<span class='badge {cls}'>{value}</span>"
+    elif normalized in {"UNKNOWN", "N/A", "NEUTRAL"}:
+        cls = "neutral"
+    return f"<span class='badge {cls}'>{escape(value)}</span>"
+
+
+def _kpi_grid(st: Any, items: list[tuple[str, Any, str | None]], columns: int = 4) -> None:
+    style = f"--desktop-cols:{columns};"
+    cards = []
+    for label, value, badge in items:
+        badge_html = _badge(badge) if badge else ""
+        value_html = escape(_format_metric(value)).replace("&lt;br&gt;", "<br>")
+        cards.append(
+            "<div class='kpi-card'>"
+            f"<div class='kpi-label'>{escape(str(label))}</div>"
+            f"<div class='kpi-value'>{value_html}</div>"
+            f"<div class='kpi-badge'>{badge_html}</div>"
+            "</div>"
+        )
+    st.markdown(f"<div class='kpi-grid' style='{style}'>{''.join(cards)}</div>", unsafe_allow_html=True)
+
+
+def _symbol_badges(st: Any, title: str, symbols: list[str], tone: str = "neutral") -> None:
+    if not symbols:
+        symbols = ["N/A"]
+    badges = "".join(f"<span class='badge {tone}'>{escape(str(symbol))}</span>" for symbol in symbols)
+    st.markdown(f"<div class='symbol-section'><h3>{escape(title)}</h3><div class='symbol-badges'>{badges}</div></div>", unsafe_allow_html=True)
+
+
+def _progress_bar(percent: Any) -> str:
+    numeric = pd.to_numeric(pd.Series([percent]), errors="coerce").iloc[0]
+    if pd.isna(numeric) or numeric in [float("inf"), float("-inf")]:
+        return "<span class='muted-small'>N/A</span>"
+    value = max(0, min(100, int(round(float(numeric)))))
+    return (
+        "<div class='progress-wrap'>"
+        f"<div class='progress-fill' style='width:{value}%'></div>"
+        "</div>"
+        f"<span class='progress-label'>{value}%</span>"
+    )
+
+
+def _profit_factor(df: pd.DataFrame) -> str:
+    closed = _closed(df)
+    if closed.empty:
+        return "N/A"
+    realized = closed.apply(estimate_r, axis=1)
+    positive = realized[realized > 0].sum()
+    negative = realized[realized < 0].sum()
+    if negative == 0:
+        return "N/A" if positive == 0 else "∞"
+    return f"{positive / abs(negative):.2f}"
+
+
+def _format_time_columns(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
+    for column in ["timestamp", "closed_at", "Last Successful Scan", "Latest Log Time"]:
+        if column in data.columns:
+            data[column] = data[column].apply(_fmt_dt_plain)
+    return data
 
 
 def _display_position_card(st: Any, row: pd.Series) -> None:
@@ -1138,35 +1483,83 @@ def _display_position_card(st: Any, row: pd.Series) -> None:
     side = str(row.get("side", "N/A")).upper()
     symbol = str(row.get("symbol", "N/A"))
     border = {"positive": "#22c55e", "warning": "#f59e0b", "danger": "#ef4444"}.get(status, "#334155")
+    status_label = "REVIEW" if status in {"warning", "danger"} else "ONLINE"
+    pnl = _fmt_percent(row.get("current_pnl_pct"))
+    pnl_class = "positive-text" if not pnl.startswith("-") and pnl != "N/A" else "danger-text" if pnl.startswith("-") else ""
     st.markdown(
         f"""
 <div class="position-card" style="border-left-color:{border}">
   <div class="position-head">
-    <strong>{symbol}</strong>
-    <span class="side {side.lower()}">{side}</span>
+    <div>
+      <strong>{escape(symbol)}</strong>
+      <span class="confidence">Confidence {escape(_format_metric(row.get("setup_strength", row.get("confidence"))))}</span>
+    </div>
+    {_badge(side)}
   </div>
-  <div class="position-grid">
-    <span>Setup</span><b>{_format_metric(row.get("setup_strength", row.get("confidence")))}</b>
-    <span>Entry</span><b>{_fmt_price(row.get("entry"))}</b>
-    <span>Current</span><b>{_fmt_price(row.get("current_price"))}</b>
-    <span>SL</span><b>{_fmt_price(row.get("stop_loss"))}</b>
-    <span>TP1</span><b>{_fmt_price(row.get("tp1"))}</b>
-    <span>TP2</span><b>{_fmt_price(row.get("tp2"))}</b>
-    <span>TP3</span><b>{_fmt_price(row.get("tp3"))}</b>
-    <span>PnL</span><b>{_fmt_percent(row.get("current_pnl_pct"))}</b>
-    <span>Progress to TP1</span><b>{_fmt_percent(row.get("progress_to_tp1_pct"))}</b>
-    <span>Time Open</span><b>{_format_metric(row.get("time_open_hours"))}h</b>
-    <span>Status</span><b>{status}</b>
-    <span>Source</span><b>{row.get("source", "Unknown")}</b>
+  <div class="position-compact-grid">
+    <div><span>Entry</span><b>{_fmt_price(row.get("entry"))}</b></div>
+    <div><span>Current</span><b>{_fmt_price(row.get("current_price"))}</b></div>
+    <div><span>PnL</span><b class="{pnl_class}">{pnl}</b></div>
+    <div><span>Open</span><b>{_fmt_duration_hours(row.get("time_open_hours"))}</b></div>
+    <div><span>TP1</span><b>{_fmt_price(row.get("tp1"))}</b></div>
+    <div><span>SL</span><b>{_fmt_price(row.get("stop_loss"))}</b></div>
   </div>
-  <div class="muted-small">Signal ref: {row.get("signal_id", row.get("timestamp", "N/A"))}</div>
+  <div class="position-progress">
+    <span>Progress</span>
+    {_progress_bar(row.get("progress_to_tp1_pct"))}
+  </div>
+  <div class="position-footer">
+    {_badge(status_label)}
+    <span class="muted-small">Opened {_fmt_dt(row.get("timestamp"))}</span>
+  </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
 
-def _streamlit_app() -> None:
+def _display_signal_cards(st: Any, df: pd.DataFrame, execution_rows: list[dict[str, str]], limit: int = 10) -> None:
+    if df.empty:
+        st.info("No signals yet.")
+        return
+    data = df.copy()
+    data["_sort_time"] = _timestamp_series(data)
+    data = data.sort_values("_sort_time", ascending=False, na_position="last").head(limit)
+    for _, row in data.iterrows():
+        symbol = escape(str(row.get("symbol") or "Unknown"))
+        side = str(row.get("side") or "Unknown").upper()
+        result = str(row.get("result") or "OPEN").upper()
+        setup = row.get("setup_strength", row.get("confidence", "N/A"))
+        execution_status = execution_status_for_signal(row, execution_rows)
+        modeled_r = estimate_r(row) if result in {"WIN", "LOSS"} else None
+        modeled_text = f"{modeled_r:+.2f}R" if modeled_r is not None else "—"
+        st.markdown(
+            "<div class='signal-card'>"
+            "<div class='signal-head'>"
+            f"<div><strong>{symbol}</strong><span class='signal-time'>{escape(_fmt_dt_plain(row.get('timestamp')))}</span></div>"
+            f"<div>{_badge(side)} {_badge(result)}</div>"
+            "</div>"
+            "<div class='signal-grid'>"
+            f"<div><span>Setup</span><b>{escape(_format_metric(setup))}</b></div>"
+            f"<div><span>Modeled R</span><b>{escape(modeled_text)}</b></div>"
+            f"<div><span>Execution</span><b>{_badge(execution_status)}</b></div>"
+            "</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def _execution_value(snapshot: dict[str, Any], key: str, suffix: str) -> str:
+    if not snapshot.get("available") or not snapshot.get("authoritative_n"):
+        return "Collecting evidence"
+    return _signed_number(snapshot.get(key), suffix)
+
+
+def _health_badge_value(snapshot: dict[str, Any]) -> str:
+    return str(snapshot.get("collector_health") or "UNAVAILABLE")
+
+
+def _streamlit_app_legacy() -> None:
     try:
         import streamlit as st
     except ModuleNotFoundError as exc:
@@ -1180,11 +1573,14 @@ def _streamlit_app() -> None:
         """
 <style>
   .block-container { padding-top: 1rem; max-width: 1280px; }
+  h1 { font-size: 1.45rem !important; margin-bottom: 0.1rem !important; }
+  h2, h3 { font-size: 1rem !important; margin: 0.55rem 0 0.35rem !important; }
   div[data-testid="stMetric"] {
     background: #101827;
     border: 1px solid #1f2a44;
     border-radius: 8px;
-    padding: 0.75rem;
+    padding: 0.45rem 0.6rem;
+    min-height: 74px;
   }
   div[data-testid="stMetric"] label,
   div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
@@ -1192,33 +1588,52 @@ def _streamlit_app() -> None:
   }
   div[data-testid="stMetricValue"] {
     color: #f8fafc !important;
-    font-size: 1.35rem;
+    font-size: 1.75rem;
+    line-height: 1.05;
   }
   div[data-testid="stMetricDelta"] { color: #cbd5e1 !important; }
-  .badge { display:inline-block; padding: 0.2rem 0.55rem; border-radius: 999px; font-size: 0.78rem; font-weight: 700; }
+  .kpi-grid { display:grid; grid-template-columns:repeat(var(--desktop-cols), minmax(0, 1fr)); gap:10px; margin: 0.45rem 0 1rem; }
+  .kpi-card { background:#101827; border:1px solid #1f2a44; border-radius:8px; padding:0.55rem 0.7rem; min-height:66px; overflow:hidden; }
+  .kpi-label { color:#94a3b8; font-size:13px; line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .kpi-value { color:#f8fafc; font-size:30px; font-weight:800; line-height:1.05; margin-top:4px; word-break:break-word; }
+  .kpi-badge { margin-top:4px; min-height:18px; }
+  .badge { display:inline-block; padding: 0.16rem 0.5rem; border-radius: 999px; font-size: 0.74rem; font-weight: 800; letter-spacing:0; vertical-align:middle; }
   .badge.positive { background:#064e3b; color:#a7f3d0; }
   .badge.warning { background:#78350f; color:#fde68a; }
   .badge.danger { background:#7f1d1d; color:#fecaca; }
   .badge.neutral { background:#1e293b; color:#cbd5e1; }
-  .position-card { background:#0f172a; border:1px solid #1e293b; border-left:5px solid #334155; border-radius:8px; padding:14px; margin-bottom:12px; }
+  .symbol-section { margin: 0.4rem 0 0.9rem; }
+  .symbol-badges { display:flex; flex-wrap:wrap; gap:6px; }
+  .position-card { background:#0f172a; border:1px solid #1e293b; border-left:5px solid #334155; border-radius:8px; padding:12px; margin-bottom:10px; }
   .position-head { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px; }
-  .side { padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; }
-  .side.long { background:#064e3b; color:#a7f3d0; }
-  .side.short { background:#7f1d1d; color:#fecaca; }
-  .position-grid { display:grid; grid-template-columns:minmax(96px, 1fr) minmax(90px, 1fr); gap:5px 12px; font-size:0.9rem; }
-  .position-grid span, .muted-small { color:#94a3b8; }
-  .muted-small { margin-top:10px; font-size:0.78rem; word-break:break-word; }
+  .confidence { color:#94a3b8; display:block; font-size:0.78rem; margin-top:2px; }
+  .position-compact-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:8px 10px; font-size:0.88rem; }
+  .position-compact-grid span, .position-progress span, .muted-small { color:#94a3b8; display:block; font-size:0.78rem; }
+  .position-compact-grid b { color:#f8fafc; font-size:1rem; }
+  .positive-text { color:#86efac !important; }
+  .danger-text { color:#fca5a5 !important; }
+  .position-progress { margin-top:10px; display:grid; grid-template-columns:72px 1fr 42px; align-items:center; gap:8px; }
+  .progress-wrap { height:10px; background:#1e293b; border-radius:999px; overflow:hidden; }
+  .progress-fill { height:100%; background:#38bdf8; border-radius:999px; }
+  .progress-label { color:#f8fafc; font-size:0.82rem; font-weight:700; }
+  .position-footer { margin-top:10px; display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }
+  .muted-small { font-size:0.76rem; word-break:break-word; }
   @media (max-width: 640px) {
     .block-container { padding-left: 0.8rem; padding-right: 0.8rem; }
-    div[data-testid="stMetricValue"] { font-size: 1.05rem; }
-    .position-grid { grid-template-columns:1fr 1fr; font-size:0.82rem; }
+    .kpi-grid { grid-template-columns:repeat(2, minmax(0, 1fr)) !important; gap:8px; }
+    .kpi-card { min-height:58px; padding:0.5rem; }
+    .kpi-label { font-size:12px; }
+    .kpi-value { font-size:1.45rem; }
+    div[data-testid="stMetricValue"] { font-size: 1.25rem; }
+    .position-compact-grid { grid-template-columns:1fr 1fr; font-size:0.82rem; }
+    .position-progress { grid-template-columns:60px 1fr 36px; }
   }
 </style>
 """,
         unsafe_allow_html=True,
     )
 
-    st.title("Crypto Multi-Coin Scanner Dashboard V2")
+    st.title("Crypto Multi-Coin Scanner Dashboard V2.1")
     st.caption("Production Season 1 control center. Read-only: no Telegram sends, no API calls, no log writes, no auto trading.")
 
     with st.sidebar:
@@ -1283,97 +1698,6 @@ def _streamlit_app() -> None:
     logs = dashboard_log_timeline()
     daily_panel = daily_summary_panel(filtered)
 
-    st.markdown("### Production Overview")
-    st.markdown(
-        f"Scanner Status: {_badge(overview['status'])} &nbsp; "
-        f"Timezone: `{overview['timezone']}` &nbsp; "
-        f"Server Time: `{overview['server_time']}`",
-        unsafe_allow_html=True,
-    )
-    overview_cols = st.columns(4)
-    overview_items = [
-        ("Last Scan", overview["last_scan"]),
-        ("Next Scan", overview["next_scan"]),
-        ("Market Regime", overview["market_regime"]),
-        ("Active Positions", overview["active_positions"]),
-        ("Signals Today", overview["signals_today"]),
-        ("Win Rate 7D", _fmt_percent(overview["win_rate_7d"])),
-        ("Average RR", _format_metric(overview["average_rr"])),
-        ("Data Freshness", overview["stale_warning"]),
-    ]
-    for index, (label, value) in enumerate(overview_items):
-        overview_cols[index % 4].metric(label, _format_metric(value))
-
-    with st.expander("Active Positions", expanded=True):
-        if active.empty:
-            st.info("No active positions found in logs/signals.csv.")
-        else:
-            for _, row in active.iterrows():
-                _display_position_card(st, row)
-
-    with st.expander("Position Review", expanded=True):
-        st.caption("Advisory view only. Dashboard never opens, closes, or modifies positions.")
-        if reviews.empty:
-            st.success("No position review items from current data.")
-        else:
-            st.dataframe(reviews, use_container_width=True, hide_index=True)
-
-    with st.expander("Signal Funnel / Quality", expanded=True):
-        funnel_cols = st.columns(3)
-        for index, (label, value) in enumerate(funnel.items()):
-            funnel_cols[index % 3].metric(label, _format_metric(value))
-        st.caption("Missing granular scanner counters are shown as N/A instead of estimated.")
-
-    with st.expander("Performance: Today / 7 Days / 30 Days", expanded=True):
-        st.caption("Scanner and Signal Refiner are separated by source when source data exists.")
-        st.dataframe(perf, use_container_width=True, hide_index=True)
-
-    with st.expander("Scanner Health", expanded=True):
-        health_cols = st.columns(3)
-        for index, (label, value) in enumerate(health.items()):
-            health_cols[index % 3].metric(label, _format_metric(value))
-
-    with st.expander("Logs Timeline", expanded=True):
-        if logs.empty:
-            st.info("No readable scanner log found.")
-        else:
-            filter_cols = st.columns(5)
-            level_filter = filter_cols[0].multiselect("Level", sorted(logs["level"].dropna().unique().tolist()))
-            event_filter = filter_cols[1].multiselect("Event Type", sorted(logs["event_type"].dropna().unique().tolist()))
-            source_filter = filter_cols[2].multiselect("Source", sorted(logs["source"].dropna().unique().tolist()))
-            status_filter = filter_cols[3].multiselect("Approved / Rejected / Error", sorted(logs["status"].dropna().unique().tolist()))
-            symbol_filter = filter_cols[4].text_input("Symbol contains", "")
-            timeline = logs.copy()
-            if level_filter:
-                timeline = timeline[timeline["level"].isin(level_filter)]
-            if event_filter:
-                timeline = timeline[timeline["event_type"].isin(event_filter)]
-            if source_filter:
-                timeline = timeline[timeline["source"].isin(source_filter)]
-            if status_filter:
-                timeline = timeline[timeline["status"].isin(status_filter)]
-            if symbol_filter:
-                timeline = timeline[timeline["message"].str.contains(symbol_filter, case=False, na=False)]
-            st.dataframe(timeline[["timestamp", "level", "event_type", "status", "message"]].tail(120), use_container_width=True, hide_index=True)
-            with st.expander("Raw log lines"):
-                st.dataframe(timeline[["raw"]].tail(120), use_container_width=True, hide_index=True)
-
-    with st.expander("Daily Summary", expanded=True):
-        daily_cols = st.columns(3)
-        for index, (label, value) in enumerate(daily_panel.items()):
-            daily_cols[index % 3].metric(label, _format_metric(value))
-
-    metric_columns = st.columns(4)
-    for index, label in enumerate([
-        "Total sent signals", "Closed trades", "Win rate", "Net R",
-    ]):
-        value = kpis[label]
-        suffix = "%" if label == "Win rate" else ""
-        metric_columns[index].metric(label, f"{_format_metric(value)}{suffix}")
-    metric_columns = st.columns(4)
-    for index, label in enumerate(["Long win rate", "Short win rate", "TP1 hit rate", "SL hit rate"]):
-        metric_columns[index].metric(label, f"{_format_metric(kpis[label])}%")
-
     symbol_perf = performance_table(filtered, "symbol")
     tier_perf = performance_table(filtered, "watchlist_tier")
     session_perf = performance_table(filtered, "market_session")
@@ -1387,178 +1711,663 @@ def _streamlit_app() -> None:
     drawdown = drawdown_curve(filtered)
     monthly = monthly_performance(filtered)
     simulator = account_growth_simulator(filtered)
+    today_ts = _timestamp_series(filtered)
+    today_df = filtered[today_ts.dt.date == _now_utc().date()] if len(filtered) else filtered
+    today_closed = _closed(today_df)
+    today_wins = int((_series(today_closed, "result").astype(str).str.upper() == "WIN").sum()) if not today_closed.empty else 0
+    today_losses = int((_series(today_closed, "result").astype(str).str.upper() == "LOSS").sum()) if not today_closed.empty else 0
+    today_open = int((_series(today_df, "result").astype(str).str.upper() == "OPEN").sum()) if not today_df.empty else 0
+    average_rr = _numeric_mean(filtered, "risk_reward")
+    best_symbols = v2["top_symbols"]["symbol"].astype(str).head(6).tolist() if not v2["top_symbols"].empty and "symbol" in v2["top_symbols"].columns else []
+    worst_symbols = v2["bottom_symbols"]["symbol"].astype(str).head(6).tolist() if not v2["bottom_symbols"].empty and "symbol" in v2["bottom_symbols"].columns else []
 
-    with st.expander("Executive Summary", expanded=True):
-        col1, col2, col3 = st.columns(3)
-        col1.write(f"Best symbol by win rate: **{kpis['Best symbol']}**")
-        col1.write(f"Worst symbol by win rate: **{kpis['Worst symbol']}**")
-        col2.write(f"Best symbol by net R: **{kpis['Best symbol by net R']}**")
-        col2.write(f"Worst symbol by net R: **{kpis['Worst symbol by net R']}**")
-        col3.write(f"Best tier/session: **{kpis['Best tier']} / {kpis['Best session']}**")
-        col3.write(f"Worst tier/session: **{kpis['Worst tier']} / {kpis['Worst session']}**")
-        st.info("Analytics suggestion only. These observations do not auto-change config or strategy.")
-        for suggestion in analytics_suggestions(filtered):
-            st.write(f"- {suggestion}")
+    st.markdown(
+        f"Scanner {_badge(overview['status'])} &nbsp; "
+        f"Data {_badge('DATA STALE' if overview['stale_warning'] != 'N/A' else 'PASS')} &nbsp; "
+        f"Server Time: <b>{_fmt_dt(overview['server_time'])}</b>",
+        unsafe_allow_html=True,
+    )
 
-    with st.expander("Dashboard V3: Equity, PnL, Drawdown, Monthly", expanded=True):
-        cols = st.columns(4)
-        cols[0].metric("Cumulative Net R", _format_metric(kpis["Net R"]))
-        cols[1].metric("Max Drawdown R", f"{max_drawdown_r(filtered):.2f}R")
-        cols[2].metric("Closed Months", int(len(monthly)))
-        cols[3].metric("Simulator Risk", "1.0% / trade")
+    st.markdown("### Today's Performance")
+    _kpi_grid(
+        st,
+        [
+            ("Signals Today", int(len(today_df)), None),
+            ("Win", today_wins, "PASS" if today_wins else None),
+            ("Loss", today_losses, "FAIL" if today_losses else None),
+            ("Open", today_open, "ONLINE" if today_open else None),
+            ("Today's R", f"{_net_r(today_df):.2f}R", None),
+            ("Need Review", int(len(reviews)), "REVIEW" if len(reviews) else "PASS"),
+        ],
+        columns=3,
+    )
 
-        chart_left, chart_right = st.columns(2)
-        chart_left.write("Equity Curve: cumulative Net R over time")
-        chart_left.line_chart(curve.set_index("closed_at")["cumulative_r"] if not curve.empty else curve)
+    st.markdown("### Production KPI")
+    _kpi_grid(
+        st,
+        [
+            ("Total Signals", kpis["Total sent signals"], None),
+            ("Win Rate", f"{kpis['Win rate']:.1f}%", None),
+            ("Net R", f"{kpis['Net R']:.2f}R", None),
+            ("Closed Trades", kpis["Closed trades"], None),
+            ("Profit Factor", _profit_factor(filtered), None),
+            ("Average RR", _format_metric(average_rr), None),
+        ],
+        columns=3,
+    )
 
-        chart_right.write("Drawdown: R below previous equity peak")
-        chart_right.line_chart(drawdown.set_index("closed_at")["drawdown_r"] if not drawdown.empty else drawdown)
+    st.markdown("### Active Positions")
+    if active.empty:
+        st.info("No active positions found in logs/signals.csv.")
+    else:
+        for _, row in active.iterrows():
+            _display_position_card(st, row)
 
-        st.write("Daily PnL histogram")
-        bars = daily_pnl_bars(filtered)
-        if bars.empty:
-            st.dataframe(bars, use_container_width=True)
+    st.markdown("### Scanner Health")
+    _kpi_grid(
+        st,
+        [
+            ("Scanner", health["Process Status"], health["Process Status"]),
+            ("Database", health["Database Status"], health["Database Status"]),
+            ("Freshness", "STALE" if overview["stale_warning"] != "N/A" else "OK", "DATA STALE" if overview["stale_warning"] != "N/A" else "PASS"),
+            ("Last Scan", _fmt_dt(overview["last_scan"]), None),
+            ("Next Scan", _fmt_dt(overview["next_scan"]), None),
+            ("Latest Log", _fmt_dt(health["Latest Log Time"]), None),
+        ],
+        columns=3,
+    )
+
+    st.markdown("### Daily Summary")
+    _kpi_grid(
+        st,
+        [
+            ("Signals Today", int(len(today_df)), None),
+            ("Win/Loss/Open", f"{today_wins}/{today_losses}/{today_open}", None),
+            ("Today's R", f"{_net_r(today_df):.2f}R", None),
+            ("Need Review", int(len(reviews)), "REVIEW" if len(reviews) else "PASS"),
+            ("Scanner Health", health["Process Status"], health["Process Status"]),
+        ],
+        columns=5,
+    )
+
+    st.markdown("### Top Performing Symbols")
+    _symbol_badges(st, "Best performers", best_symbols, "positive")
+    st.markdown("### Top Losing Symbols")
+    _symbol_badges(st, "Weak performers", worst_symbols, "danger")
+
+    with st.expander("Position Review", expanded=False):
+        st.caption("Advisory view only. Dashboard never opens, closes, or modifies positions.")
+        if reviews.empty:
+            st.success("No position review items from current data.")
         else:
-            import matplotlib.pyplot as plt
+            st.dataframe(_format_time_columns(reviews), use_container_width=True, hide_index=True)
 
-            fig, ax = plt.subplots(figsize=(10, 3.5))
-            ax.bar(bars["date"].astype(str), bars["net_r"], color=bars["color"])
-            ax.axhline(0, color="#475569", linewidth=1)
-            ax.set_ylabel("Net R")
-            ax.set_xlabel("Date")
-            ax.tick_params(axis="x", rotation=45)
-            fig.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
+    with st.expander("Advanced Analytics", expanded=False):
+        st.markdown("#### Core Quality Metrics")
+        _kpi_grid(
+            st,
+            [
+                ("Long Win Rate", f"{kpis['Long win rate']:.1f}%", None),
+                ("Short Win Rate", f"{kpis['Short win rate']:.1f}%", None),
+                ("TP1 Hit Rate", f"{kpis['TP1 hit rate']:.1f}%", None),
+                ("SL Hit Rate", f"{kpis['SL hit rate']:.1f}%", None),
+                ("Rejected by RR", funnel["Rejected by RR"], None),
+                ("Rejected by Confidence", funnel["Rejected by Confidence"], None),
+                ("Outcome Pending", funnel["Outcome Pending"], None),
+                ("Candidates Found", funnel["Candidates Found"], None),
+            ],
+            columns=4,
+        )
 
-        st.write("Monthly Performance Summary")
-        st.dataframe(monthly, use_container_width=True)
-        st.write("Account Growth Simulator")
-        st.caption("Educational estimate using realized Net R and fixed 1% risk per trade. It does not account for fees, slippage, leverage liquidation, or compounding changes.")
-        st.dataframe(simulator, use_container_width=True)
+        st.markdown("#### Source Split")
+        st.caption("Scanner and Signal Refiner are separated by source when source data exists.")
+        st.dataframe(perf, use_container_width=True, hide_index=True)
 
-    with st.expander("Top Performers", expanded=True):
-        st.write("Top 10 symbols ranked by Net R, win rate, and trades.")
-        st.dataframe(v2["top_symbols"], use_container_width=True)
+        st.markdown("#### Performance 7D / 30D")
+        st.dataframe(perf[perf["window"].isin(["7 Days", "30 Days"])], use_container_width=True, hide_index=True)
 
-    with st.expander("Worst Performers", expanded=True):
-        st.write("Bottom 10 symbols ranked by Net R, win rate, and trades.")
-        st.dataframe(v2["bottom_symbols"], use_container_width=True)
+        with st.expander("Signal Funnel / Quality"):
+            st.dataframe(pd.DataFrame([funnel]), use_container_width=True, hide_index=True)
 
-    with st.expander("Warnings", expanded=True):
-        warnings = warning_table(filtered)
-        if warnings.empty:
-            st.success("No V2 weak-performance warnings for the current filters.")
-        else:
-            for warning in warnings["warning"].tolist():
-                st.warning(warning)
+        with st.expander("Logs Timeline"):
+            if logs.empty:
+                st.info("No readable scanner log found.")
+            else:
+                filter_cols = st.columns(5)
+                level_filter = filter_cols[0].multiselect("Level", sorted(logs["level"].dropna().unique().tolist()))
+                event_filter = filter_cols[1].multiselect("Event Type", sorted(logs["event_type"].dropna().unique().tolist()))
+                source_filter = filter_cols[2].multiselect("Source", sorted(logs["source"].dropna().unique().tolist()))
+                status_filter = filter_cols[3].multiselect("Approved / Rejected / Error", sorted(logs["status"].dropna().unique().tolist()))
+                symbol_filter = filter_cols[4].text_input("Symbol contains", "")
+                timeline = logs.copy()
+                if level_filter:
+                    timeline = timeline[timeline["level"].isin(level_filter)]
+                if event_filter:
+                    timeline = timeline[timeline["event_type"].isin(event_filter)]
+                if source_filter:
+                    timeline = timeline[timeline["source"].isin(source_filter)]
+                if status_filter:
+                    timeline = timeline[timeline["status"].isin(status_filter)]
+                if symbol_filter:
+                    timeline = timeline[timeline["message"].str.contains(symbol_filter, case=False, na=False)]
+                st.dataframe(_format_time_columns(timeline[["timestamp", "level", "event_type", "status", "message"]].tail(120)), use_container_width=True, hide_index=True)
+                with st.expander("Raw Logs"):
+                    st.dataframe(timeline[["raw"]].tail(120), use_container_width=True, hide_index=True)
 
-    with st.expander("Win/Loss Analytics", expanded=True):
-        left, right = st.columns(2)
-        daily = win_loss_by_day(filtered)
-        left.bar_chart(daily.set_index("date") if not daily.empty else daily)
-        net_daily = daily_net_r(filtered)
-        right.line_chart(net_daily.set_index("date")["net_r"] if not net_daily.empty else net_daily)
+        with st.expander("Scanner Health Details"):
+            health_view = pd.DataFrame([health])
+            st.dataframe(_format_time_columns(health_view), use_container_width=True, hide_index=True)
 
-    with st.expander("Drawdown Analytics"):
-        cols = st.columns(4)
-        for index, label in enumerate(["Avg max drawdown %", "Avg drawdown winners", "Avg drawdown losers", "Max drawdown ever"]):
-            cols[index].metric(label, _format_metric(kpis[label]))
-        left, right = st.columns(2)
-        left.bar_chart(symbol_perf.set_index("symbol")["avg_drawdown"] if not symbol_perf.empty else symbol_perf)
-        right.bar_chart(tier_perf.set_index("watchlist_tier")["avg_drawdown"] if not tier_perf.empty else tier_perf)
+        with st.expander("Executive Summary"):
+            col1, col2, col3 = st.columns(3)
+            col1.write(f"Best symbol by win rate: **{kpis['Best symbol']}**")
+            col1.write(f"Worst symbol by win rate: **{kpis['Worst symbol']}**")
+            col2.write(f"Best symbol by net R: **{kpis['Best symbol by net R']}**")
+            col2.write(f"Worst symbol by net R: **{kpis['Worst symbol by net R']}**")
+            col3.write(f"Best tier/session: **{kpis['Best tier']} / {kpis['Best session']}**")
+            col3.write(f"Worst tier/session: **{kpis['Worst tier']} / {kpis['Worst session']}**")
+            st.info("Analytics suggestion only. These observations do not auto-change config or strategy.")
+            for suggestion in analytics_suggestions(filtered):
+                st.write(f"- {suggestion}")
 
-    with st.expander("Symbol Analytics"):
-        left, right = st.columns(2)
-        left.bar_chart(symbol_perf.set_index("symbol")["win_rate"] if not symbol_perf.empty else symbol_perf)
-        right.bar_chart(symbol_perf.set_index("symbol")["net_r"] if not symbol_perf.empty else symbol_perf)
-        st.dataframe(symbol_perf, use_container_width=True)
+        with st.expander("Dashboard V3: Equity, PnL, Drawdown, Monthly"):
+            _kpi_grid(
+                st,
+                [
+                    ("Cumulative Net R", f"{kpis['Net R']:.2f}R", None),
+                    ("Max Drawdown R", f"{max_drawdown_r(filtered):.2f}R", None),
+                    ("Closed Months", int(len(monthly)), None),
+                    ("Simulator Risk", "1.0% / trade", None),
+                ],
+                columns=4,
+            )
+            chart_left, chart_right = st.columns(2)
+            chart_left.write("Equity Curve: cumulative Net R over time")
+            chart_left.line_chart(curve.set_index("closed_at")["cumulative_r"] if not curve.empty else curve)
+            chart_right.write("Drawdown: R below previous equity peak")
+            chart_right.line_chart(drawdown.set_index("closed_at")["drawdown_r"] if not drawdown.empty else drawdown)
+            st.write("Daily PnL histogram")
+            bars = daily_pnl_bars(filtered)
+            if bars.empty:
+                st.dataframe(bars, use_container_width=True)
+            else:
+                import matplotlib.pyplot as plt
 
-    with st.expander("Tier Analytics"):
-        left, right = st.columns(2)
-        left.bar_chart(tier_perf.set_index("watchlist_tier")["win_rate"] if not tier_perf.empty else tier_perf)
-        right.bar_chart(tier_perf.set_index("watchlist_tier")["net_r"] if not tier_perf.empty else tier_perf)
-        st.dataframe(tier_perf, use_container_width=True)
+                fig, ax = plt.subplots(figsize=(10, 3.5))
+                ax.bar(bars["date"].astype(str), bars["net_r"], color=bars["color"])
+                ax.axhline(0, color="#475569", linewidth=1)
+                ax.set_ylabel("Net R")
+                ax.set_xlabel("Date")
+                ax.tick_params(axis="x", rotation=45)
+                fig.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+            st.write("Monthly Performance Summary")
+            st.dataframe(monthly, use_container_width=True)
+            st.write("Account Growth Simulator")
+            st.caption("Educational estimate using realized Net R and fixed 1% risk per trade. It does not account for fees, slippage, leverage liquidation, or compounding changes.")
+            st.dataframe(simulator, use_container_width=True)
 
-    with st.expander("Session Analytics"):
-        left, right = st.columns(2)
-        left.bar_chart(session_perf.set_index("market_session")["win_rate"] if not session_perf.empty else session_perf)
-        right.bar_chart(session_perf.set_index("market_session")["net_r"] if not session_perf.empty else session_perf)
-        st.dataframe(session_perf, use_container_width=True)
+        with st.expander("Top / Worst Performer Tables"):
+            st.write("Top 10 symbols ranked by Net R, win rate, and trades.")
+            st.dataframe(v2["top_symbols"], use_container_width=True)
+            st.write("Bottom 10 symbols ranked by Net R, win rate, and trades.")
+            st.dataframe(v2["bottom_symbols"], use_container_width=True)
 
-    with st.expander("Long vs Short Analytics"):
-        left, right = st.columns(2)
-        left.bar_chart(side_perf.set_index("side")["win_rate"] if not side_perf.empty else side_perf)
-        right.bar_chart(side_perf.set_index("side")["net_r"] if not side_perf.empty else side_perf)
-        st.dataframe(side_perf, use_container_width=True)
+        with st.expander("Warnings"):
+            warnings = warning_table(filtered)
+            if warnings.empty:
+                st.success("No V2 weak-performance warnings for the current filters.")
+            else:
+                for warning in warnings["warning"].tolist():
+                    st.warning(warning)
 
-    with st.expander("Score / Confidence Analytics"):
-        left, right = st.columns(2)
-        left.bar_chart(score_perf.set_index("score_range")["win_rate"] if not score_perf.empty else score_perf)
-        right.bar_chart(confidence_perf.set_index("confidence_range")["win_rate"] if not confidence_perf.empty else confidence_perf)
-        st.write("Score bucket performance")
-        st.dataframe(score_perf, use_container_width=True)
-        st.write("Confidence bucket performance")
-        st.dataframe(confidence_perf, use_container_width=True)
+        with st.expander("Win/Loss Analytics"):
+            left, right = st.columns(2)
+            daily = win_loss_by_day(filtered)
+            left.bar_chart(daily.set_index("date") if not daily.empty else daily)
+            net_daily = daily_net_r(filtered)
+            right.line_chart(net_daily.set_index("date")["net_r"] if not net_daily.empty else net_daily)
 
-    with st.expander("TP/SL Analytics"):
-        st.bar_chart(distribution.set_index("target")["count"] if not distribution.empty else distribution)
-        cols = st.columns(4)
-        for index, label in enumerate(["TP1 hit rate", "TP2 hit rate", "SL hit rate", "Avg time to TP"]):
-            suffix = "%" if "rate" in label else " min"
-            value = kpis[label]
-            cols[index].metric(label, f"{_format_metric(value)}{suffix if value is not None else ''}")
+        with st.expander("Drawdown Analytics"):
+            _kpi_grid(
+                st,
+                [(label, _format_metric(kpis[label]), None) for label in ["Avg max drawdown %", "Avg drawdown winners", "Avg drawdown losers", "Max drawdown ever"]],
+                columns=4,
+            )
+            left, right = st.columns(2)
+            left.bar_chart(symbol_perf.set_index("symbol")["avg_drawdown"] if not symbol_perf.empty else symbol_perf)
+            right.bar_chart(tier_perf.set_index("watchlist_tier")["avg_drawdown"] if not tier_perf.empty else tier_perf)
 
-    with st.expander("External VIP Signal Analytics"):
-        external = external_summary(data.get("external_signals", pd.DataFrame()))
-        st.bar_chart(external.set_index("recommendation")["count"] if not external.empty else external)
-        st.dataframe(data.get("external_signals", pd.DataFrame()).tail(50), use_container_width=True)
+        with st.expander("Symbol Analytics"):
+            left, right = st.columns(2)
+            left.bar_chart(symbol_perf.set_index("symbol")["win_rate"] if not symbol_perf.empty else symbol_perf)
+            right.bar_chart(symbol_perf.set_index("symbol")["net_r"] if not symbol_perf.empty else symbol_perf)
+            st.dataframe(symbol_perf, use_container_width=True)
 
-    with st.expander("Position Manager Analytics"):
-        st.dataframe(data.get("position_management", pd.DataFrame()).tail(100), use_container_width=True)
-        st.write("Open positions")
-        st.dataframe(open_positions(filtered), use_container_width=True)
+        with st.expander("Tier Analytics"):
+            left, right = st.columns(2)
+            left.bar_chart(tier_perf.set_index("watchlist_tier")["win_rate"] if not tier_perf.empty else tier_perf)
+            right.bar_chart(tier_perf.set_index("watchlist_tier")["net_r"] if not tier_perf.empty else tier_perf)
+            st.dataframe(tier_perf, use_container_width=True)
 
-    with st.expander("Risk-Quality Views"):
-        st.write("High score but lost trades")
-        st.dataframe(quality["high_score_losses"].head(25), use_container_width=True)
-        st.write("Low score but won trades")
-        st.dataframe(quality["low_score_wins"].head(25), use_container_width=True)
-        st.write("High drawdown winners")
-        st.dataframe(quality["high_drawdown_winners"].head(25), use_container_width=True)
-        st.write("Fast SL trades")
-        st.dataframe(quality["fast_sl"].head(25), use_container_width=True)
-        st.write("Slow TP trades")
-        st.dataframe(quality["slow_tp"].head(25), use_container_width=True)
-        st.write("Symbols with repeated losses")
-        st.dataframe(quality["repeated_loss_symbols"].head(25), use_container_width=True)
-        st.write("Sessions with poor performance")
-        st.dataframe(quality["poor_sessions"].head(25), use_container_width=True)
-        st.write("Tier C risk review")
-        st.dataframe(quality["tier_c"].head(50), use_container_width=True)
+        with st.expander("Session Analytics"):
+            left, right = st.columns(2)
+            left.bar_chart(session_perf.set_index("market_session")["win_rate"] if not session_perf.empty else session_perf)
+            right.bar_chart(session_perf.set_index("market_session")["net_r"] if not session_perf.empty else session_perf)
+            st.dataframe(session_perf, use_container_width=True)
 
-    with st.expander("Recent Sent Signals"):
-        st.dataframe(latest_signals(filtered, 50), use_container_width=True)
+        with st.expander("Long vs Short Analytics"):
+            left, right = st.columns(2)
+            left.bar_chart(side_perf.set_index("side")["win_rate"] if not side_perf.empty else side_perf)
+            right.bar_chart(side_perf.set_index("side")["net_r"] if not side_perf.empty else side_perf)
+            st.dataframe(side_perf, use_container_width=True)
 
-    with st.expander("Closed Trades"):
-        st.dataframe(recent_events(filtered, 50), use_container_width=True)
+        with st.expander("Score / Confidence Analytics"):
+            left, right = st.columns(2)
+            left.bar_chart(score_perf.set_index("score_range")["win_rate"] if not score_perf.empty else score_perf)
+            right.bar_chart(confidence_perf.set_index("confidence_range")["win_rate"] if not confidence_perf.empty else confidence_perf)
+            st.write("Score bucket performance")
+            st.dataframe(score_perf, use_container_width=True)
+            st.write("Confidence bucket performance")
+            st.dataframe(confidence_perf, use_container_width=True)
 
-    with st.expander("Full Analytics / CSV Exports"):
-        st.caption("Read-only generated analytics. Telegram sends only the executive summary.")
-        report_html = REPORTS_DIR / "report.html"
-        if report_html.exists():
-            st.write(f"Full static report: `{report_html}`")
-        analytics_files = sorted(LOGS_DIR.glob("*.csv"))
-        if not analytics_files:
-            st.info("No CSV exports found yet. Run performance_report.py first.")
-        for csv_path in analytics_files:
-            with st.container():
-                st.write(f"CSV: `{csv_path.name}`")
-                preview = load_csv_safely(csv_path)
-                if preview.empty:
-                    st.dataframe(preview, use_container_width=True)
-                else:
-                    st.dataframe(preview.tail(50), use_container_width=True)
+        with st.expander("TP/SL Analytics"):
+            st.bar_chart(distribution.set_index("target")["count"] if not distribution.empty else distribution)
+            _kpi_grid(
+                st,
+                [
+                    ("TP1 Hit Rate", f"{kpis['TP1 hit rate']:.1f}%", None),
+                    ("TP2 Hit Rate", f"{kpis['TP2 hit rate']:.1f}%", None),
+                    ("SL Hit Rate", f"{kpis['SL hit rate']:.1f}%", None),
+                    ("Avg Time to TP", f"{_format_metric(kpis['Avg time to TP'])} min", None),
+                ],
+                columns=4,
+            )
+
+        with st.expander("External VIP Signal Analytics"):
+            external = external_summary(data.get("external_signals", pd.DataFrame()))
+            st.bar_chart(external.set_index("recommendation")["count"] if not external.empty else external)
+            st.dataframe(data.get("external_signals", pd.DataFrame()).tail(50), use_container_width=True)
+
+        with st.expander("Position Manager Analytics"):
+            st.dataframe(data.get("position_management", pd.DataFrame()).tail(100), use_container_width=True)
+            st.write("Open positions")
+            st.dataframe(_format_time_columns(open_positions(filtered)), use_container_width=True)
+
+        with st.expander("Risk-Quality Views"):
+            st.write("High score but lost trades")
+            st.dataframe(quality["high_score_losses"].head(25), use_container_width=True)
+            st.write("Low score but won trades")
+            st.dataframe(quality["low_score_wins"].head(25), use_container_width=True)
+            st.write("High drawdown winners")
+            st.dataframe(quality["high_drawdown_winners"].head(25), use_container_width=True)
+            st.write("Fast SL trades")
+            st.dataframe(quality["fast_sl"].head(25), use_container_width=True)
+            st.write("Slow TP trades")
+            st.dataframe(quality["slow_tp"].head(25), use_container_width=True)
+            st.write("Symbols with repeated losses")
+            st.dataframe(quality["repeated_loss_symbols"].head(25), use_container_width=True)
+            st.write("Sessions with poor performance")
+            st.dataframe(quality["poor_sessions"].head(25), use_container_width=True)
+            st.write("Tier C risk review")
+            st.dataframe(quality["tier_c"].head(50), use_container_width=True)
+
+        with st.expander("Recent Sent Signals"):
+            st.dataframe(_format_time_columns(latest_signals(filtered, 50)), use_container_width=True)
+
+        with st.expander("Closed Trades"):
+            st.dataframe(_format_time_columns(recent_events(filtered, 50)), use_container_width=True)
+
+        with st.expander("Full Analytics / CSV Exports"):
+            st.caption("Read-only generated analytics. Telegram sends only the executive summary.")
+            report_html = REPORTS_DIR / "report.html"
+            if report_html.exists():
+                st.write(f"Full static report: `{report_html}`")
+            analytics_files = sorted(LOGS_DIR.glob("*.csv"))
+            if not analytics_files:
+                st.info("No CSV exports found yet. Run performance_report.py first.")
+            for csv_path in analytics_files:
+                with st.container():
+                    st.write(f"CSV: `{csv_path.name}`")
+                    preview = load_csv_safely(csv_path)
+                    if preview.empty:
+                        st.dataframe(preview, use_container_width=True)
+                    else:
+                        st.dataframe(_format_time_columns(preview.tail(50)), use_container_width=True)
+
+
+def _streamlit_app() -> None:
+    try:
+        import streamlit as st
+    except ModuleNotFoundError as exc:
+        raise SystemExit("Streamlit is not installed. Run: pip install -r requirements.txt") from exc
+
+    st.set_page_config(page_title="Crypto Scanner — Production Control Center", layout="wide")
+
+    @st.cache_data(ttl=30, show_spinner=False)
+    def cached_dashboard_data() -> dict[str, pd.DataFrame]:
+        return load_dashboard_data()
+
+    @st.cache_data(ttl=20, show_spinner=False)
+    def cached_execution_truth() -> dict[str, Any]:
+        return load_execution_truth_snapshot()
+
+    @st.cache_data(ttl=15, show_spinner=False)
+    def cached_operational_health() -> tuple[dict[str, Any], dict[str, Any]]:
+        status_snapshot = scanner_status_snapshot()
+        return status_snapshot, health_snapshot(status_snapshot=status_snapshot)
+
+    @st.cache_data(ttl=15, show_spinner=False)
+    def cached_service_states() -> dict[str, str]:
+        return {
+            "Scanner": _systemctl_state("crypto-scanner.service") or "UNKNOWN",
+            "Outcome checker": _systemctl_state("crypto-outcome-checker.service") or "UNKNOWN",
+            "Position watcher": _systemctl_state("crypto-position-watcher.service") or "UNKNOWN",
+            "Execution timer": _systemctl_state("crypto-binance-execution-truth.timer") or "UNKNOWN",
+            "Execution service": _systemctl_state("crypto-binance-execution-truth.service") or "UNKNOWN",
+        }
+
+    st.markdown(
+        """
+<style>
+  .block-container { padding-top: 3.35rem; padding-bottom: 2rem; max-width: 1180px; }
+  header[data-testid="stHeader"] { height: 2rem; }
+  div[data-testid="stVerticalBlock"] { gap:.55rem; }
+  h1 { font-size: 1.35rem !important; margin: 0 !important; }
+  h2 { font-size: 1.06rem !important; margin: .85rem 0 .35rem !important; }
+  h3 { font-size: .95rem !important; margin: .55rem 0 .3rem !important; }
+  .hero { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin:.1rem 0 .65rem; }
+  .hero-title { font-size:1.42rem; font-weight:800; line-height:1.1; }
+  .hero-subtitle { color:#94a3b8; font-size:.82rem; margin-top:3px; }
+  .kpi-grid { display:grid; grid-template-columns:repeat(var(--desktop-cols), minmax(0, 1fr)); gap:8px; margin:.35rem 0 .8rem; }
+  .kpi-card { background:color-mix(in srgb, var(--background-color) 92%, #64748b 8%); border:1px solid rgba(148,163,184,.22); border-radius:10px; padding:.58rem .68rem; min-height:64px; overflow:hidden; }
+  .kpi-label { color:#94a3b8; font-size:.76rem; line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .kpi-value { font-size:1.42rem; font-weight:780; line-height:1.12; margin-top:5px; overflow-wrap:anywhere; }
+  .kpi-badge { margin-top:4px; min-height:16px; }
+  .badge { display:inline-block; padding:.13rem .45rem; border-radius:999px; font-size:.68rem; font-weight:800; vertical-align:middle; }
+  .badge.positive { background:rgba(16,185,129,.17); color:#34d399; }
+  .badge.warning { background:rgba(245,158,11,.17); color:#fbbf24; }
+  .badge.danger { background:rgba(239,68,68,.17); color:#f87171; }
+  .badge.neutral { background:rgba(100,116,139,.18); color:#94a3b8; }
+  .position-card,.signal-card { border:1px solid rgba(148,163,184,.22); border-radius:10px; padding:.65rem .72rem; margin-bottom:8px; background:color-mix(in srgb, var(--background-color) 94%, #64748b 6%); }
+  .position-card { border-left:4px solid #475569; }
+  .position-head,.signal-head { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; margin-bottom:8px; }
+  .confidence,.signal-time,.muted-small { color:#94a3b8; display:block; font-size:.72rem; margin-top:2px; }
+  .position-compact-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px 10px; }
+  .position-compact-grid span,.position-progress span,.signal-grid span { color:#94a3b8; display:block; font-size:.7rem; }
+  .position-compact-grid b,.signal-grid b { font-size:.9rem; }
+  .position-progress { margin-top:8px; display:grid; grid-template-columns:64px 1fr 38px; align-items:center; gap:7px; }
+  .progress-wrap { height:8px; background:rgba(100,116,139,.25); border-radius:999px; overflow:hidden; }
+  .progress-fill { height:100%; background:#38bdf8; border-radius:999px; }
+  .progress-label { font-size:.74rem; font-weight:700; }
+  .position-footer { margin-top:8px; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  .signal-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+  .positive-text { color:#34d399 !important; } .danger-text { color:#f87171 !important; }
+  div[data-testid="stSegmentedControl"] { margin-bottom:.35rem; }
+  div[data-testid="stDataFrame"] { font-size:.78rem; }
+  @media (max-width:640px) {
+    .block-container { padding:3.25rem .7rem 1.4rem; }
+    .hero-title { font-size:1.2rem; }
+    .hero-subtitle { font-size:.74rem; }
+    .kpi-grid { grid-template-columns:repeat(2,minmax(0,1fr)) !important; gap:7px; }
+    .kpi-card { min-height:57px; padding:.5rem; }
+    .kpi-label { font-size:.7rem; }
+    .kpi-value { font-size:1.17rem; }
+    .position-compact-grid { grid-template-columns:1fr 1fr; }
+    .signal-grid { grid-template-columns:1fr 1fr 1.25fr; }
+    div[data-testid="stButtonGroup"] { width:100% !important; }
+    div[data-testid="stButtonGroup"] div[role="radiogroup"] { display:grid !important; grid-template-columns:repeat(4,minmax(0,1fr)); width:100% !important; }
+    div[data-testid="stButtonGroup"] button[role="radio"] { min-width:0 !important; width:100%; padding-left:.2rem !important; padding-right:.2rem !important; }
+    div[data-testid="stButtonGroup"] button[role="radio"] p { font-size:.56rem !important; }
+  }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+    data = cached_dashboard_data()
+    sent = data["sent"]
+    scanner_snapshot, health = cached_operational_health()
+    overview = overview_metrics(data, status_snapshot=scanner_snapshot)
+    execution = cached_execution_truth()
+    status = overview["status"]
+    st.markdown(
+        "<div class='hero'><div>"
+        "<div class='hero-title'>Crypto Scanner</div>"
+        "<div class='hero-subtitle'>Production Season 1 · Read-only control center</div>"
+        f"</div><div>{_badge(status)}</div></div>",
+        unsafe_allow_html=True,
+    )
+    view = st.segmented_control(
+        "View",
+        ["HOME", "SIGNALS", "PERF", "SYSTEM"],
+        default="HOME",
+        label_visibility="collapsed",
+        width="stretch",
+    ) or "HOME"
+
+    filtered = sent
+    if view in {"SIGNALS", "PERF"}:
+        with st.sidebar:
+            st.header("Filters")
+            timestamps = _timestamp_series(sent).dropna()
+            local_dates = timestamps.dt.tz_convert(DISPLAY_TZ).dt.date if not timestamps.empty else pd.Series(dtype=object)
+            min_date = local_dates.min() if not local_dates.empty else None
+            max_date = local_dates.max() if not local_dates.empty else None
+            selected_range = st.date_input(
+                "Date range",
+                value=(min_date, max_date) if min_date and max_date else ((_now_utc().astimezone(DISPLAY_TZ).date(),) * 2),
+            )
+            start_date = end_date = None
+            if isinstance(selected_range, tuple) and len(selected_range) == 2:
+                start_date, end_date = selected_range
+            symbols = st.multiselect("Symbol", sorted(sent["symbol"].dropna().unique().tolist()) if "symbol" in sent.columns else [])
+            sides = st.multiselect("Direction", ["LONG", "SHORT"])
+            results = st.multiselect("Result", ["WIN", "LOSS", "OPEN"])
+            source_values = sorted(sent["source"].dropna().astype(str).replace("", "Unknown").unique().tolist()) if "source" in sent.columns else []
+            sources = st.multiselect("Source", ["All", *source_values], default=["All"])
+        filtered = apply_filters(
+            sent,
+            start_date,
+            end_date,
+            symbols,
+            [],
+            [],
+            sides,
+            sources,
+            results,
+            [],
+            (0, 100),
+            (0, 100),
+        )
+        filtered = ensure_score_buckets(filtered)
+
+    if view == "HOME":
+        today_df = _local_day_frame(sent)
+        today_closed = _closed(today_df)
+        wins = int(_series(today_closed, "result").astype(str).str.upper().eq("WIN").sum())
+        losses = int(_series(today_closed, "result").astype(str).str.upper().eq("LOSS").sum())
+        active = active_positions(sent)
+
+        st.markdown("## Status")
+        _kpi_grid(
+            st,
+            [
+                ("Last Scan", _fmt_time(overview["last_scan"]), None),
+                ("Next Scan", _fmt_time(overview["next_scan"]), None),
+                ("Timezone", DISPLAY_TZ_LABEL, None),
+                ("Data", "STALE" if overview["stale_warning"] != "N/A" else "FRESH", "WARNING" if overview["stale_warning"] != "N/A" else "HEALTHY"),
+            ],
+            columns=4,
+        )
+        st.markdown("## Today")
+        _kpi_grid(
+            st,
+            [
+                ("Signals", len(today_df), None),
+                ("Wins", wins, "WIN" if wins else None),
+                ("Losses", losses, "LOSS" if losses else None),
+                ("Open", len(active), "ONLINE" if len(active) else None),
+            ],
+            columns=4,
+        )
+        st.markdown("## Execution Truth")
+        _kpi_grid(
+            st,
+            [
+                ("Matched", execution.get("matched") if execution.get("matched") is not None else "Unavailable", None),
+                ("Authoritative", execution.get("authoritative_n") if execution.get("authoritative_n") is not None else "Unavailable", None),
+                ("Execution Net R", _execution_value(execution, "execution_net_r", "R"), None),
+                ("Execution PnL", _execution_value(execution, "execution_pnl_usdt", " USDT"), None),
+            ],
+            columns=4,
+        )
+        st.markdown("## Collector Health")
+        _kpi_grid(
+            st,
+            [
+                ("Collector", _health_badge_value(execution), _health_badge_value(execution)),
+                ("Last Sync", _relative_time(execution.get("last_success_utc")), None),
+                ("INVALID", execution.get("invalid") if execution.get("invalid") is not None else "Unavailable", "INVALID" if execution.get("invalid") else None),
+                ("AMBIGUOUS", execution.get("ambiguous") if execution.get("ambiguous") is not None else "Unavailable", "AMBIGUOUS" if execution.get("ambiguous") else None),
+            ],
+            columns=4,
+        )
+        if not execution.get("available"):
+            st.caption("Execution Truth: waiting for readable collector artifacts.")
+        st.markdown("## Recent Signals")
+        _display_signal_cards(st, sent, execution.get("rows", []), limit=8)
+        with st.expander(f"Open Positions · {len(active)}"):
+            if active.empty:
+                st.info("No open positions.")
+            else:
+                for _, row in active.iterrows():
+                    _display_position_card(st, row)
+
+    elif view == "SIGNALS":
+        st.markdown("## Recent Signals")
+        st.caption(f"{len(filtered)} signals match the current filters. Times shown in {DISPLAY_TZ_LABEL}.")
+        _display_signal_cards(st, filtered, execution.get("rows", []), limit=25)
+        with st.expander("Technical details"):
+            columns = [
+                name for name in ["timestamp", "symbol", "side", "result", "hit_target", "setup_strength", "confidence", "risk_reward", "entry", "stop_loss", "tp1", "tp2", "closed_at"]
+                if name in filtered.columns
+            ]
+            st.dataframe(_format_time_columns(filtered[columns].tail(100)), width="stretch", hide_index=True)
+
+    elif view == "PERF":
+        kpis = dashboard_kpis(filtered)
+        closed = _closed(filtered)
+        st.markdown("## Modeled Scanner Performance")
+        st.caption(f"Modeled scanner outcomes · sample size {len(closed)} closed trades")
+        _kpi_grid(
+            st,
+            [
+                ("Closed", len(closed), None),
+                ("Win Rate", f"{kpis['Win rate']:.1f}%", None),
+                ("Net R", f"{kpis['Net R']:+.2f}R", None),
+                ("Profit Factor", _profit_factor(filtered), None),
+            ],
+            columns=4,
+        )
+        st.markdown("## Authoritative Execution Performance")
+        authoritative_n = execution.get("authoritative_n")
+        st.caption(
+            "Final execution PnL excludes funding and other adjustments · "
+            + (f"sample size {authoritative_n}" if authoritative_n is not None else "sample unavailable")
+        )
+        _kpi_grid(
+            st,
+            [
+                ("Eligible N", authoritative_n if authoritative_n is not None else "Unavailable", None),
+                ("Gross Realized", _execution_value(execution, "gross_realized_pnl_usdt", " USDT"), None),
+                ("Commission", _execution_value(execution, "commission_usdt", " USDT"), None),
+                ("Execution PnL", _execution_value(execution, "execution_pnl_usdt", " USDT"), None),
+                ("Gross R", _execution_value(execution, "gross_r", "R"), None),
+                ("Execution Net R", _execution_value(execution, "execution_net_r", "R"), None),
+            ],
+            columns=3,
+        )
+        if not authoritative_n:
+            st.info("Collecting execution evidence")
+        st.markdown("## Provisional Funding View")
+        st.markdown(_badge("PROVISIONAL"), unsafe_allow_html=True)
+        st.caption("Funding-adjusted values are observational and are not presented as final execution performance.")
+        _kpi_grid(
+            st,
+            [
+                ("Funding Rows", execution.get("funding_rows") if execution.get("funding_rows") is not None else "Unavailable", "PROVISIONAL"),
+                ("Observed Funding", _signed_number(execution.get("funding_usdt"), " USDT"), "PROVISIONAL"),
+                ("Funding-adjusted PnL", _signed_number(execution.get("funding_adjusted_pnl_usdt"), " USDT"), "PROVISIONAL"),
+            ],
+            columns=3,
+        )
+        with st.expander("Modeled analytics"):
+            curve = equity_curve(filtered)
+            drawdown = drawdown_curve(filtered)
+            left, right = st.columns(2)
+            left.write("Cumulative modeled Net R")
+            if curve.empty:
+                left.info("No closed trades.")
+            else:
+                left.line_chart(curve.set_index("closed_at")["cumulative_r"])
+            right.write("Modeled drawdown")
+            if drawdown.empty:
+                right.info("No closed trades.")
+            else:
+                right.line_chart(drawdown.set_index("closed_at")["drawdown_r"])
+            st.dataframe(performance_windows(filtered)["performance"], width="stretch", hide_index=True)
+
+    else:
+        services = cached_service_states()
+        st.markdown("## Services")
+        _kpi_grid(st, [(name, value, value) for name, value in services.items()], columns=3)
+        st.markdown("## Scanner Diagnostics")
+        _kpi_grid(
+            st,
+            [
+                ("Server UTC", _fmt_utc_compact(overview["server_time"]), None),
+                ("Last Scan UTC", _fmt_utc_compact(overview["last_scan"]), None),
+                ("Next Scan UTC", _fmt_utc_compact(overview["next_scan"]), None),
+                ("Latest Log UTC", _fmt_utc_compact(health["Latest Log Time"]), None),
+                ("Data Age", f"{overview['data_age_minutes']} min" if overview["data_age_minutes"] is not None else "Unavailable", None),
+                ("Disk Usage", health.get("Disk Usage", "Unavailable"), None),
+            ],
+            columns=3,
+        )
+        with st.expander("Execution Truth diagnostics", expanded=True):
+            diagnostic = {
+                "Collector health": execution.get("collector_health"),
+                "Last success UTC": execution.get("last_success_utc"),
+                "Last success age seconds": execution.get("last_success_age_seconds"),
+                "High-water UTC": execution.get("high_water_utc"),
+                "High-water age seconds": execution.get("state_age_seconds"),
+                "Prospective boundary": execution.get("boundary"),
+                "Lifecycle provenance": execution.get("provenance"),
+                "Pending reconciliation": execution.get("pending_reconciliation"),
+                "INVALID": execution.get("invalid"),
+                "AMBIGUOUS": execution.get("ambiguous"),
+                "Artifacts": execution.get("artifacts"),
+                "Diagnostic message": execution.get("message"),
+            }
+            st.json(diagnostic)
+            if execution.get("checks"):
+                st.dataframe(
+                    pd.DataFrame(
+                        [{"check": name, **value} for name, value in execution["checks"].items()]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+        logs = dashboard_log_timeline()
+        with st.expander("Recent system events"):
+            if logs.empty:
+                st.info("No readable scanner log found.")
+            else:
+                st.dataframe(logs[["timestamp", "level", "event_type", "status", "message"]].tail(100), width="stretch", hide_index=True)
+        with st.expander("Raw scanner health"):
+            st.json(health)
 
 
 def _table_html(df: pd.DataFrame) -> str:
@@ -1671,4 +2480,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
