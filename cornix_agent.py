@@ -10,6 +10,7 @@ already scored.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -20,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from requests import Timeout
-from typing import Any
+from typing import Any, Callable
 
 import matplotlib
 
@@ -35,7 +36,12 @@ from urllib3.util.retry import Retry
 from core.btc_regime_filter import detect_btc_regime
 from core.cross_scan_exposure_shadow import (
     CrossScanExposureShadowLogger,
+    ExposureState,
+    OpenExposure,
     ShadowRule,
+    load_open_exposure_state,
+    pair_return_correlation,
+    signal_key as cross_scan_signal_key,
     timestamped_close_series,
 )
 from core.entry_timing_engine import EntryTimingEngine, EntryTimingLogger
@@ -44,6 +50,14 @@ from core.market_exhaustion_engine import (
     MarketExhaustionConfig,
     MarketExhaustionShadowLogger,
     evaluate_market_exhaustion,
+)
+from core.research_telemetry import (
+    CandidateSnapshot,
+    FailOpenResearchTelemetry,
+    PreCandidateObservation,
+    ShadowDecision as ResearchShadowDecision,
+    classify_decision as classify_research_decision,
+    make_run_id as make_research_run_id,
 )
 from core.setup_strength_prospective_shadow import SetupStrengthProspectiveShadowLogger, classify_signal_setup_strength
 from core.sr_trade_weight_gate import SRGateConfig, SRTradeWeightShadowLogger, evaluate_sr_trade_weight
@@ -70,6 +84,7 @@ SETUP_STRENGTH_PROSPECTIVE_SHADOW_JOURNAL = LOG_DIR / "setup_strength_prospectiv
 CROSS_SCAN_EXPOSURE_SHADOW_JOURNAL = LOG_DIR / "cross_scan_exposure_shadow_v1.csv"
 CROSS_SCAN_EXPOSURE_SHADOW_STATE = LOG_DIR / "cross_scan_exposure_shadow_v1.state.json"
 BINANCE_EXECUTION_TRUTH_JOURNAL = LOG_DIR / "binance_execution_truth_v1.csv"
+RESEARCH_TELEMETRY_DB = BASE_DIR / "research" / "scanner_research_v1.db"
 SIGNAL_VERSION = "internal-lab-v2"
 
 LOG_DIR.mkdir(exist_ok=True)
@@ -435,6 +450,11 @@ class TradeSignal:
     risk_mode: str = "normal"
     btc_regime_notes: str = ""
     setup_strength: int | None = None
+    closed_candle_time_utc: str = ""
+    research_features: dict[str, Any] = field(default_factory=dict)
+    research_market: dict[str, Any] = field(default_factory=dict)
+    research_shadows: list[ResearchShadowDecision] = field(default_factory=list)
+    research_exposure: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -685,7 +705,23 @@ class SignalScorer:
         self.regime_detector = regime_detector
         self.liquidation_context = LiquidationContextFilter(config)
 
-    def score(self, symbol: str, df_1h: pd.DataFrame, df_15m: pd.DataFrame, fear_greed: int | None = None, df_htf: pd.DataFrame | None = None) -> TradeSignal | None:
+    def score(
+        self,
+        symbol: str,
+        df_1h: pd.DataFrame,
+        df_15m: pd.DataFrame,
+        fear_greed: int | None = None,
+        df_htf: pd.DataFrame | None = None,
+        observation_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> TradeSignal | None:
+        def observe(category: str, **values: Any) -> None:
+            if observation_callback is None:
+                return
+            try:
+                observation_callback(category, values)
+            except Exception as exc:
+                LOGGER.warning("Pre-candidate telemetry callback failed open for %s: %s", symbol, exc)
+
         watchlist_tier = self.config.watchlist_tiers.get(symbol, "B")
         latest_1h = df_1h.iloc[-1]
         latest_15m = df_15m.iloc[-1]
@@ -705,6 +741,12 @@ class SignalScorer:
         volume_sma = float(latest_1h["volume_sma20"])
         volume_ratio = float(latest_1h["volume"] / volume_sma) if volume_sma > 0 else 0.0
         if math.isnan(atr) or atr <= 0:
+            observe(
+                "INVALID_ATR", stage="INDICATOR_VALIDATION", reason="atr_missing_nonfinite_or_nonpositive",
+                scan_candle_utc=latest_1h.get("close_time"), rsi=latest_1h.get("rsi14"), mfi=mfi,
+                atr=atr, trend_1h=regime.name, trend_4h=htf_regime, session=market_session,
+                atr_pct=atr_pct, volume_ratio=volume_ratio,
+            )
             return None
 
         if self._is_no_trade(regime.name, volume_ratio, atr_pct):
@@ -714,6 +756,12 @@ class SignalScorer:
                 regime.name,
                 volume_ratio,
                 atr_pct,
+            )
+            observe(
+                "REGIME_NO_TRADE", stage="REGIME_FILTER", reason="regime_volume_atr_no_trade",
+                scan_candle_utc=latest_1h.get("close_time"), rsi=latest_1h.get("rsi14"), mfi=mfi,
+                atr=atr, trend_1h=regime.name, trend_4h=htf_regime, session=market_session,
+                atr_pct=atr_pct, volume_ratio=volume_ratio,
             )
             return None
 
@@ -808,6 +856,13 @@ class SignalScorer:
             }
 
         if long_score < 1 and short_score < 1:
+            observe(
+                "BELOW_DIRECTIONAL_THRESHOLD", stage="DIRECTION_SCORING",
+                reason="both_directional_scores_below_one", scan_candle_utc=latest_1h.get("close_time"),
+                score_long=long_score, score_short=short_score, rsi=latest_1h.get("rsi14"), mfi=mfi,
+                atr=atr, trend_1h=regime.name, trend_4h=htf_regime, session=market_session,
+                atr_pct=atr_pct, volume_ratio=volume_ratio,
+            )
             return None
 
         direction = "LONG" if long_score >= short_score else "SHORT"
@@ -1707,6 +1762,13 @@ class AgentRunner:
         self.market_exhaustion_logger = MarketExhaustionShadowLogger(MARKET_EXHAUSTION_SHADOW_JOURNAL)
         self.cross_scan_exposure_shadow_logger: CrossScanExposureShadowLogger | None = None
         self.cross_scan_price_history: dict[str, pd.Series] = {}
+        self.research_correlation_rule = ShadowRule(
+            correlation_threshold=env_float("CROSS_SCAN_EXPOSURE_CORRELATION_THRESHOLD", 0.75),
+            correlation_lookback_bars=env_int("CROSS_SCAN_EXPOSURE_LOOKBACK_BARS", 72),
+            correlation_min_observations=env_int("CROSS_SCAN_EXPOSURE_MIN_OBSERVATIONS", 48),
+            max_correlated_open_positions=env_int("CROSS_SCAN_EXPOSURE_MAX_OPEN", 1),
+            stale_after_hours=env_float("CROSS_SCAN_EXPOSURE_STALE_HOURS", 24.0),
+        )
         if env_bool("CROSS_SCAN_EXPOSURE_SHADOW_ENABLED", True):
             try:
                 self.cross_scan_exposure_shadow_logger = CrossScanExposureShadowLogger(
@@ -1714,13 +1776,7 @@ class AgentRunner:
                     CROSS_SCAN_EXPOSURE_SHADOW_STATE,
                     SIGNAL_JOURNAL,
                     execution_path=BINANCE_EXECUTION_TRUTH_JOURNAL,
-                    rule=ShadowRule(
-                        correlation_threshold=env_float("CROSS_SCAN_EXPOSURE_CORRELATION_THRESHOLD", 0.75),
-                        correlation_lookback_bars=env_int("CROSS_SCAN_EXPOSURE_LOOKBACK_BARS", 72),
-                        correlation_min_observations=env_int("CROSS_SCAN_EXPOSURE_MIN_OBSERVATIONS", 48),
-                        max_correlated_open_positions=env_int("CROSS_SCAN_EXPOSURE_MAX_OPEN", 1),
-                        stale_after_hours=env_float("CROSS_SCAN_EXPOSURE_STALE_HOURS", 24.0),
-                    ),
+                    rule=self.research_correlation_rule,
                     prospective_start_timestamp_utc=(
                         os.getenv("CROSS_SCAN_EXPOSURE_SHADOW_START_UTC", "").strip() or None
                     ),
@@ -1729,6 +1785,20 @@ class AgentRunner:
                 LOGGER.warning("Cross-scan exposure shadow disabled after logger init failure: %s", exc)
         self.state = self._load_state()
         self.fear_greed_value: int | None = None
+        research_path = Path(os.getenv("RESEARCH_TELEMETRY_DB", str(RESEARCH_TELEMETRY_DB)))
+        self.research_telemetry = FailOpenResearchTelemetry(
+            research_path,
+            enabled=env_bool("RESEARCH_TELEMETRY_ENABLED", True),
+        )
+        self.research_run_id = ""
+        self.research_scan_started_at_utc = ""
+        self.research_scan_candle_utc = ""
+        self.research_exposure_history = pd.DataFrame()
+        self.research_cross_scan_state = ExposureState((), ())
+        self.research_correlation_state_error = ""
+        self.research_same_scan_counts = {"LONG": 0, "SHORT": 0}
+        self.research_same_scan_sent_counts = {"LONG": 0, "SHORT": 0}
+        self.research_same_scan_sent_signals: list[OpenExposure] = []
 
     def _load_state(self) -> dict[str, Any]:
         if not STATE_FILE.exists():
@@ -1825,6 +1895,29 @@ class AgentRunner:
         self.maybe_send_daily_summary()
         self.ai_commentary.reset_run_budget()
         self.cross_scan_price_history = {}
+        self.research_scan_started_at_utc = datetime.now(timezone.utc).isoformat()
+        scan_candle = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+        self.research_scan_candle_utc = scan_candle
+        self.research_run_id = make_research_run_id(self.research_scan_started_at_utc, scan_candle)
+        self.research_telemetry.start_run(self.research_run_id, self.research_scan_started_at_utc, scan_candle)
+        self.research_same_scan_counts = {"LONG": 0, "SHORT": 0}
+        self.research_same_scan_sent_counts = {"LONG": 0, "SHORT": 0}
+        self.research_same_scan_sent_signals = []
+        try:
+            self.research_exposure_history = pd.read_csv(self.journal.path) if self.journal.path.exists() else pd.DataFrame()
+        except Exception as exc:
+            LOGGER.warning("Research exposure snapshot unavailable; live scanner continues: %s", exc)
+            self.research_exposure_history = pd.DataFrame()
+        try:
+            self.research_cross_scan_state = load_open_exposure_state(
+                self.journal.path,
+                stale_after_hours=self.research_correlation_rule.stale_after_hours,
+            )
+            self.research_correlation_state_error = ""
+        except Exception as exc:
+            LOGGER.warning("Research correlation exposure state unavailable; live scanner continues: %s", exc)
+            self.research_cross_scan_state = ExposureState((), ())
+            self.research_correlation_state_error = "exposure_state_unavailable"
         if self.cross_scan_exposure_shadow_logger:
             try:
                 self.cross_scan_exposure_shadow_logger.refresh_outcomes()
@@ -1845,13 +1938,58 @@ class AgentRunner:
                 signal = self.scan_symbol(symbol)
                 if signal:
                     candidates.append(signal)
-            except requests.HTTPError as exc:
+            except requests.RequestException as exc:
+                self.record_pre_candidate_observation(
+                    "MARKET_DATA_FAILURE",
+                    {"stage": "MARKET_DATA_FETCH", "reason": type(exc).__name__},
+                    symbol=symbol,
+                )
                 LOGGER.warning("Scan skipped for %s: %s", symbol, exc)
             except Exception as exc:
                 LOGGER.exception("Scan failed for %s: %s", symbol, exc)
             time.sleep(self.config.request_delay_seconds)
 
         self.process_candidates(candidates)
+
+    def record_pre_candidate_observation(
+        self,
+        category: str,
+        values: dict[str, Any],
+        *,
+        symbol: str = "",
+    ) -> None:
+        """Best-effort observation for exits before a TradeSignal exists."""
+        try:
+            stamp = datetime.now(timezone.utc).isoformat()
+            candle = str(values.get("scan_candle_utc") or self.research_scan_candle_utc or stamp)
+            known = {
+                "stage", "reason", "side_hint", "score_long", "score_short", "confidence", "rsi", "mfi",
+                "atr", "btc_regime", "trend_1h", "trend_4h", "session", "scan_candle_utc",
+            }
+            observation = PreCandidateObservation(
+                run_id=self.research_run_id,
+                timestamp_utc=stamp,
+                scan_candle_utc=candle,
+                symbol=symbol or str(values.get("symbol") or ""),
+                stage=str(values.get("stage") or "SCORER"),
+                category=category,
+                reason=str(values.get("reason") or ""),
+                side_hint=str(values.get("side_hint") or ""),
+                score_long=values.get("score_long"),
+                score_short=values.get("score_short"),
+                confidence=values.get("confidence"),
+                rsi=values.get("rsi"),
+                mfi=values.get("mfi"),
+                atr=values.get("atr"),
+                btc_regime=str(values.get("btc_regime") or ""),
+                trend_1h=str(values.get("trend_1h") or ""),
+                trend_4h=str(values.get("trend_4h") or ""),
+                session=str(values.get("session") or ""),
+                extras={key: value for key, value in values.items() if key not in known},
+            )
+            self.research_telemetry.record_observation(observation)
+        except Exception as exc:
+            LOGGER.warning("Pre-candidate observation construction failed open for %s: %s", symbol, exc)
 
     def evaluate_entry_timing_shadow(self, signal: TradeSignal, signal_status: str) -> None:
         try:
@@ -1878,6 +2016,26 @@ class AgentRunner:
             record = self.cross_scan_exposure_shadow_logger.log_candidate(
                 signal,
                 self.cross_scan_price_history,
+            )
+            signal.research_exposure.update(
+                {
+                    "cross_scan_same_side_count": record.get("shadow_retained_same_side_count"),
+                    "correlated_open_count": record.get("correlated_open_count"),
+                    "max_pair_correlation": record.get("max_pair_correlation"),
+                    "cluster_id": record.get("cluster_id"),
+                    "representative_signal_key": record.get("representative_signal_key"),
+                    "cross_scan_state": record.get("shadow_decision"),
+                    "cross_scan_reason": record.get("shadow_reason"),
+                }
+            )
+            signal.research_shadows.append(
+                ResearchShadowDecision(
+                    "cross_scan_exposure_v1",
+                    str(record.get("shadow_version") or "1"),
+                    str(record.get("shadow_decision") or ""),
+                    str(record.get("shadow_reason") or ""),
+                    metrics=record,
+                )
             )
             LOGGER.info(
                 "Cross-scan exposure shadow %s for %s %s: correlated=%s max_corr=%s; live send unchanged",
@@ -1913,6 +2071,237 @@ class AgentRunner:
     def log_signal_status(self, signal: TradeSignal, signal_status: str = "sent", skip_reason: str = "") -> None:
         self.journal.log_signal(signal, signal_status, skip_reason)
         self.evaluate_setup_strength_shadow(signal, signal_status, skip_reason)
+        try:
+            self.record_research_telemetry(signal, signal_status, skip_reason)
+        except Exception as exc:
+            LOGGER.warning("Research telemetry snapshot failed open for %s: %s", signal.symbol, exc)
+        finally:
+            side = signal.direction.upper()
+            self.research_same_scan_counts[side] = self.research_same_scan_counts.get(side, 0) + 1
+            if signal_status == "sent":
+                self.research_same_scan_sent_counts[side] = self.research_same_scan_sent_counts.get(side, 0) + 1
+                try:
+                    stamp = pd.Timestamp(signal.timestamp)
+                    if stamp.tzinfo is None:
+                        stamp = stamp.tz_localize("UTC")
+                    self.research_same_scan_sent_signals.append(
+                        OpenExposure(
+                            canonical_signal_key=cross_scan_signal_key(signal),
+                            symbol=SymbolFormatter.to_binance_symbol(signal.symbol),
+                            side=side,
+                            timestamp=stamp.tz_convert("UTC"),
+                        )
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Research same-scan exposure update failed open for %s: %s", signal.symbol, exc)
+
+    def evaluate_research_candidate_correlation(self, signal: TradeSignal) -> None:
+        """Snapshot cached correlation evidence only; never changes live routing."""
+        rule = self.research_correlation_rule
+        side = signal.direction.upper()
+        candidate_symbol = SymbolFormatter.to_binance_symbol(signal.symbol)
+        candidate_signal_key = cross_scan_signal_key(signal)
+        same_side = [
+            item for item in self.research_cross_scan_state.positions
+            if item.side == side and item.canonical_signal_key != candidate_signal_key
+        ]
+        same_side.extend(
+            item for item in getattr(self, "research_same_scan_sent_signals", [])
+            if item.side == side and item.canonical_signal_key != candidate_signal_key
+        )
+        result: dict[str, Any] = {
+            "cross_scan_same_side_count": len(same_side),
+            "correlation_lookback": rule.correlation_lookback_bars,
+            "correlation_min_observations": rule.correlation_min_observations,
+            "correlation_threshold": rule.correlation_threshold,
+            "correlation_evaluated": False,
+            "correlated_open_count": None,
+            "max_pair_correlation": None,
+            "correlated_signal_keys": [],
+            "correlation_pair_observations": {},
+            "cluster_id": None,
+            "representative_signal_key": None,
+            "unavailable_reason": "",
+            "correlation_source": "in_memory_price_history+cached_open_exposure_state",
+        }
+        candidate_prices = self.cross_scan_price_history.get(candidate_symbol)
+        if self.research_correlation_state_error:
+            result["unavailable_reason"] = self.research_correlation_state_error
+        elif candidate_prices is None or candidate_prices.empty:
+            result["unavailable_reason"] = "candidate_price_history_unavailable"
+        elif not same_side:
+            result["correlated_open_count"] = 0
+            result["unavailable_reason"] = "no_open_same_side_exposure"
+        else:
+            evaluated: list[tuple[Any, float]] = []
+            observations_by_key: dict[str, int] = {}
+            for exposure in same_side:
+                correlation, observations = pair_return_correlation(
+                    candidate_prices,
+                    self.cross_scan_price_history.get(exposure.symbol),
+                    lookback_bars=rule.correlation_lookback_bars,
+                    min_observations=rule.correlation_min_observations,
+                )
+                observations_by_key[exposure.canonical_signal_key] = observations
+                if correlation is not None:
+                    evaluated.append((exposure, correlation))
+            result["correlation_pair_observations"] = observations_by_key
+            if not evaluated:
+                result["unavailable_reason"] = "insufficient_or_unaligned_price_history"
+            else:
+                correlated = sorted(
+                    (item for item in evaluated if item[1] >= rule.correlation_threshold),
+                    key=lambda item: (item[0].timestamp, item[0].canonical_signal_key),
+                )
+                result["correlation_evaluated"] = True
+                result["correlated_open_count"] = len(correlated)
+                result["max_pair_correlation"] = max(item[1] for item in evaluated)
+                result["correlated_signal_keys"] = [item[0].canonical_signal_key for item in correlated]
+                if correlated:
+                    representative = correlated[0][0]
+                    digest = hashlib.sha256(
+                        f"{side}|{representative.canonical_signal_key}".encode("utf-8")
+                    ).hexdigest()[:16]
+                    result["cluster_id"] = f"xscan:v1:{side}:{digest}"
+                    result["representative_signal_key"] = representative.canonical_signal_key
+        result["cross_scan_state"] = "EVALUATED" if result["correlation_evaluated"] else "UNAVAILABLE"
+        signal.research_exposure.update(result)
+
+    def research_exposure_snapshot(self, signal: TradeSignal) -> dict[str, Any]:
+        history = self.research_exposure_history
+        result = dict(signal.research_exposure)
+        side = signal.direction.upper()
+        opposite = "SHORT" if side == "LONG" else "LONG"
+        result.update(
+            {
+                "same_scan_long_count": self.research_same_scan_counts.get("LONG", 0),
+                "same_scan_short_count": self.research_same_scan_counts.get("SHORT", 0),
+                "same_scan_side_count": self.research_same_scan_counts.get(side, 0),
+                "same_scan_sent_long_count": self.research_same_scan_sent_counts.get("LONG", 0),
+                "same_scan_sent_short_count": self.research_same_scan_sent_counts.get("SHORT", 0),
+            }
+        )
+        same_scan_sent = self.research_same_scan_sent_counts.get(side, 0)
+        if history.empty or "side" not in history.columns:
+            result.setdefault("actual_open_total", 0)
+            result.setdefault("actual_open_same_side", 0)
+            result.setdefault("actual_open_opposite_side", 0)
+            result.setdefault("same_side_altcoin_open_count", 0)
+            result.setdefault("prior_same_side_1h", same_scan_sent)
+            result.setdefault("prior_same_side_3h", same_scan_sent)
+            result.setdefault("prior_same_side_6h", same_scan_sent)
+            result.setdefault("cumulative_same_side_modeled_risk", float(same_scan_sent))
+            result.setdefault("candidate_sequence_after_first_exposure", same_scan_sent)
+            result.setdefault("open_position_ages_json", [])
+            return result
+        sides = history["side"].fillna("").astype(str).str.upper()
+        statuses = history.get("signal_status", pd.Series("sent", index=history.index)).fillna("sent").astype(str).str.lower()
+        results = history.get("result", pd.Series("OPEN", index=history.index)).fillna("OPEN").astype(str).str.upper()
+        active_statuses = {"sent", "tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only", "london_long_report_only"}
+        open_mask = statuses.isin(active_statuses) & (results == "OPEN")
+        same_open = open_mask & (sides == side)
+        opposite_open = open_mask & (sides == opposite)
+        symbols = history.get("symbol", pd.Series("", index=history.index)).fillna("").astype(str).str.upper()
+        result.update(
+            {
+                "actual_open_total": int(open_mask.sum()),
+                "actual_open_same_side": int(same_open.sum()),
+                "actual_open_opposite_side": int(opposite_open.sum()),
+                "same_side_altcoin_open_count": int((same_open & (symbols != "BTCUSDT")).sum()),
+                "cumulative_same_side_modeled_risk": float(same_open.sum()) + same_scan_sent,
+                "candidate_sequence_after_first_exposure": int(same_open.sum()) + same_scan_sent,
+            }
+        )
+        timestamps = pd.to_datetime(history.get("timestamp"), utc=True, errors="coerce")
+        now = pd.Timestamp(signal.timestamp)
+        if now.tzinfo is None:
+            now = now.tz_localize("UTC")
+        sent_same = statuses.isin(active_statuses) & (sides == side) & timestamps.notna()
+        for hours in (1, 3, 6):
+            result[f"prior_same_side_{hours}h"] = int((sent_same & (timestamps <= now) & (timestamps >= now - pd.Timedelta(hours=hours))).sum()) + same_scan_sent
+        result["open_position_ages_json"] = [
+            round(float((now - stamp).total_seconds() / 60), 2)
+            for stamp in timestamps[same_open & timestamps.notna()].tolist()
+        ]
+        return result
+
+    def record_research_telemetry(self, signal: TradeSignal, signal_status: str, skip_reason: str) -> None:
+        """Best-effort sidecar write after the live decision has already been made."""
+        if not self.research_run_id:
+            self.research_scan_started_at_utc = datetime.now(timezone.utc).isoformat()
+            candle = signal.closed_candle_time_utc or self.research_scan_started_at_utc
+            self.research_run_id = make_research_run_id(self.research_scan_started_at_utc, candle)
+            self.research_telemetry.start_run(self.research_run_id, self.research_scan_started_at_utc, candle)
+        try:
+            self.evaluate_research_candidate_correlation(signal)
+        except Exception as exc:
+            signal.research_exposure.update(
+                {
+                    "correlation_evaluated": False,
+                    "correlated_open_count": None,
+                    "max_pair_correlation": None,
+                    "unavailable_reason": f"evaluation_error:{type(exc).__name__}",
+                }
+            )
+            LOGGER.warning("Research correlation snapshot failed open for %s: %s", signal.symbol, exc)
+        features = dict(signal.research_features)
+        try:
+            entry_timing = self.entry_timing.evaluate(signal)
+            features["entry_timing_state"] = entry_timing.recommendation
+            signal.research_shadows.append(
+                ResearchShadowDecision(
+                    "entry_timing_v1", "1", entry_timing.recommendation, entry_timing.reason,
+                    metrics={"entry_quality_score": entry_timing.entry_quality_score},
+                )
+            )
+        except Exception:
+            pass
+        stamp = pd.Timestamp(signal.timestamp)
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize("UTC")
+        stamp = stamp.tz_convert("UTC")
+        market = dict(signal.research_market)
+        market.update(
+            {
+                "btc_regime": signal.btc_regime,
+                "trend_1h": signal.regime,
+                "trend_4h": signal.htf_regime,
+                "volatility_context": signal.regime_details,
+                "btc_side_alignment": "OPPOSITE" if "opposite-direction" in signal.reason else "ALIGNED_OR_NEUTRAL",
+                "session": signal.market_session,
+                "utc_hour": stamp.hour,
+                "local_hour": stamp.to_pydatetime().astimezone().hour,
+                "day_of_week": stamp.day_name(),
+                "long_short_mix": f"L{self.research_same_scan_counts.get('LONG', 0)}:S{self.research_same_scan_counts.get('SHORT', 0)}",
+            }
+        )
+        snapshot = CandidateSnapshot(
+            run_id=self.research_run_id,
+            timestamp_utc=signal.timestamp.isoformat(),
+            closed_candle_time_utc=signal.closed_candle_time_utc or signal.timestamp.isoformat(),
+            symbol=signal.symbol,
+            side=signal.direction,
+            decision=classify_research_decision(signal_status),
+            decision_reason=skip_reason,
+            decision_stage=signal_status,
+            signal_status=signal_status,
+            entry=signal.entry,
+            sl=signal.sl,
+            tp1=signal.tp1,
+            tp2=signal.tp2,
+            rr=signal.rr,
+            score=signal.score,
+            confidence=signal.confidence,
+            setup_strength=signal.setup_strength,
+            tier=signal.watchlist_tier,
+            session=signal.market_session,
+            source_version=SIGNAL_VERSION,
+            features=features,
+            market=market,
+            exposure=self.research_exposure_snapshot(signal),
+            shadows=tuple(signal.research_shadows),
+        )
+        self.research_telemetry.record_candidate(snapshot)
 
     def evaluate_sr_trade_weight_shadow(self, signal: TradeSignal, signal_status: str = "candidate") -> str:
         if not self.config.sr_gate_shadow_enabled:
@@ -1937,6 +2326,17 @@ class AgentRunner:
                 config=self.sr_gate_config,
             )
             appended = self.sr_gate_logger.log_signal(signal, result, signal_status=signal_status, source="scanner")
+            signal.research_features["sr_state"] = result.decision
+            signal.research_shadows.append(
+                ResearchShadowDecision(
+                    "sr_weight_v1", "1", result.decision, result.reason,
+                    metrics={
+                        "opposing_distance_atr": result.opposing_distance_atr,
+                        "effective_sr_rr": result.effective_sr_rr,
+                        "score_penalty_shadow": result.score_penalty_shadow,
+                    },
+                )
+            )
             LOGGER.info(
                 "SR Gate shadow %s for %s %s: decision=%s effective_sr_rr=%s reason=%s",
                 "logged" if appended else "duplicate skipped",
@@ -2004,6 +2404,25 @@ class AgentRunner:
                 config=self.market_exhaustion_config,
             )
             appended = self.market_exhaustion_logger.log_signal(signal, result, signal_status=signal_status, source="scanner")
+            signal.research_features.update(
+                {
+                    "exhaustion_state": result.exhaustion_class,
+                    "ema20_distance_atr": result.ema20_distance_atr,
+                    "ema50_distance_atr": result.ema50_distance_atr,
+                    "momentum": int(result.momentum_exception_applied),
+                }
+            )
+            signal.research_shadows.append(
+                ResearchShadowDecision(
+                    "exhaustion_v1", "1", result.exhaustion_class, result.reason,
+                    metrics={
+                        "swing_distance_atr": result.swing_distance_atr,
+                        "directional_run_1h": result.directional_run_1h,
+                        "directional_run_15m": result.directional_run_15m,
+                        "penalty": result.exhaustion_penalty_shadow,
+                    },
+                )
+            )
             LOGGER.info(
                 "ME_SHADOW %s %s %s swing=%sATR ema20=%sATR penalty=%s %s",
                 signal.symbol,
@@ -2026,12 +2445,53 @@ class AgentRunner:
         df_htf = None
         if self.config.use_4h_regime_filter:
             df_htf = self.indicators.add_indicators(self.data_client.fetch_closed_klines(symbol, self.config.htf_timeframe, 200))
-        signal = self.scorer.score(symbol, df_1h, df_15m, self.fear_greed_value, df_htf)
+        signal = self.scorer.score(
+            symbol,
+            df_1h,
+            df_15m,
+            self.fear_greed_value,
+            df_htf,
+            observation_callback=lambda category, values: self.record_pre_candidate_observation(
+                category, values, symbol=symbol
+            ),
+        )
         if not signal:
             LOGGER.info("%s WAIT: no valid setup", symbol)
             return None
 
         signal = self.risk_manager.apply(signal)
+        try:
+            latest_1h = df_1h.iloc[-1]
+            latest_15m = df_15m.iloc[-1]
+            candle_range = max(float(latest_1h.get("high", 0)) - float(latest_1h.get("low", 0)), 0.0)
+            signal.closed_candle_time_utc = str(latest_1h.get("close_time", signal.timestamp.isoformat()))
+            signal.research_features.update(
+                {
+                    "rsi": latest_1h.get("rsi14"),
+                    "mfi": latest_1h.get("mfi"),
+                    "atr": latest_1h.get("atr14"),
+                    "atr_pct": latest_1h.get("atr_pct"),
+                    "atr_expansion": signal.atr_expansion_ratio,
+                    "ema9": latest_15m.get("ema9"),
+                    "ema20": latest_1h.get("ema20"),
+                    "ema21": latest_15m.get("ema21"),
+                    "ema50": latest_1h.get("ema50"),
+                    "body_ratio": signal.body_ratio,
+                    "upper_wick_ratio": ((float(latest_1h.get("high", 0)) - max(float(latest_1h.get("open", 0)), float(latest_1h.get("close", 0)))) / candle_range) if candle_range else 0.0,
+                    "lower_wick_ratio": ((min(float(latest_1h.get("open", 0)), float(latest_1h.get("close", 0))) - float(latest_1h.get("low", 0))) / candle_range) if candle_range else 0.0,
+                    "opposite_wick_ratio": signal.opposite_wick_ratio,
+                    "volume": latest_1h.get("volume"),
+                    "volume_ratio": signal.volume_ratio,
+                    "momentum_15m_rsi": latest_15m.get("rsi14"),
+                    "breakout_confirmed": signal.breakout_confirmed,
+                    "wave_score": signal.wave_score,
+                    "wave_state": signal.wave_structure,
+                    "wave_phase": signal.wave_phase,
+                    "quality_flags": signal.quality_flags,
+                }
+            )
+        except Exception as exc:
+            LOGGER.warning("Research feature snapshot unavailable for %s; live scanner continues: %s", symbol, exc)
         sr_gate_decision = self.evaluate_sr_trade_weight_shadow(signal, "candidate")
         self.evaluate_market_exhaustion_shadow(signal, df_1h, df_15m, "candidate", sr_gate_decision)
         signal.ai_commentary = ""

@@ -17,6 +17,12 @@ backups/
 archive/
 signal_state.json
 state/binance_execution_truth_v1.json
+research/*.db
+research/*.db-wal
+research/*.db-shm
+research/*.sqlite
+research/*.sqlite-wal
+research/*.sqlite-shm
 .env.binance-readonly
 
 *.bak

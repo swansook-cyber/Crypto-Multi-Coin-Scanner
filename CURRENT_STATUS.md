@@ -59,6 +59,7 @@
 - Daily VPS operations checklist via `DAILY_OPERATIONS.md`
 - RC1.4 audit performance optimization: `data_integrity_audit.py --profile` and `--benchmark` are available; stale watcher cleanup now builds runtime indexes once per run.
 - RC1.5/RC1.6 provenance optimization: Entry Timing audit now uses canonical candidate identity with deterministic source priority, reducing false cross-source ambiguity while preserving true ambiguity warnings.
+- Unified Scanner Research Telemetry V1: fail-open SQLite sidecar captures immutable prospective candidate, feature, market, exposure, and shadow evidence; existing CSV/shadow outputs remain in compatibility dual-write mode. Outcome and Binance Execution Truth enrichment are standalone and read existing artifacts only.
 
 ## Telegram Channels
 
@@ -127,6 +128,7 @@ Legacy `SYMBOLS` still works if tier variables are not configured.
 ## Production Notes
 
 - Runtime CSV/log/chart/dashboard output should stay out of Git
+- Research telemetry schema v2 defaults to `research/scanner_research_v1.db` (WAL, ignored by Git), covering constructed candidates plus pre-candidate WAIT/no-trade observations. Use `python -m core.research_telemetry status`, `coverage`, or `health` for read-only diagnostics. The research database is never required by the live scanner.
 - `.env` and real API/chat IDs must not be committed
 - Manual Live Pilot is policy/journal/advisory only; it never sends exchange orders
 - Keep `TRADING_MODE=PAPER` and `LIVE_PILOT_ENABLED=false` unless explicitly running the supervised manual pilot
