@@ -49,7 +49,8 @@ is manufactured.
 
 ## Schema
 
-Schema version 2 uses these normalized tables:
+Schema version 3 uses these normalized tables (v3 changes only enrichment
+operations metadata; candidate evidence remains immutable):
 
 - `research_meta`: schema version and the single prospective boundary.
 - `scanner_runs`: deterministic scan identity and source provenance.
@@ -60,7 +61,8 @@ Schema version 2 uses these normalized tables:
 - `shadow_decisions`: many versioned evaluator decisions per candidate.
 - `signal_outcomes`: idempotent modeled-outcome enrichment by canonical signal key.
 - `execution_truth_links`: idempotent execution enrichment by canonical signal key.
-- `enrichment_status`: source high-water and success/error status.
+- `enrichment_status`: attempt/success timestamps, timestamp high-water,
+  source/matched/updated counts, and error/health status.
 - `pre_candidate_observations`: deterministic pre-construction WAIT evidence,
   including exit category, available scores/indicators/regime/session, and
   source provenance.
@@ -111,7 +113,9 @@ Safe import and enrichment examples:
 python -m core.research_telemetry backfill --signals logs/signals.csv
 python -m core.research_telemetry backfill --signals logs/signals.csv \
   --shadow setup_strength_v1=logs/setup_strength_prospective_shadow.csv
-python -m core.research_telemetry enrich --signals logs/signals.csv --execution logs/binance_execution_truth_v1.csv
+python -m core.research_telemetry enrich-outcomes --signals logs/signals.csv
+python -m core.research_telemetry enrich-execution --execution logs/binance_execution_truth_v1.csv
+python -m core.research_telemetry enrich-all
 ```
 
 Both enrichment functions are incremental-safe/idempotent upserts. Resolved
@@ -174,7 +178,7 @@ while holding the write transaction. Read-only reporting opens SQLite in
 `mode=ro`. Indexed paths cover time, run, population, signal key, symbol/side/
 candle, shadow decision, result, and execution eligibility. Schema DDL and the
 version marker commit in one explicit transaction. Unsupported future versions
-are rejected before any DDL, and each ordered v1-to-v2 migration plus version
+are rejected before any DDL, and each ordered schema migration plus version
 marker is committed atomically or rolled back completely.
 
 Read-only commands:

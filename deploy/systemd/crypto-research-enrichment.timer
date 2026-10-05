@@ -1,0 +1,11 @@
+[Unit]
+Description=Enrich Crypto Scanner research telemetry every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+RandomizedDelaySec=30s
+Persistent=true
+Unit=crypto-research-enrichment.service
+
+[Install]
+WantedBy=timers.target

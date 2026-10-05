@@ -178,8 +178,10 @@ def test_outcome_enrichment_idempotent_and_does_not_mutate_source(tmp_path: Path
         writer.writeheader()
         writer.writerow({"canonical_signal_key": key, "timestamp": snapshot.timestamp_utc, "symbol": "BTCUSDT", "side": "LONG", "result": "WIN", "result_r": "2", "closed_at": snapshot.timestamp_utc})
     before = path.read_bytes()
-    assert store.enrich_outcomes(path)["upserted"] == 1
-    assert store.enrich_outcomes(path)["upserted"] == 1
+    first = store.enrich_outcomes(path)
+    second = store.enrich_outcomes(path)
+    assert (first["inserted"], first["updated"], first["unchanged"]) == (1, 0, 0)
+    assert (second["inserted"], second["updated"], second["unchanged"]) == (0, 0, 1)
     assert path.read_bytes() == before
     with store.connect(read_only=True) as connection:
         assert connection.execute("SELECT COUNT(*) FROM signal_outcomes").fetchone()[0] == 1
@@ -187,6 +189,7 @@ def test_outcome_enrichment_idempotent_and_does_not_mutate_source(tmp_path: Path
 
 def test_execution_enrichment_idempotent(tmp_path: Path) -> None:
     store = make_store(tmp_path)
+    store.record_candidate(make_snapshot(store, canonical_signal_key="k"))
     path = tmp_path / "execution.csv"
     fields = ["canonical_signal_key", "match_status", "execution_finality", "accounting_evidence_status",
               "entry_fill_price", "exit_vwap", "gross_realized_pnl_usdt", "commission_usdt",
@@ -201,8 +204,10 @@ def test_execution_enrichment_idempotent(tmp_path: Path) -> None:
                          "execution_pnl_usdt": 1.9, "gross_realized_r": 2, "execution_r": 1.9,
                          "commission_finality": "COMMISSION_FINAL", "funding_finality": "FUNDING_FINAL",
                          "accounting_finality": "ACCOUNTING_FINAL"})
-    store.enrich_execution(path)
-    store.enrich_execution(path)
+    first = store.enrich_execution(path)
+    second = store.enrich_execution(path)
+    assert (first["inserted"], first["updated"], first["unchanged"]) == (1, 0, 0)
+    assert (second["inserted"], second["updated"], second["unchanged"]) == (0, 0, 1)
     with store.connect(read_only=True) as connection:
         row = connection.execute("SELECT COUNT(*),authoritative_eligible FROM execution_truth_links").fetchone()
         assert tuple(row) == (1, 1)
@@ -236,7 +241,7 @@ def test_schema_migration_is_safe(tmp_path: Path) -> None:
     assert ResearchTelemetryStore(store.path).boundary() == boundary
 
 
-def test_schema_migrates_v1_to_v2_atomically(tmp_path: Path) -> None:
+def test_schema_migrates_v1_to_current_atomically(tmp_path: Path) -> None:
     path = tmp_path / "v1.db"
     connection = sqlite3.connect(path)
     for statement in telemetry_module._sql_statements(telemetry_module.MIGRATION_1):
@@ -247,11 +252,35 @@ def test_schema_migrates_v1_to_v2_atomically(tmp_path: Path) -> None:
     connection.close()
     store = ResearchTelemetryStore(path)
     with store.connect(read_only=True) as connection:
-        assert connection.execute("SELECT schema_version FROM research_meta").fetchone()[0] == 2
+        assert connection.execute("SELECT schema_version FROM research_meta").fetchone()[0] == telemetry_module.SCHEMA_VERSION
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pre_candidate_observations'"
         ).fetchone()
     assert store.boundary() == boundary
+
+
+def test_schema_v2_to_v3_preserves_enrichment_status(tmp_path: Path) -> None:
+    path = tmp_path / "v2.db"
+    connection = sqlite3.connect(path)
+    for version in (1, 2):
+        for statement in telemetry_module._sql_statements(telemetry_module.MIGRATIONS[version]):
+            connection.execute(statement)
+    boundary = "2026-01-01T00:00:00Z"
+    connection.execute("INSERT INTO research_meta VALUES (1,2,?,?,?)", (boundary, boundary, boundary))
+    connection.execute(
+        "INSERT INTO enrichment_status VALUES (?,?,?,?)",
+        ("outcomes:signals.csv", boundary, "100", ""),
+    )
+    connection.commit()
+    connection.close()
+    store = ResearchTelemetryStore(path)
+    with store.connect(read_only=True) as connection:
+        row = connection.execute("SELECT * FROM enrichment_status").fetchone()
+        assert row["last_success_utc"] == boundary
+        assert row["high_water"] == "100"
+        assert row["last_attempt_utc"] is None
+        assert row["source_rows_seen"] == 0
+        assert connection.execute("SELECT schema_version FROM research_meta").fetchone()[0] == 3
 
 
 def test_corrupt_db_fails_open(tmp_path: Path) -> None:
@@ -340,6 +369,7 @@ def test_module_has_no_telegram_cornix_or_binance_calls() -> None:
 
 def test_duplicate_open_row_cannot_regress_resolved_outcome(tmp_path: Path) -> None:
     store = make_store(tmp_path)
+    store.record_candidate(make_snapshot(store, canonical_signal_key="signal"))
     path = tmp_path / "outcomes.csv"
     fields = ["canonical_signal_key", "timestamp", "symbol", "side", "result", "result_r", "closed_at"]
     stamp = utc_now()
@@ -356,6 +386,7 @@ def test_duplicate_open_row_cannot_regress_resolved_outcome(tmp_path: Path) -> N
 
 def test_pending_execution_cannot_regress_authoritative_execution(tmp_path: Path) -> None:
     store = make_store(tmp_path)
+    store.record_candidate(make_snapshot(store, canonical_signal_key="signal"))
     path = tmp_path / "execution.csv"
     fields = ["canonical_signal_key", "match_status", "execution_finality", "accounting_evidence_status",
               "commission_finality", "funding_finality", "accounting_finality", "execution_r"]
@@ -599,3 +630,189 @@ def test_failed_migration_rolls_back_all_schema_changes(tmp_path: Path, monkeypa
     tables = list(connection.execute("SELECT name FROM sqlite_master WHERE type='table'"))
     connection.close()
     assert tables == []
+
+
+def _write_csv(path: Path, fields: list[str], rows: list[dict[str, object]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_outcome_open_resolves_and_terminal_result_cannot_regress(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    snapshot = make_snapshot(store, canonical_signal_key="outcome-key")
+    store.record_candidate(snapshot)
+    path = tmp_path / "signals.csv"
+    fields = ["canonical_signal_key", "timestamp", "result", "result_r", "closed_at", "hit_target"]
+    _write_csv(path, fields, [{"canonical_signal_key": "outcome-key", "timestamp": snapshot.timestamp_utc, "result": "OPEN"}])
+    assert store.enrich_outcomes(path)["inserted"] == 1
+    _write_csv(path, fields, [{
+        "canonical_signal_key": "outcome-key", "timestamp": snapshot.timestamp_utc,
+        "result": "WIN", "result_r": 2, "closed_at": snapshot.timestamp_utc, "hit_target": "TP2",
+    }])
+    assert store.enrich_outcomes(path)["updated"] == 1
+    _write_csv(path, fields, [{"canonical_signal_key": "outcome-key", "timestamp": snapshot.timestamp_utc, "result": "OPEN"}])
+    assert store.enrich_outcomes(path)["unchanged"] == 1
+    with store.connect(read_only=True) as connection:
+        row = connection.execute(
+            "SELECT result,modeled_r,tp1_hit,tp2_hit,sl_hit FROM signal_outcomes"
+        ).fetchone()
+        assert tuple(row) == ("WIN", 2.0, 1, 1, None)
+
+
+def test_report_only_and_rejected_outcomes_require_real_source_evidence(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    report = make_snapshot(
+        store, canonical_signal_key="report-key", decision="REPORT_ONLY", signal_status="session_risk_report_only"
+    )
+    rejected = make_snapshot(
+        store, canonical_signal_key="rejected-key", symbol="ETHUSDT", decision="REJECTED",
+        signal_status="logged_quality_filter"
+    )
+    store.record_candidate(report)
+    store.record_candidate(rejected)
+    signals = tmp_path / "signals.csv"
+    fields = ["canonical_signal_key", "timestamp", "result", "net_r_estimate", "closed_at"]
+    _write_csv(signals, fields, [
+        {"canonical_signal_key": "report-key", "timestamp": report.timestamp_utc, "result": "WIN", "net_r_estimate": 1, "closed_at": report.timestamp_utc},
+        {"canonical_signal_key": "rejected-key", "timestamp": rejected.timestamp_utc, "result": "SKIPPED"},
+    ])
+    result = store.enrich_outcomes(signals)
+    assert result["matched_report_only"] == 1
+    assert result["matched_rejected"] == 0
+    with store.connect(read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM signal_outcomes").fetchone()[0] == 1
+    rejected_shadow = tmp_path / "rejected_outcome_shadow.csv"
+    _write_csv(
+        rejected_shadow,
+        ["canonical_signal_key", "timestamp_utc", "hypothetical_outcome", "hypothetical_r", "close_timestamp"],
+        [{
+            "canonical_signal_key": "rejected-key", "timestamp_utc": rejected.timestamp_utc,
+            "hypothetical_outcome": "LOSS", "hypothetical_r": -1, "close_timestamp": rejected.timestamp_utc,
+        }],
+    )
+    result = store.enrich_outcomes(rejected_shadow)
+    assert result["matched_rejected"] == 1
+    with store.connect(read_only=True) as connection:
+        assert tuple(connection.execute(
+            "SELECT result,modeled_r FROM signal_outcomes WHERE canonical_signal_key='rejected-key'"
+        ).fetchone()) == ("LOSS", -1.0)
+
+
+def test_execution_unknowns_stay_null_and_authoritative_never_regresses(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    store.record_candidate(make_snapshot(store, canonical_signal_key="execution-key"))
+    path = tmp_path / "execution.csv"
+    fields = [
+        "canonical_signal_key", "match_status", "execution_finality", "accounting_evidence_status",
+        "entry_fill_price", "exit_vwap", "gross_realized_pnl_usdt", "commission_usdt",
+        "execution_pnl_usdt", "gross_realized_r", "execution_r", "commission_finality",
+        "funding_finality", "accounting_finality",
+    ]
+    _write_csv(path, fields, [{
+        "canonical_signal_key": "execution-key", "match_status": "PARTIAL",
+        "execution_finality": "EXECUTION_PENDING", "entry_fill_price": 100,
+    }])
+    assert store.enrich_execution(path)["inserted"] == 1
+    with store.connect(read_only=True) as connection:
+        row = connection.execute(
+            "SELECT actual_entry_vwap,actual_exit_vwap,execution_pnl,execution_net_r FROM execution_truth_links"
+        ).fetchone()
+        assert tuple(row) == (100.0, None, None, None)
+    _write_csv(path, fields, [{
+        "canonical_signal_key": "execution-key", "match_status": "MATCHED",
+        "execution_finality": "EXECUTION_FINAL", "accounting_evidence_status": "ACCOUNTING_EVIDENCE_VALID",
+        "entry_fill_price": 100, "exit_vwap": 102, "gross_realized_pnl_usdt": 2,
+        "commission_usdt": -.1, "execution_pnl_usdt": 1.9, "gross_realized_r": 2,
+        "execution_r": 1.9, "commission_finality": "COMMISSION_FINAL",
+        "funding_finality": "FUNDING_FINAL", "accounting_finality": "ACCOUNTING_FINAL",
+    }])
+    assert store.enrich_execution(path)["updated"] == 1
+    _write_csv(path, fields, [{
+        "canonical_signal_key": "execution-key", "match_status": "PARTIAL",
+        "execution_finality": "EXECUTION_PENDING",
+    }])
+    assert store.enrich_execution(path)["unchanged"] == 1
+    with store.connect(read_only=True) as connection:
+        row = connection.execute(
+            "SELECT execution_status,authoritative_eligible,execution_net_r FROM execution_truth_links"
+        ).fetchone()
+        assert tuple(row) == ("MATCHED", 1, 1.9)
+
+
+def test_enrichment_status_distinguishes_no_data_healthy_and_error(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    empty = tmp_path / "empty.csv"
+    _write_csv(empty, ["canonical_signal_key", "result"], [])
+    assert store.enrich_outcomes(empty)["source_rows"] == 0
+    assert health(store)["enrichment_sources"]["outcomes:empty.csv"]["status"] == "NO_DATA"
+    store.record_candidate(make_snapshot(store, canonical_signal_key="healthy-key"))
+    populated = tmp_path / "populated.csv"
+    _write_csv(populated, ["canonical_signal_key", "result"], [{"canonical_signal_key": "healthy-key", "result": "OPEN"}])
+    store.enrich_outcomes(populated)
+    assert health(store)["enrichment_sources"]["outcomes:populated.csv"]["status"] == "HEALTHY"
+    missing = tmp_path / "missing.csv"
+    with pytest.raises(FileNotFoundError):
+        store.enrich_outcomes(missing)
+    error = health(store)["enrichment_sources"]["outcomes:missing.csv"]
+    assert error["status"] == "ERROR"
+    assert "FileNotFoundError" in error["last_error"]
+
+
+def test_locked_enrichment_fails_without_source_or_candidate_mutation(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    snapshot = make_snapshot(store, canonical_signal_key="locked-key")
+    store.record_candidate(snapshot)
+    path = tmp_path / "signals.csv"
+    _write_csv(path, ["canonical_signal_key", "result"], [{"canonical_signal_key": "locked-key", "result": "OPEN"}])
+    before = path.read_bytes()
+    blocker = sqlite3.connect(store.path, timeout=.05)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            store.enrich_outcomes(path)
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert path.read_bytes() == before
+    with store.connect(read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM signal_outcomes").fetchone()[0] == 0
+        assert connection.execute("SELECT decision FROM candidates").fetchone()[0] == "SENT"
+
+
+def test_corrupt_db_enrichment_cli_fails_nonzero(tmp_path: Path) -> None:
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"not sqlite")
+    source = tmp_path / "signals.csv"
+    _write_csv(source, ["canonical_signal_key", "result"], [])
+    before = source.read_bytes()
+    assert telemetry_module.main(["--db", str(corrupt), "enrich-outcomes", "--signals", str(source)]) == 1
+    assert source.read_bytes() == before
+
+
+def test_enrichment_uses_no_network_and_does_not_change_candidate_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+
+    store = make_store(tmp_path)
+    snapshot = make_snapshot(store, canonical_signal_key="offline-key", score=91)
+    store.record_candidate(snapshot)
+    path = tmp_path / "signals.csv"
+    _write_csv(path, ["canonical_signal_key", "result"], [{"canonical_signal_key": "offline-key", "result": "OPEN"}])
+    monkeypatch.setattr(socket, "socket", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("network used")))
+    store.enrich_outcomes(path)
+    with store.connect(read_only=True) as connection:
+        row = connection.execute("SELECT decision,score FROM candidates").fetchone()
+        assert tuple(row) == ("SENT", 91.0)
+
+
+def test_research_enrichment_systemd_units_are_isolated_oneshot() -> None:
+    service = Path("deploy/systemd/crypto-research-enrichment.service").read_text(encoding="utf-8")
+    timer = Path("deploy/systemd/crypto-research-enrichment.timer").read_text(encoding="utf-8")
+    assert "Type=oneshot" in service
+    assert "research_telemetry enrich-all" in service
+    assert "network-online.target" not in service
+    assert "crypto-scanner.service" not in service
+    assert "OnCalendar=*:0/15" in timer

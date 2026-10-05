@@ -16,6 +16,7 @@ import math
 import os
 import sqlite3
 import statistics
+import sys
 import tempfile
 import time
 from contextlib import closing
@@ -28,7 +29,7 @@ from core.signal_identity import canonical_signal_key, normalize_side, normalize
 
 
 LOGGER = logging.getLogger(__name__)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FEATURE_SCHEMA_VERSION = 1
 DEFAULT_DB_PATH = Path("research/scanner_research_v1.db")
 VALID_SOURCE_MODES = {"PROSPECTIVE", "HISTORICAL_BACKFILL"}
@@ -72,6 +73,26 @@ def _bool_int(value: Any) -> int | None:
     return None
 
 
+def _first_present(row: Mapping[str, Any], *names: str) -> Any:
+    """Return the first non-blank field without treating numeric zero as absent."""
+    for name in names:
+        value = row.get(name)
+        if value is not None and _text(value) != "":
+            return value
+    return None
+
+
+def _normalized_outcome(value: Any) -> str:
+    normalized = _text(value).upper()
+    if normalized.startswith("WIN"):
+        return "WIN"
+    if normalized == "LOSS" or normalized.startswith("LOSS_"):
+        return "LOSS"
+    if normalized == "OPEN":
+        return "OPEN"
+    return ""
+
+
 def _outcome_evidence_rank(result: Any, resolved_at: Any = "") -> int:
     normalized = _text(result).upper()
     if normalized == "LOSS" or normalized.startswith("WIN"):
@@ -83,14 +104,17 @@ def _outcome_evidence_rank(result: Any, resolved_at: Any = "") -> int:
 
 def _execution_evidence_rank(status: Any, finality: Any, authoritative: Any) -> int:
     if _bool_int(authoritative):
-        return 4
+        return 50
     normalized_finality = _text(finality).upper()
     if normalized_finality in {"EXECUTION_FINAL", "ACCOUNTING_FINAL"}:
-        return 3
+        return 40
     normalized_status = _text(status).upper()
-    if normalized_status in {"MATCHED", "PARTIAL", "AMBIGUOUS"}:
-        return 2
-    return 1 if normalized_status else 0
+    return {
+        "MATCHED": 30,
+        "PARTIAL": 20,
+        "AMBIGUOUS": 15,
+        "UNMATCHED": 10,
+    }.get(normalized_status, 1 if normalized_status else 0)
 
 
 def _json(value: Any) -> str:
@@ -467,7 +491,15 @@ CREATE INDEX IF NOT EXISTS idx_pre_candidate_population
 """
 
 
-MIGRATIONS = {1: MIGRATION_1, 2: MIGRATION_2}
+MIGRATION_3 = """
+ALTER TABLE enrichment_status ADD COLUMN last_attempt_utc TEXT;
+ALTER TABLE enrichment_status ADD COLUMN source_rows_seen INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE enrichment_status ADD COLUMN rows_matched INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE enrichment_status ADD COLUMN rows_updated INTEGER NOT NULL DEFAULT 0;
+"""
+
+
+MIGRATIONS = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3}
 
 
 def _sql_statements(script: str) -> Iterable[str]:
@@ -717,135 +749,380 @@ class ResearchTelemetryStore:
                 ),
             ).rowcount == 1
 
+    @staticmethod
+    def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+        if not path.exists():
+            raise FileNotFoundError(f"Enrichment source does not exist: {path}")
+        if path.stat().st_size == 0:
+            return []
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    @staticmethod
+    def _source_high_water(rows: Sequence[Mapping[str, Any]], *fields: str) -> str:
+        values: list[datetime] = []
+        for row in rows:
+            for field_name in fields:
+                parsed = _utc_datetime(row.get(field_name))
+                if parsed is not None:
+                    values.append(parsed)
+                    break
+        if not values:
+            return ""
+        return max(values).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+    @staticmethod
+    def _prospective_candidate_decisions(connection: sqlite3.Connection) -> dict[str, str]:
+        return {
+            row[0]: row[1]
+            for row in connection.execute(
+                """SELECT canonical_signal_key,decision FROM candidates
+                WHERE source_mode='PROSPECTIVE' AND canonical_signal_key IS NOT NULL
+                AND canonical_signal_key<>''"""
+            )
+        }
+
+    @staticmethod
+    def _outcome_record(row: Mapping[str, Any], path: Path, now: str) -> dict[str, Any] | None:
+        symbol = normalize_symbol(row.get("symbol"))
+        side = normalize_side(_first_present(row, "side", "direction"))
+        timestamp = _first_present(row, "timestamp", "timestamp_utc", "signal_timestamp")
+        key = _text(row.get("canonical_signal_key")) or canonical_signal_key(
+            symbol=symbol,
+            side=side,
+            timestamp=timestamp,
+            entry=_first_present(row, "entry", "entry_low"),
+        )
+        result = _normalized_outcome(
+            _first_present(row, "result", "final_outcome", "outcome", "hypothetical_outcome")
+        )
+        if not key or not result:
+            return None
+        modeled_r = _float(
+            _first_present(row, "result_r", "net_r_estimate", "modeled_r", "hypothetical_r", "final_r")
+        )
+        target = _text(_first_present(row, "hit_target", "hypothetical_hit_target")).upper()
+        if modeled_r is None:
+            if result == "LOSS" and target == "SL":
+                modeled_r = -1.0
+            elif result == "WIN" and target in {"TP2", "TP3"}:
+                modeled_r = _float(_first_present(row, "risk_reward", "rr", "original_rr"))
+            elif result == "WIN" and target == "TP1":
+                entry = _float(_first_present(row, "entry", "entry_low"))
+                stop = _float(_first_present(row, "stop_loss", "sl"))
+                tp1 = _float(row.get("tp1"))
+                risk = abs(entry - stop) if entry is not None and stop is not None else 0.0
+                modeled_r = abs(tp1 - entry) / risk if entry is not None and tp1 is not None and risk else None
+        resolved_raw = _text(_first_present(row, "closed_at", "resolved_at_utc", "close_timestamp"))
+        resolved = normalize_utc(resolved_raw) if resolved_raw else None
+        seconds = _float(_first_present(row, "time_to_resolution_sec"))
+        if seconds is None:
+            start = _utc_datetime(timestamp)
+            end = _utc_datetime(resolved_raw)
+            seconds = (end - start).total_seconds() if start is not None and end is not None else None
+        tp1_explicit = _bool_int(row.get("tp1_hit"))
+        tp2_explicit = _bool_int(row.get("tp2_hit"))
+        sl_explicit = _bool_int(row.get("sl_hit"))
+        return {
+            "canonical_signal_key": key,
+            "result": result,
+            "modeled_r": modeled_r,
+            "resolved_at_utc": resolved,
+            "tp1_hit": tp1_explicit if tp1_explicit is not None else (1 if target in {"TP1", "TP2", "TP3"} else None),
+            "tp2_hit": tp2_explicit if tp2_explicit is not None else (1 if target in {"TP2", "TP3"} else None),
+            "sl_hit": sl_explicit if sl_explicit is not None else (1 if target == "SL" else None),
+            "time_to_resolution_sec": seconds,
+            "source_name": path.name,
+            "source_version": _text(_first_present(row, "source_version", "record_version")) or "csv_v1",
+            "last_enriched_at_utc": now,
+        }
+
     def enrich_outcomes(self, signals_path: Path | str) -> dict[str, int]:
         path = Path(signals_path)
-        if not path.exists() or path.stat().st_size == 0:
-            return {"read": 0, "upserted": 0}
-        rows = list(csv.DictReader(path.open("r", encoding="utf-8-sig", newline="")))
-        now = utc_now()
-        upserted = 0
-        with closing(self.connect()) as connection, connection:
-            for row in rows:
-                symbol = normalize_symbol(row.get("symbol"))
-                side = normalize_side(row.get("side") or row.get("direction"))
-                timestamp = row.get("timestamp") or row.get("timestamp_utc")
-                key = _text(row.get("canonical_signal_key")) or canonical_signal_key(
-                    symbol=symbol, side=side, timestamp=timestamp,
-                    entry=row.get("entry") or row.get("entry_low"),
+        source_name = f"outcomes:{path.name}"
+        attempt = utc_now()
+        try:
+            rows = self._read_csv_rows(path)
+            high_water = self._source_high_water(
+                rows, "closed_at", "resolved_at_utc", "close_timestamp", "timestamp", "timestamp_utc"
+            )
+            with closing(self.connect()) as connection, connection:
+                candidate_decisions = self._prospective_candidate_decisions(connection)
+                selected: dict[str, dict[str, Any]] = {}
+                missing: set[str] = set()
+                matched_source_rows = 0
+                for row in rows:
+                    record = self._outcome_record(row, path, attempt)
+                    if record is None:
+                        continue
+                    key = record["canonical_signal_key"]
+                    if key not in candidate_decisions:
+                        missing.add(key)
+                        continue
+                    matched_source_rows += 1
+                    previous = selected.get(key)
+                    if previous is None:
+                        selected[key] = record
+                        continue
+                    old_rank = _outcome_evidence_rank(previous["result"], previous["resolved_at_utc"])
+                    new_rank = _outcome_evidence_rank(record["result"], record["resolved_at_utc"])
+                    if old_rank == new_rank == 3 and previous["result"] != record["result"]:
+                        raise ValueError(f"Conflicting terminal outcomes for {key}")
+                    old_quality = sum(previous.get(name) is not None for name in (
+                        "modeled_r", "resolved_at_utc", "tp1_hit", "tp2_hit", "sl_hit", "time_to_resolution_sec"
+                    ))
+                    new_quality = sum(record.get(name) is not None for name in (
+                        "modeled_r", "resolved_at_utc", "tp1_hit", "tp2_hit", "sl_hit", "time_to_resolution_sec"
+                    ))
+                    if (new_rank, new_quality) > (old_rank, old_quality):
+                        selected[key] = record
+
+                inserted = updated = unchanged = 0
+                matched_by_decision = {"SENT": 0, "REPORT_ONLY": 0, "REJECTED": 0, "SKIPPED": 0}
+                value_names = (
+                    "result", "modeled_r", "resolved_at_utc", "tp1_hit", "tp2_hit", "sl_hit",
+                    "time_to_resolution_sec", "source_name", "source_version",
                 )
-                if not key:
-                    continue
-                result = _text(row.get("result") or row.get("final_outcome") or row.get("outcome")).upper()
-                modeled_r = _float(row.get("result_r") or row.get("net_r_estimate") or row.get("modeled_r"))
-                if modeled_r is None:
-                    target = _text(row.get("hit_target")).upper()
-                    if result == "LOSS" and target == "SL":
-                        modeled_r = -1.0
-                    elif result.startswith("WIN") and target in {"TP2", "TP3"}:
-                        modeled_r = _float(row.get("risk_reward") or row.get("rr"))
-                    elif result.startswith("WIN") and target == "TP1":
-                        entry = _float(row.get("entry") or row.get("entry_low"))
-                        stop = _float(row.get("stop_loss") or row.get("sl"))
-                        tp1 = _float(row.get("tp1"))
-                        risk = abs(entry - stop) if entry is not None and stop is not None else 0.0
-                        modeled_r = abs(tp1 - entry) / risk if entry is not None and tp1 is not None and risk else None
-                resolved = _text(row.get("closed_at") or row.get("resolved_at_utc"))
-                seconds = None
-                try:
-                    start = datetime.fromisoformat(_text(timestamp).replace("Z", "+00:00"))
-                    end = datetime.fromisoformat(resolved.replace("Z", "+00:00"))
-                    seconds = (end - start).total_seconds()
-                except (ValueError, TypeError):
-                    pass
-                existing = connection.execute(
-                    "SELECT result,resolved_at_utc FROM signal_outcomes WHERE canonical_signal_key=?",
-                    (key,),
-                ).fetchone()
-                if existing is not None and _outcome_evidence_rank(result, resolved) < _outcome_evidence_rank(existing[0], existing[1]):
-                    continue
-                connection.execute(
-                    """INSERT INTO signal_outcomes VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(canonical_signal_key) DO UPDATE SET
-                    result=excluded.result, modeled_r=excluded.modeled_r, resolved_at_utc=excluded.resolved_at_utc,
-                    tp1_hit=excluded.tp1_hit, tp2_hit=excluded.tp2_hit, sl_hit=excluded.sl_hit,
-                    time_to_resolution_sec=excluded.time_to_resolution_sec, source_name=excluded.source_name,
-                    source_version=excluded.source_version, last_enriched_at_utc=excluded.last_enriched_at_utc""",
-                    (key, result, modeled_r, normalize_utc(resolved),
-                     _bool_int(row.get("tp1_hit") or ("YES" if _text(row.get("hit_target")).upper() in {"TP1", "TP2", "TP3"} else "")),
-                     _bool_int(row.get("tp2_hit") or ("YES" if _text(row.get("hit_target")).upper() in {"TP2", "TP3"} else "")),
-                     _bool_int(row.get("sl_hit") or ("YES" if _text(row.get("hit_target")).upper() == "SL" else "")),
-                     seconds, path.name, "csv_v1", now),
+                for key, record in selected.items():
+                    decision = candidate_decisions[key]
+                    matched_by_decision[decision] = matched_by_decision.get(decision, 0) + 1
+                    existing = connection.execute(
+                        "SELECT * FROM signal_outcomes WHERE canonical_signal_key=?", (key,)
+                    ).fetchone()
+                    if existing is None:
+                        connection.execute(
+                            """INSERT INTO signal_outcomes
+                            (canonical_signal_key,result,modeled_r,resolved_at_utc,tp1_hit,tp2_hit,sl_hit,
+                             time_to_resolution_sec,source_name,source_version,last_enriched_at_utc)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                            tuple(record[name] for name in ("canonical_signal_key", *value_names, "last_enriched_at_utc")),
+                        )
+                        inserted += 1
+                        continue
+                    old_rank = _outcome_evidence_rank(existing["result"], existing["resolved_at_utc"])
+                    new_rank = _outcome_evidence_rank(record["result"], record["resolved_at_utc"])
+                    if new_rank < old_rank:
+                        unchanged += 1
+                        continue
+                    if old_rank == new_rank == 3 and existing["result"] != record["result"]:
+                        raise ValueError(f"Conflicting terminal outcome for {key}")
+                    merged = {
+                        name: record[name] if record[name] is not None and record[name] != "" else existing[name]
+                        for name in value_names
+                    }
+                    if all(merged[name] == existing[name] for name in value_names):
+                        unchanged += 1
+                        continue
+                    connection.execute(
+                        """UPDATE signal_outcomes SET result=?,modeled_r=?,resolved_at_utc=?,tp1_hit=?,tp2_hit=?,
+                        sl_hit=?,time_to_resolution_sec=?,source_name=?,source_version=?,last_enriched_at_utc=?
+                        WHERE canonical_signal_key=?""",
+                        tuple(merged[name] for name in value_names) + (attempt, key),
+                    )
+                    updated += 1
+                self._set_enrichment_status(
+                    connection, source_name, attempt, attempt, high_water, len(rows), len(selected),
+                    inserted + updated, "",
                 )
-                upserted += 1
-            self._set_enrichment_status(connection, f"outcomes:{path.name}", now, str(len(rows)), "")
-        return {"read": len(rows), "upserted": upserted}
+            return {
+                "source_rows": len(rows),
+                "matched_source_rows": matched_source_rows,
+                "matched_keys": len(selected),
+                "inserted": inserted,
+                "updated": updated,
+                "unchanged": unchanged,
+                "missing_keys": len(missing),
+                "matched_sent": matched_by_decision.get("SENT", 0),
+                "matched_report_only": matched_by_decision.get("REPORT_ONLY", 0),
+                "matched_rejected": matched_by_decision.get("REJECTED", 0),
+                "errors": 0,
+            }
+        except Exception as exc:
+            self._record_enrichment_error(source_name, attempt, exc)
+            raise
+
+    @staticmethod
+    def _execution_record(row: Mapping[str, Any], path: Path, now: str) -> dict[str, Any] | None:
+        key = _text(row.get("canonical_signal_key"))
+        if not key:
+            return None
+        status = _text(_first_present(row, "match_status", "execution_status")).upper()
+        finality = _text(_first_present(row, "execution_finality", "accounting_finality")).upper()
+        evidence_valid = _text(row.get("accounting_evidence_status")).upper() == "ACCOUNTING_EVIDENCE_VALID"
+        explicit_authoritative = _bool_int(row.get("authoritative_eligible"))
+        authoritative = explicit_authoritative if explicit_authoritative is not None else int(
+            status == "MATCHED"
+            and _text(row.get("execution_finality")).upper() == "EXECUTION_FINAL"
+            and _text(row.get("commission_finality")).upper() == "COMMISSION_FINAL"
+            and _text(row.get("funding_finality")).upper() == "FUNDING_FINAL"
+            and _text(row.get("accounting_finality")).upper() == "ACCOUNTING_FINAL"
+            and evidence_valid
+        )
+        return {
+            "canonical_signal_key": key,
+            "execution_status": status or None,
+            "execution_finality": finality or None,
+            "authoritative_eligible": authoritative,
+            "actual_entry_vwap": _float(_first_present(row, "entry_fill_price", "actual_entry_vwap")),
+            "actual_exit_vwap": _float(_first_present(row, "exit_vwap", "actual_exit_vwap")),
+            "gross_realized_pnl": _float(_first_present(row, "gross_realized_pnl_usdt", "gross_realized_pnl")),
+            "commission": _float(_first_present(row, "commission_usdt", "commission")),
+            "execution_pnl": _float(_first_present(row, "execution_pnl_usdt", "execution_pnl")),
+            "gross_r": _float(_first_present(row, "gross_realized_r", "gross_r")),
+            "execution_net_r": _float(_first_present(row, "execution_r", "net_realized_r", "execution_net_r")),
+            "funding_state": _text(_first_present(row, "funding_finality", "funding_status")) or None,
+            "source_name": path.name,
+            "source_version": _text(row.get("record_version")) or "execution_truth_v1",
+            "last_enriched_at_utc": now,
+        }
 
     def enrich_execution(self, execution_path: Path | str) -> dict[str, int]:
         path = Path(execution_path)
-        if not path.exists() or path.stat().st_size == 0:
-            return {"read": 0, "upserted": 0}
-        rows = list(csv.DictReader(path.open("r", encoding="utf-8-sig", newline="")))
-        now = utc_now()
-        upserted = 0
-        with closing(self.connect()) as connection, connection:
-            for row in rows:
-                key = _text(row.get("canonical_signal_key"))
-                if not key:
-                    continue
-                execution_status = _text(row.get("match_status") or row.get("execution_status"))
-                finality = _text(row.get("execution_finality") or row.get("accounting_finality"))
-                evidence_valid = _text(row.get("accounting_evidence_status")) == "ACCOUNTING_EVIDENCE_VALID"
-                explicit_authoritative = _bool_int(row.get("authoritative_eligible"))
-                authoritative = bool(explicit_authoritative) if explicit_authoritative is not None else (
-                    execution_status == "MATCHED"
-                    and _text(row.get("execution_finality")) == "EXECUTION_FINAL"
-                    and _text(row.get("commission_finality")) == "COMMISSION_FINAL"
-                    and _text(row.get("funding_finality")) == "FUNDING_FINAL"
-                    and _text(row.get("accounting_finality")) == "ACCOUNTING_FINAL"
-                    and evidence_valid
+        source_name = f"execution:{path.name}"
+        attempt = utc_now()
+        try:
+            rows = self._read_csv_rows(path)
+            high_water = self._source_high_water(rows, "collected_at_utc", "signal_timestamp_utc")
+            with closing(self.connect()) as connection, connection:
+                candidate_decisions = self._prospective_candidate_decisions(connection)
+                selected: dict[str, dict[str, Any]] = {}
+                missing: set[str] = set()
+                matched_source_rows = 0
+                for row in rows:
+                    record = self._execution_record(row, path, attempt)
+                    if record is None:
+                        continue
+                    key = record["canonical_signal_key"]
+                    if key not in candidate_decisions:
+                        missing.add(key)
+                        continue
+                    matched_source_rows += 1
+                    previous = selected.get(key)
+                    quality = sum(record.get(name) is not None for name in (
+                        "actual_entry_vwap", "actual_exit_vwap", "gross_realized_pnl", "commission",
+                        "execution_pnl", "gross_r", "execution_net_r", "funding_state",
+                    ))
+                    previous_quality = sum(previous.get(name) is not None for name in (
+                        "actual_entry_vwap", "actual_exit_vwap", "gross_realized_pnl", "commission",
+                        "execution_pnl", "gross_r", "execution_net_r", "funding_state",
+                    )) if previous else -1
+                    rank = _execution_evidence_rank(
+                        record["execution_status"], record["execution_finality"], record["authoritative_eligible"]
+                    )
+                    previous_rank = _execution_evidence_rank(
+                        previous["execution_status"], previous["execution_finality"], previous["authoritative_eligible"]
+                    ) if previous else -1
+                    if (rank, quality) > (previous_rank, previous_quality):
+                        selected[key] = record
+
+                inserted = updated = unchanged = authoritative_count = pending_count = 0
+                value_names = (
+                    "execution_status", "execution_finality", "authoritative_eligible", "actual_entry_vwap",
+                    "actual_exit_vwap", "gross_realized_pnl", "commission", "execution_pnl", "gross_r",
+                    "execution_net_r", "funding_state", "source_name", "source_version",
                 )
-                existing = connection.execute(
-                    """SELECT execution_status,execution_finality,authoritative_eligible
-                    FROM execution_truth_links WHERE canonical_signal_key=?""",
-                    (key,),
-                ).fetchone()
-                if existing is not None and _execution_evidence_rank(
-                    execution_status, finality, authoritative
-                ) < _execution_evidence_rank(existing[0], existing[1], existing[2]):
-                    continue
-                connection.execute(
-                    """INSERT INTO execution_truth_links VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(canonical_signal_key) DO UPDATE SET
-                    execution_status=excluded.execution_status, execution_finality=excluded.execution_finality,
-                    authoritative_eligible=excluded.authoritative_eligible, actual_entry_vwap=excluded.actual_entry_vwap,
-                    actual_exit_vwap=excluded.actual_exit_vwap, gross_realized_pnl=excluded.gross_realized_pnl,
-                    commission=excluded.commission, execution_pnl=excluded.execution_pnl, gross_r=excluded.gross_r,
-                    execution_net_r=excluded.execution_net_r, funding_state=excluded.funding_state,
-                    source_name=excluded.source_name, source_version=excluded.source_version,
-                    last_enriched_at_utc=excluded.last_enriched_at_utc""",
-                    (key, execution_status, finality, int(authoritative),
-                     _float(row.get("entry_fill_price") or row.get("actual_entry_vwap")),
-                     _float(row.get("exit_vwap") or row.get("actual_exit_vwap")),
-                     _float(row.get("gross_realized_pnl_usdt") or row.get("gross_realized_pnl")),
-                     _float(row.get("commission_usdt") or row.get("commission")),
-                     _float(row.get("execution_pnl_usdt") or row.get("execution_pnl")),
-                     _float(row.get("gross_realized_r") or row.get("gross_r")),
-                     _float(row.get("execution_r") or row.get("net_realized_r") or row.get("execution_net_r")),
-                     _text(row.get("funding_finality") or row.get("funding_status")), path.name,
-                     _text(row.get("record_version") or "execution_truth_v1"), now),
+                for key, record in selected.items():
+                    authoritative_count += int(bool(record["authoritative_eligible"]))
+                    pending_count += int(not bool(record["authoritative_eligible"]))
+                    existing = connection.execute(
+                        "SELECT * FROM execution_truth_links WHERE canonical_signal_key=?", (key,)
+                    ).fetchone()
+                    if existing is None:
+                        connection.execute(
+                            """INSERT INTO execution_truth_links
+                            (canonical_signal_key,execution_status,execution_finality,authoritative_eligible,
+                             actual_entry_vwap,actual_exit_vwap,gross_realized_pnl,commission,execution_pnl,
+                             gross_r,execution_net_r,funding_state,source_name,source_version,last_enriched_at_utc)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            tuple(record[name] for name in ("canonical_signal_key", *value_names, "last_enriched_at_utc")),
+                        )
+                        inserted += 1
+                        continue
+                    old_rank = _execution_evidence_rank(
+                        existing["execution_status"], existing["execution_finality"], existing["authoritative_eligible"]
+                    )
+                    new_rank = _execution_evidence_rank(
+                        record["execution_status"], record["execution_finality"], record["authoritative_eligible"]
+                    )
+                    if new_rank < old_rank:
+                        unchanged += 1
+                        continue
+                    merged = {
+                        name: record[name] if record[name] is not None and record[name] != "" else existing[name]
+                        for name in value_names
+                    }
+                    if existing["authoritative_eligible"]:
+                        merged["authoritative_eligible"] = 1
+                    if all(merged[name] == existing[name] for name in value_names):
+                        unchanged += 1
+                        continue
+                    connection.execute(
+                        """UPDATE execution_truth_links SET execution_status=?,execution_finality=?,
+                        authoritative_eligible=?,actual_entry_vwap=?,actual_exit_vwap=?,gross_realized_pnl=?,
+                        commission=?,execution_pnl=?,gross_r=?,execution_net_r=?,funding_state=?,source_name=?,
+                        source_version=?,last_enriched_at_utc=? WHERE canonical_signal_key=?""",
+                        tuple(merged[name] for name in value_names) + (attempt, key),
+                    )
+                    updated += 1
+                self._set_enrichment_status(
+                    connection, source_name, attempt, attempt, high_water, len(rows), len(selected),
+                    inserted + updated, "",
                 )
-                upserted += 1
-            self._set_enrichment_status(connection, f"execution:{path.name}", now, str(len(rows)), "")
-        return {"read": len(rows), "upserted": upserted}
+            return {
+                "source_rows": len(rows),
+                "matched_source_rows": matched_source_rows,
+                "matched_keys": len(selected),
+                "inserted": inserted,
+                "updated": updated,
+                "unchanged": unchanged,
+                "missing_keys": len(missing),
+                "authoritative": authoritative_count,
+                "pending": pending_count,
+                "errors": 0,
+            }
+        except Exception as exc:
+            self._record_enrichment_error(source_name, attempt, exc)
+            raise
 
     @staticmethod
-    def _set_enrichment_status(connection: sqlite3.Connection, name: str, success: str, high_water: str, error: str) -> None:
+    def _set_enrichment_status(
+        connection: sqlite3.Connection,
+        name: str,
+        attempt: str,
+        success: str | None,
+        high_water: str,
+        source_rows: int,
+        rows_matched: int,
+        rows_updated: int,
+        error: str,
+    ) -> None:
         connection.execute(
-            """INSERT INTO enrichment_status VALUES (?,?,?,?)
-            ON CONFLICT(source_name) DO UPDATE SET last_success_utc=excluded.last_success_utc,
-            high_water=excluded.high_water,last_error=excluded.last_error""",
-            (name, success, high_water, error),
+            """INSERT INTO enrichment_status
+            (source_name,last_success_utc,high_water,last_error,last_attempt_utc,
+             source_rows_seen,rows_matched,rows_updated)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(source_name) DO UPDATE SET
+            last_attempt_utc=excluded.last_attempt_utc,
+            last_success_utc=COALESCE(excluded.last_success_utc,enrichment_status.last_success_utc),
+            high_water=CASE WHEN excluded.last_success_utc IS NULL THEN enrichment_status.high_water ELSE excluded.high_water END,
+            source_rows_seen=CASE WHEN excluded.last_success_utc IS NULL THEN enrichment_status.source_rows_seen ELSE excluded.source_rows_seen END,
+            rows_matched=CASE WHEN excluded.last_success_utc IS NULL THEN enrichment_status.rows_matched ELSE excluded.rows_matched END,
+            rows_updated=CASE WHEN excluded.last_success_utc IS NULL THEN enrichment_status.rows_updated ELSE excluded.rows_updated END,
+            last_error=excluded.last_error""",
+            (name, success, high_water, error, attempt, source_rows, rows_matched, rows_updated),
         )
+
+    def _record_enrichment_error(self, name: str, attempt: str, exc: Exception) -> None:
+        try:
+            with closing(self.connect()) as connection, connection:
+                self._set_enrichment_status(
+                    connection, name, attempt, None, "", 0, 0, 0,
+                    f"{type(exc).__name__}: {exc}",
+                )
+        except Exception:
+            # A corrupt or locked DB cannot record its own failure.  Preserve the
+            # original exception so the CLI exits nonzero and systemd records it.
+            pass
 
 
 class FailOpenResearchTelemetry:
@@ -965,7 +1242,10 @@ def ingest_shadow_csv(store: ResearchTelemetryStore, path: Path, shadow_name: st
                      _text(row.get("shadow_reason") or row.get("reason") or row.get("rejection_reason")),
                      _json(row), normalize_utc(row.get("generated_at_utc") or row.get("timestamp") or now)),
                 ).rowcount
-        store._set_enrichment_status(connection, f"shadow:{path.name}", now, str(len(rows)), "")
+        store._set_enrichment_status(
+            connection, f"shadow:{path.name}", now, now, str(len(rows)),
+            len(rows), linked, linked, "",
+        )
     return {"read": len(rows), "linked": linked}
 
 
@@ -1049,6 +1329,18 @@ ANALYSIS_QUERIES: dict[str, str] = {
 }
 
 
+def _enrichment_health_state(row: Mapping[str, Any], *, now: datetime | None = None) -> str:
+    if _text(row.get("last_error")):
+        return "ERROR"
+    if int(row.get("source_rows_seen") or 0) == 0:
+        return "NO_DATA"
+    success = _utc_datetime(row.get("last_success_utc"))
+    current = now or datetime.now(timezone.utc)
+    if success is None or current - success > timedelta(minutes=45):
+        return "STALE"
+    return "HEALTHY"
+
+
 def health(store: ResearchTelemetryStore) -> dict[str, Any]:
     result: dict[str, Any] = {"db_readable": False, "db_size_bytes": store.path.stat().st_size if store.path.exists() else 0}
     with closing(store.connect(read_only=True)) as connection:
@@ -1071,6 +1363,23 @@ def health(store: ResearchTelemetryStore) -> dict[str, Any]:
             )
         }
         result["last_enrichment_timestamp"] = connection.execute("SELECT MAX(last_success_utc) FROM enrichment_status").fetchone()[0]
+        enrichment_rows = connection.execute(
+            """SELECT source_name,last_attempt_utc,last_success_utc,high_water,source_rows_seen,
+            rows_matched,rows_updated,last_error FROM enrichment_status ORDER BY source_name"""
+        ).fetchall()
+        result["enrichment_sources"] = {
+            row["source_name"]: {
+                "status": _enrichment_health_state(dict(row)),
+                "last_attempt_utc": row["last_attempt_utc"],
+                "last_success_utc": row["last_success_utc"],
+                "high_water": row["high_water"],
+                "source_rows_seen": row["source_rows_seen"],
+                "rows_matched": row["rows_matched"],
+                "rows_updated": row["rows_updated"],
+                "last_error": row["last_error"],
+            }
+            for row in enrichment_rows
+        }
         result["duplicate_candidate_keys"] = connection.execute(
             "SELECT COUNT(*) FROM (SELECT candidate_key FROM candidates GROUP BY candidate_key HAVING COUNT(*)>1)"
         ).fetchone()[0]
@@ -1097,7 +1406,16 @@ def summary(store: ResearchTelemetryStore) -> dict[str, Any]:
         data["resolved_outcomes"] = connection.execute(
             "SELECT COUNT(*) FROM signal_outcomes WHERE result NOT IN ('','OPEN')"
         ).fetchone()[0]
+        for decision in ("SENT", "REPORT_ONLY", "REJECTED"):
+            data[f"resolved_{decision.lower()}"] = connection.execute(
+                """SELECT COUNT(*) FROM candidates c JOIN signal_outcomes o USING(canonical_signal_key)
+                WHERE c.source_mode='PROSPECTIVE' AND c.decision=? AND o.result IN ('WIN','LOSS')""",
+                (decision,),
+            ).fetchone()[0]
         data["execution_linked"] = connection.execute("SELECT COUNT(*) FROM execution_truth_links").fetchone()[0]
+        data["authoritative_execution"] = connection.execute(
+            "SELECT COUNT(*) FROM execution_truth_links WHERE authoritative_eligible=1"
+        ).fetchone()[0]
         data["feature_coverage"] = connection.execute(
             "SELECT COUNT(*) FROM candidate_features WHERE rsi IS NOT NULL OR mfi IS NOT NULL OR atr IS NOT NULL"
         ).fetchone()[0]
@@ -1168,16 +1486,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="NAME=PATH",
         help="Compatibility-ingest a shadow CSV after candidates (repeatable).",
     )
-    enrich_parser = sub.add_parser("enrich")
-    enrich_parser.add_argument("--signals", type=Path, default=Path("logs/signals.csv"))
-    enrich_parser.add_argument("--execution", type=Path, default=Path("logs/binance_execution_truth_v1.csv"))
+    enrich_commands = {}
+    for command in ("enrich", "enrich-all"):
+        enrich_commands[command] = sub.add_parser(command)
+        enrich_commands[command].add_argument("--signals", type=Path, default=Path("logs/signals.csv"))
+        enrich_commands[command].add_argument(
+            "--execution", type=Path, default=Path("logs/binance_execution_truth_v1.csv")
+        )
+    outcomes_parser = sub.add_parser("enrich-outcomes")
+    outcomes_parser.add_argument("--signals", type=Path, default=Path("logs/signals.csv"))
+    execution_parser = sub.add_parser("enrich-execution")
+    execution_parser.add_argument("--execution", type=Path, default=Path("logs/binance_execution_truth_v1.csv"))
     bench_parser = sub.add_parser("benchmark")
     bench_parser.add_argument("--count", type=int, default=10_000)
     args = parser.parse_args(argv)
     if args.command == "benchmark":
         _print_mapping("Research Telemetry Benchmark", benchmark(args.count))
         return 0
-    store = ResearchTelemetryStore(args.db)
+    try:
+        store = ResearchTelemetryStore(args.db)
+    except Exception as exc:
+        print(f"Research telemetry initialization failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     if args.command in {"status", "summary"}:
         _print_mapping("Research Telemetry", summary(store))
     elif args.command == "health":
@@ -1219,9 +1549,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             name, raw_path = spec.split("=", 1)
             result[f"shadow:{name}"] = ingest_shadow_csv(store, Path(raw_path), name)
         print(json.dumps(result, indent=2, sort_keys=True))
-    elif args.command == "enrich":
-        result = {"outcomes": store.enrich_outcomes(args.signals), "execution": store.enrich_execution(args.execution)}
-        print(json.dumps(result, indent=2, sort_keys=True))
+    elif args.command in {"enrich", "enrich-all", "enrich-outcomes", "enrich-execution"}:
+        try:
+            if args.command == "enrich-outcomes":
+                result = {"outcomes": store.enrich_outcomes(args.signals)}
+            elif args.command == "enrich-execution":
+                result = {"execution": store.enrich_execution(args.execution)}
+            else:
+                result = {
+                    "outcomes": store.enrich_outcomes(args.signals),
+                    "execution": store.enrich_execution(args.execution),
+                }
+            print(json.dumps(result, indent=2, sort_keys=True))
+        except Exception as exc:
+            print(f"Research enrichment failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
     return 0
 
 

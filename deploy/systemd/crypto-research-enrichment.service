@@ -1,0 +1,11 @@
+[Unit]
+Description=Crypto Scanner Unified Research Telemetry Enrichment
+After=local-fs.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python -m core.research_telemetry enrich-all
+StandardOutput=journal
+StandardError=journal
