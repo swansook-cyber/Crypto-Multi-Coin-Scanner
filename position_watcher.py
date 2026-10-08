@@ -26,6 +26,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from core.analytics_reporting import load_csv_safely
+from core.binance_symbols import binance_usdm_market_symbol
 from telegram_sender import TelegramRoutes, send_text
 
 
@@ -329,7 +330,11 @@ def position_is_valid_for_command(row: pd.Series) -> tuple[bool, str]:
 
 
 def fetch_current_price(session: requests.Session, symbol: str) -> float:
-    response = session.get(BINANCE_PRICE_URL, params={"symbol": symbol.upper()}, timeout=10)
+    canonical_symbol = str(symbol).strip().upper()
+    market_symbol = binance_usdm_market_symbol(canonical_symbol)
+    if market_symbol != canonical_symbol:
+        LOGGER.info("BINANCE MARKET SYMBOL canonical=%s exchange=%s", canonical_symbol, market_symbol)
+    response = session.get(BINANCE_PRICE_URL, params={"symbol": market_symbol}, timeout=10)
     response.raise_for_status()
     data = response.json()
     return float(data["price"])

@@ -10,6 +10,7 @@ decisions.
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import time
@@ -24,10 +25,12 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from core.binance_symbols import binance_usdm_market_symbol
 from core.signal_identity import canonical_signal_key, normalize_side, normalize_symbol, normalize_timestamp
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
+LOGGER = logging.getLogger("moving_sl_prospective_shadow")
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 TIMEFRAME = "15m"
 SHADOW_VERSION = "moving-sl-shadow-v1"
@@ -532,10 +535,14 @@ def build_session() -> requests.Session:
 
 
 def fetch_futures_klines(session: requests.Session, symbol: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
+    canonical_symbol = normalize_symbol(symbol)
+    market_symbol = binance_usdm_market_symbol(canonical_symbol)
+    if market_symbol != canonical_symbol:
+        LOGGER.info("BINANCE MARKET SYMBOL canonical=%s exchange=%s", canonical_symbol, market_symbol)
     response = session.get(
         BINANCE_FUTURES_KLINES,
         params={
-            "symbol": normalize_symbol(symbol),
+            "symbol": market_symbol,
             "interval": TIMEFRAME,
             "startTime": int(start_ts.timestamp() * 1000),
             "endTime": int(end_ts.timestamp() * 1000),

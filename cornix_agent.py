@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from core.binance_symbols import binance_usdm_market_symbol
 from core.btc_regime_filter import detect_btc_regime
 from core.cross_scan_exposure_shadow import (
     CrossScanExposureShadowLogger,
@@ -519,7 +520,16 @@ class MarketDataClient:
 
     def fetch_klines(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
         self._rate_limit_pause()
-        params = {"symbol": SymbolFormatter.to_binance_symbol(symbol), "interval": interval, "limit": limit}
+        canonical_symbol = SymbolFormatter.to_binance_symbol(symbol)
+        market_symbol = binance_usdm_market_symbol(canonical_symbol)
+        if market_symbol != canonical_symbol:
+            LOGGER.info(
+                "BINANCE MARKET SYMBOL canonical=%s exchange=%s endpoint=%s",
+                canonical_symbol,
+                market_symbol,
+                self.BASE_URL,
+            )
+        params = {"symbol": market_symbol, "interval": interval, "limit": limit}
         response = self.session.get(self.BASE_URL, params=params, timeout=15)
         response.raise_for_status()
         data = response.json()

@@ -17,6 +17,7 @@ import pandas as pd
 import requests
 
 from core.analytics_reporting import load_csv_safely
+from core.binance_symbols import binance_usdm_market_symbol
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -134,9 +135,13 @@ def _format_price(value: float) -> str:
 
 
 def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    canonical_symbol = str(symbol).strip().upper()
+    market_symbol = binance_usdm_market_symbol(canonical_symbol)
+    if market_symbol != canonical_symbol:
+        LOGGER.info("BINANCE MARKET SYMBOL canonical=%s exchange=%s", canonical_symbol, market_symbol)
     response = requests.get(
         BINANCE_FUTURES_KLINES,
-        params={"symbol": symbol.upper(), "interval": interval, "limit": limit},
+        params={"symbol": market_symbol, "interval": interval, "limit": limit},
         timeout=20,
     )
     response.raise_for_status()

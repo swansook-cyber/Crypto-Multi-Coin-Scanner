@@ -22,6 +22,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from core.binance_symbols import binance_usdm_market_symbol
 from core.signal_identity import canonical_signal_key, normalize_float, normalize_side, normalize_symbol, normalize_timestamp
 
 
@@ -387,9 +388,13 @@ def build_session() -> requests.Session:
 
 
 def fetch_futures_klines(session: requests.Session, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    canonical_symbol = normalize_symbol(symbol)
+    market_symbol = binance_usdm_market_symbol(canonical_symbol)
+    if market_symbol != canonical_symbol:
+        LOGGER.info("BINANCE MARKET SYMBOL canonical=%s exchange=%s", canonical_symbol, market_symbol)
     response = session.get(
         BINANCE_FUTURES_KLINES,
-        params={"symbol": normalize_symbol(symbol), "interval": TIMEFRAME, "startTime": start_ms, "endTime": end_ms, "limit": 1000},
+        params={"symbol": market_symbol, "interval": TIMEFRAME, "startTime": start_ms, "endTime": end_ms, "limit": 1000},
         timeout=20,
     )
     response.raise_for_status()

@@ -20,6 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from core.analytics_engine import update_validation_artifacts
+from core.binance_symbols import binance_usdm_market_symbol
 from core.outcome_tracker import HISTORY_COLUMNS, sync_history_files
 
 
@@ -585,19 +586,21 @@ def send_test_report(session: requests.Session) -> bool:
 
 def fetch_klines(session: requests.Session, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     normalized_symbol = clean_symbol(symbol)
+    market_symbol = binance_usdm_market_symbol(normalized_symbol)
     params = {
-        "symbol": normalized_symbol,
+        "symbol": market_symbol,
         "interval": OUTCOME_TIMEFRAME,
         "startTime": start_ms,
         "endTime": end_ms,
         "limit": 1000,
     }
     LOGGER.info(
-        "OUTCOME PRICE SOURCE exchange=%s market_type=%s endpoint=%s symbol=%s timeframe=%s start_ms=%s end_ms=%s",
+        "OUTCOME PRICE SOURCE exchange=%s market_type=%s endpoint=%s symbol=%s exchange_symbol=%s timeframe=%s start_ms=%s end_ms=%s",
         OUTCOME_EXCHANGE,
         OUTCOME_MARKET_TYPE,
         BINANCE_FUTURES_KLINES,
         normalized_symbol,
+        market_symbol,
         OUTCOME_TIMEFRAME,
         start_ms,
         end_ms,
