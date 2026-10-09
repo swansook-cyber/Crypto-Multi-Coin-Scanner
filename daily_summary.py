@@ -62,6 +62,15 @@ REQUIRED_COLUMNS = {
     "confidence": "",
     "btc_regime": "",
     "wave_score": "",
+    "entry": "",
+    "sl": "",
+    "stop_loss": "",
+    "tp1": "",
+    "tp2": "",
+    "lifecycle_state": "",
+    "lifecycle_r": "",
+    "lifecycle_terminal": 0,
+    "remainder_resolution_time_utc": "",
 }
 
 
@@ -80,6 +89,33 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["closed_at"] = pd.to_datetime(df["closed_at"], utc=True, errors="coerce")
     df["result"] = df["result"].fillna("OPEN").astype(str).str.upper()
     df["hit_target"] = df["hit_target"].fillna("").astype(str).str.upper()
+    df["lifecycle_state"] = df["lifecycle_state"].fillna("").astype(str).str.upper()
+    df["lifecycle_r"] = pd.to_numeric(df["lifecycle_r"], errors="coerce")
+    df["lifecycle_terminal"] = df["lifecycle_terminal"].fillna(0).astype(str).str.lower().isin(["1", "true", "yes"])
+    legacy_loss = df["lifecycle_state"].eq("") & df["result"].eq("LOSS")
+    df.loc[legacy_loss, "lifecycle_state"] = "ORIGINAL_SL"
+    df.loc[legacy_loss, "lifecycle_r"] = -1.0
+    df.loc[legacy_loss, "lifecycle_terminal"] = True
+    legacy_tp2 = df["lifecycle_state"].eq("") & df["result"].eq("WIN") & df["hit_target"].eq("TP2")
+    entry = pd.to_numeric(df["entry"], errors="coerce")
+    stop = pd.to_numeric(df["sl"].where(df["sl"].fillna("").astype(str).str.strip().ne(""), df["stop_loss"]), errors="coerce")
+    tp1_price = pd.to_numeric(df["tp1"], errors="coerce")
+    tp2_price = pd.to_numeric(df["tp2"], errors="coerce")
+    risk = (entry - stop).abs()
+    valid_tp2 = legacy_tp2 & risk.gt(0) & pd.concat([entry, stop, tp1_price, tp2_price], axis=1).notna().all(axis=1)
+    df.loc[valid_tp2, "lifecycle_state"] = "TP2_WIN"
+    df.loc[valid_tp2, "lifecycle_r"] = 0.5 * (tp1_price[valid_tp2] - entry[valid_tp2]).abs() / risk[valid_tp2] + 0.5 * (tp2_price[valid_tp2] - entry[valid_tp2]).abs() / risk[valid_tp2]
+    df.loc[valid_tp2, "lifecycle_terminal"] = True
+    unresolved = df["lifecycle_state"].isin(["TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"])
+    legacy_tp1_only = df["lifecycle_state"].eq("") & df["result"].eq("WIN") & df["hit_target"].isin(["", "TP1"])
+    df.loc[legacy_tp1_only, "lifecycle_state"] = "TP1_TOUCHED_REMAINDER_OPEN"
+    df.loc[unresolved | legacy_tp1_only, "result"] = "OPEN"
+    resolved = df["lifecycle_terminal"] & df["lifecycle_r"].notna()
+    df.loc[resolved & df["lifecycle_r"].gt(0), "result"] = "WIN"
+    df.loc[resolved & df["lifecycle_r"].lt(0), "result"] = "LOSS"
+    df.loc[resolved & df["lifecycle_r"].eq(0), "result"] = "BREAKEVEN"
+    lifecycle_closed_at = pd.to_datetime(df["remainder_resolution_time_utc"], utc=True, errors="coerce")
+    df.loc[df["lifecycle_terminal"] & lifecycle_closed_at.notna(), "closed_at"] = lifecycle_closed_at
     if df["outcome"].fillna("").astype(str).str.strip().eq("").all():
         result = df["result"].fillna("").astype(str).str.upper()
         target = df["hit_target"].fillna("").astype(str).str.upper().replace("", "TP1")
@@ -96,7 +132,10 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["watchlist_tier"] = df["watchlist_tier"].fillna("-").replace("", "-").astype(str).str.upper()
     df["score_bucket"] = df["score_bucket"].fillna("-").replace("", "-")
     df["real_rr"] = pd.to_numeric(df["real_rr"], errors="coerce")
+    df.loc[df["lifecycle_r"].notna(), "real_rr"] = df.loc[df["lifecycle_r"].notna(), "lifecycle_r"]
+    df.loc[unresolved | legacy_tp1_only, "real_rr"] = pd.NA
     df["pnl_percent"] = pd.to_numeric(df["pnl_percent"], errors="coerce")
+    df.loc[unresolved | legacy_tp1_only, "pnl_percent"] = 0.0
     df["wave_score"] = pd.to_numeric(df["wave_score"], errors="coerce")
     df["btc_regime"] = df["btc_regime"].fillna("unclear").replace("", "unclear").astype(str).str.lower()
     return df
@@ -183,11 +222,13 @@ def build_daily_summary(df: pd.DataFrame, date: str | None = None) -> dict[str, 
         day_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == date].copy()
 
     total = int(len(day_df))
-    tp1 = int((day_df["outcome"] == "WIN_TP1").sum()) if total else 0
-    tp2 = int((day_df["outcome"] == "WIN_TP2").sum()) if total else 0
-    sl = int((day_df["outcome"] == "LOSS").sum()) if total else 0
+    lifecycle = day_df["lifecycle_state"] if total else pd.Series(dtype=str)
+    tp1 = int((lifecycle.isin(["TP1_TOUCHED_REMAINDER_OPEN", "TP1_THEN_ORIGINAL_SL", "TP1_THEN_PROTECTIVE_STOP", "TP2_WIN"]) | day_df["outcome"].eq("WIN_TP1")).sum()) if total else 0
+    tp2 = int((lifecycle.eq("TP2_WIN") | day_df["outcome"].eq("WIN_TP2")).sum()) if total else 0
+    sl = int((day_df["result"] == "LOSS").sum()) if total else 0
     pending = int((day_df["result"] == "OPEN").sum()) if total else 0
-    closed_count = tp1 + tp2 + sl
+    wins = int((day_df["result"] == "WIN").sum()) if total else 0
+    closed_count = wins + sl
     holding_minutes = pd.to_numeric(day_df["holding_minutes"], errors="coerce")
     if holding_minutes.dropna().empty:
         holding_minutes = (day_df["closed_at"] - day_df["timestamp"]).dt.total_seconds().div(60)
@@ -202,13 +243,13 @@ def build_daily_summary(df: pd.DataFrame, date: str | None = None) -> dict[str, 
     return {
         "date": date,
         "total_signals": total,
-        "wins": tp1 + tp2,
+        "wins": wins,
         "losses": sl,
         "tp1_hits": tp1,
         "tp2_hits": tp2,
         "sl_hits": sl,
         "pending": pending,
-        "win_rate": (tp1 + tp2) / closed_count * 100 if closed_count else 0.0,
+        "win_rate": wins / closed_count * 100 if closed_count else 0.0,
         "net_rr": day_df["real_rr"].fillna(0).sum() if "real_rr" in day_df else 0.0,
         "max_drawdown": perf["max_drawdown"],
         "equity_change_pct": day_df["pnl_percent"].fillna(0).sum() if "pnl_percent" in day_df else 0.0,

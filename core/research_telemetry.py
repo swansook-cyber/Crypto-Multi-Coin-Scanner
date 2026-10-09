@@ -29,7 +29,7 @@ from core.signal_identity import canonical_signal_key, normalize_side, normalize
 
 
 LOGGER = logging.getLogger(__name__)
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 FEATURE_SCHEMA_VERSION = 1
 DEFAULT_DB_PATH = Path("research/scanner_research_v1.db")
 VALID_SOURCE_MODES = {"PROSPECTIVE", "HISTORICAL_BACKFILL"}
@@ -499,7 +499,16 @@ ALTER TABLE enrichment_status ADD COLUMN rows_updated INTEGER NOT NULL DEFAULT 0
 """
 
 
-MIGRATIONS = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3}
+MIGRATION_4 = """
+CREATE TABLE IF NOT EXISTS shadow_boundaries (
+    shadow_name TEXT PRIMARY KEY,
+    prospective_start_utc TEXT NOT NULL,
+    created_at_utc TEXT NOT NULL
+);
+"""
+
+
+MIGRATIONS = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3, 4: MIGRATION_4}
 
 
 def _sql_statements(script: str) -> Iterable[str]:
@@ -582,6 +591,27 @@ class ResearchTelemetryStore:
     def boundary(self) -> str:
         if self._prospective_start_utc:
             return self._prospective_start_utc
+
+    def shadow_boundary(self, shadow_name: str, *, requested_start_utc: str = "") -> str:
+        """Return an immutable first-activation boundary that can never be backdated."""
+        name = _text(shadow_name)
+        if not name:
+            raise ValueError("shadow_name is required")
+        now_text = utc_now()
+        now_value = _utc_datetime(now_text)
+        requested = _utc_datetime(requested_start_utc)
+        effective = max(value for value in (now_value, requested) if value is not None)
+        effective_text = effective.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO shadow_boundaries
+                (shadow_name,prospective_start_utc,created_at_utc) VALUES (?,?,?)""",
+                (name, effective_text, now_text),
+            )
+            row = connection.execute(
+                "SELECT prospective_start_utc FROM shadow_boundaries WHERE shadow_name=?", (name,)
+            ).fetchone()
+        return _text(row[0]) if row else ""
         with closing(self.connect(read_only=True)) as connection:
             row = connection.execute("SELECT prospective_start_utc FROM research_meta WHERE singleton=1").fetchone()
             self._prospective_start_utc = _text(row[0]) if row else ""
@@ -748,6 +778,54 @@ class ResearchTelemetryStore:
                     observation.source_name, observation.source_version, imported, created,
                 ),
             ).rowcount == 1
+
+    def upsert_shadow_for_signal(
+        self,
+        canonical_signal_key_value: str,
+        decision: ShadowDecision,
+        *,
+        minimum_candidate_time_utc: str = "",
+    ) -> bool:
+        """Attach evolving shadow evidence to the newest matching prospective candidate."""
+        signal_key = _text(canonical_signal_key_value)
+        if not signal_key:
+            return False
+        boundary = _utc_datetime(minimum_candidate_time_utc)
+        with closing(self.connect()) as connection, connection:
+            rows = connection.execute(
+                """SELECT candidate_key,timestamp_utc FROM candidates
+                WHERE canonical_signal_key=? AND source_mode='PROSPECTIVE'
+                ORDER BY recorded_at_utc DESC""",
+                (signal_key,),
+            ).fetchall()
+            candidate_key = ""
+            for row in rows:
+                candidate_time = _utc_datetime(row["timestamp_utc"])
+                if boundary is None or (candidate_time is not None and candidate_time >= boundary):
+                    candidate_key = row["candidate_key"]
+                    break
+            if not candidate_key:
+                return False
+            connection.execute(
+                """INSERT INTO shadow_decisions
+                (candidate_key,shadow_name,shadow_version,decision,reason,metrics_json,evaluated_at_utc)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(candidate_key,shadow_name,shadow_version) DO UPDATE SET
+                    decision=excluded.decision,
+                    reason=excluded.reason,
+                    metrics_json=excluded.metrics_json,
+                    evaluated_at_utc=excluded.evaluated_at_utc""",
+                (
+                    candidate_key,
+                    decision.name,
+                    decision.version,
+                    decision.decision,
+                    decision.reason,
+                    _json(decision.metrics),
+                    normalize_utc(decision.evaluated_at_utc or utc_now()),
+                ),
+            )
+        return True
 
     @staticmethod
     def _read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -1170,6 +1248,24 @@ class FailOpenResearchTelemetry:
             LOGGER.warning("Research telemetry pre-candidate observation failed open: %s", exc)
             return False
 
+    def upsert_shadow_for_signal(self, *args: Any, **kwargs: Any) -> bool:
+        if self.store is None:
+            return False
+        try:
+            return self.store.upsert_shadow_for_signal(*args, **kwargs)
+        except Exception as exc:
+            LOGGER.warning("Research telemetry post-TP1 shadow failed open: %s", exc)
+            return False
+
+    def shadow_boundary(self, *args: Any, **kwargs: Any) -> str:
+        if self.store is None:
+            return ""
+        try:
+            return self.store.shadow_boundary(*args, **kwargs)
+        except Exception as exc:
+            LOGGER.warning("Research telemetry shadow boundary failed open: %s", exc)
+            return ""
+
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists() or path.stat().st_size == 0:
@@ -1423,6 +1519,151 @@ def summary(store: ResearchTelemetryStore) -> dict[str, Any]:
         return data
 
 
+def post_tp1_shadow_metrics(store: ResearchTelemetryStore) -> dict[str, Any]:
+    """Promotion evidence for the delayed +0.25R shadow, excluding ambiguity/unresolved rows."""
+    shadow_name = "post_tp1_delayed_quarter_r_v1"
+    with closing(store.connect(read_only=True)) as connection:
+        rows = connection.execute(
+            """SELECT c.timestamp_utc,c.side,c.session,c.tier,s.decision,s.metrics_json
+            FROM shadow_decisions s JOIN candidates c USING(candidate_key)
+            WHERE s.shadow_name=? AND c.source_mode='PROSPECTIVE'
+            ORDER BY c.timestamp_utc,c.candidate_key""",
+            (shadow_name,),
+        ).fetchall()
+    parsed: list[dict[str, Any]] = []
+    ambiguous = 0
+    unresolved = 0
+    eligible_tp1 = 0
+    shadow_action_n = 0
+    keep_original_n = 0
+    for row in rows:
+        try:
+            metrics = json.loads(row["metrics_json"] or "{}")
+        except json.JSONDecodeError:
+            metrics = {}
+        decision = _text(row["decision"]).upper()
+        if _text(metrics.get("tp1_touch_utc") or metrics.get("tp1_touch_time_utc")):
+            eligible_tp1 += 1
+        action = _text(metrics.get("shadow_action")).upper()
+        shadow_action_n += int(action == "MOVE_REMAINDER_STOP_TO_PLUS_0.25R")
+        keep_original_n += int(action == "KEEP_ORIGINAL_SL")
+        if decision == "SAME_CANDLE_AMBIGUOUS":
+            ambiguous += 1
+            continue
+        baseline_r = _float(metrics.get("baseline_r"))
+        shadow_r = _float(metrics.get("shadow_r"))
+        if decision == "UNRESOLVED" or baseline_r is None or shadow_r is None:
+            unresolved += 1
+            continue
+        parsed.append({
+            "timestamp_utc": row["timestamp_utc"], "side": row["side"],
+            "session": row["session"] or "UNKNOWN", "tier": row["tier"] or "UNKNOWN",
+            "decision": decision, "baseline_state": _text(metrics.get("baseline_lifecycle_state")).upper(),
+            "baseline_r": baseline_r, "shadow_r": shadow_r,
+        })
+
+    def max_drawdown(values: list[float]) -> float:
+        equity = peak = worst = 0.0
+        for value in values:
+            equity += value
+            peak = max(peak, equity)
+            worst = max(worst, peak - equity)
+        return round(worst, 6)
+
+    def breakdown(field_name: str) -> dict[str, dict[str, Any]]:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for item in parsed:
+            if field_name == "month":
+                parsed_time = _utc_datetime(item["timestamp_utc"])
+                key = parsed_time.strftime("%Y-%m") if parsed_time else "UNKNOWN"
+            else:
+                key = _text(item.get(field_name)) or "UNKNOWN"
+            groups.setdefault(key, []).append(item)
+        return {
+            key: {
+                "n": len(items),
+                "baseline_net_r": round(sum(item["baseline_r"] for item in items), 6),
+                "shadow_net_r": round(sum(item["shadow_r"] for item in items), 6),
+                "delta_r": round(sum(item["shadow_r"] - item["baseline_r"] for item in items), 6),
+            }
+            for key, items in sorted(groups.items())
+        }
+
+    baseline_values = [item["baseline_r"] for item in parsed]
+    shadow_values = [item["shadow_r"] for item in parsed]
+    tp2_population = [item for item in parsed if item["baseline_state"] == "TP2_WIN"]
+    retained = sum(item["decision"] == "SHADOW_TP2" for item in tp2_population)
+    sacrificed = sum(item["shadow_r"] < item["baseline_r"] for item in tp2_population)
+    improved_tp1_sl = sum(
+        item["baseline_state"] == "TP1_THEN_ORIGINAL_SL" and item["shadow_r"] > item["baseline_r"]
+        for item in parsed
+    )
+    changed = [item for item in parsed if abs(item["shadow_r"] - item["baseline_r"]) > 1e-12]
+    positive_deltas = [item["shadow_r"] - item["baseline_r"] for item in changed if item["shadow_r"] > item["baseline_r"]]
+    total_positive_delta = sum(positive_deltas)
+    concentration = max(positive_deltas) / total_positive_delta if total_positive_delta > 0 else None
+    changed_months = {
+        parsed_time.strftime("%Y-%m")
+        for item in changed
+        if (parsed_time := _utc_datetime(item["timestamp_utc"])) is not None
+    }
+    asia_long_delta = sum(
+        item["shadow_r"] - item["baseline_r"]
+        for item in parsed
+        if item["side"] == "LONG" and "ASIA" in item["session"].upper()
+    )
+    baseline_dd = max_drawdown(baseline_values)
+    shadow_dd = max_drawdown(shadow_values)
+    cumulative_delta = sum(s - b for b, s in zip(baseline_values, shadow_values))
+    promotion_checks = {
+        "multiple_independent_changed_outcomes": len(changed) >= 2,
+        "delta_exceeds_cost_noise": cumulative_delta > 0.25,
+        "asia_long_not_damaged": asia_long_delta >= 0,
+        "no_single_trade_concentration": concentration is not None and concentration <= 0.75,
+        "multiple_market_periods": len(changed_months) >= 2,
+        "max_drawdown_not_worse": shadow_dd <= baseline_dd,
+        "no_lookahead_design_verified": True,
+        "sufficient_15m_price_granularity": ambiguous == 0,
+        # Design review cannot prove Cornix remainder-only timing behavior.
+        "executable_stop_semantics_verified": False,
+    }
+    result = {
+        "shadow_name": shadow_name,
+        "eligible_tp1_n": eligible_tp1,
+        "resolved_eligible_n": len(parsed),
+        "shadow_action_n": shadow_action_n,
+        "keep_original_sl_n": keep_original_n,
+        "eligible_n": len(parsed),
+        "baseline_net_r": round(sum(baseline_values), 6),
+        "shadow_net_r": round(sum(shadow_values), 6),
+        "delta_r": round(cumulative_delta, 6),
+        "baseline_max_drawdown_r": baseline_dd,
+        "shadow_max_drawdown_r": shadow_dd,
+        "tp2_retention_n": retained,
+        "tp2_population_n": len(tp2_population),
+        "tp2_retention_rate": round(retained / len(tp2_population), 6) if tp2_population else None,
+        "tp2_winners_preserved": retained,
+        "tp2_winners_sacrificed": sacrificed,
+        "tp1_to_sl_improved": improved_tp1_sl,
+        "negative_tail_improvements": sum(item["baseline_state"] in {"ORIGINAL_SL", "TP1_THEN_ORIGINAL_SL"} and item["shadow_r"] > item["baseline_r"] for item in parsed),
+        "worsened_winners": sum(item["baseline_state"] == "TP2_WIN" and item["shadow_r"] < item["baseline_r"] for item in parsed),
+        "same_candle_ambiguous_exclusions": ambiguous,
+        "unresolved_exclusions": unresolved,
+        "changed_outcomes_n": len(changed),
+        "positive_delta_single_trade_concentration": None if concentration is None else round(concentration, 6),
+        "changed_market_periods_n": len(changed_months),
+        "asia_long_delta_r": round(asia_long_delta, 6),
+        "promotion_checks": promotion_checks,
+        "classification": "READY FOR REVIEW" if all(promotion_checks.values()) else "INSUFFICIENT EVIDENCE",
+        "live_promotion_blockers": [key for key, passed in promotion_checks.items() if not passed],
+        "by_side": breakdown("side"),
+        "by_session": breakdown("session"),
+        "by_tier": breakdown("tier"),
+        "by_month": breakdown("month"),
+    }
+    return result
+
+
 def benchmark(count: int, path: Path | None = None) -> dict[str, Any]:
     owns_path = path is None
     temp_dir: tempfile.TemporaryDirectory[str] | None = tempfile.TemporaryDirectory() if owns_path else None
@@ -1473,7 +1714,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Unified scanner research telemetry (read-only by default).")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("status", "summary", "shadows", "coverage", "health"):
+    for command in ("status", "summary", "shadows", "post-tp1-shadow", "coverage", "health"):
         sub.add_parser(command)
     analysis_parser = sub.add_parser("analysis")
     analysis_parser.add_argument("name", choices=sorted(ANALYSIS_QUERIES))
@@ -1531,6 +1772,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(" | ".join(str(item) for item in row))
             if not rows:
                 print("N/A: no shadow decisions")
+    elif args.command == "post-tp1-shadow":
+        print(json.dumps(post_tp1_shadow_metrics(store), indent=2, sort_keys=True))
     elif args.command == "analysis":
         with closing(store.connect(read_only=True)) as connection:
             rows = connection.execute(ANALYSIS_QUERIES[args.name]).fetchall()

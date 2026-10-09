@@ -36,6 +36,15 @@ HISTORY_COLUMNS = [
     "pnl_percent",
     "holding_minutes",
     "outcome",
+    "lifecycle_state",
+    "lifecycle_r",
+    "lifecycle_terminal",
+    "tp1_fraction",
+    "remainder_fraction",
+    "tp1_touch_time_utc",
+    "remainder_resolution_time_utc",
+    "lifecycle_same_candle_ambiguous",
+    "lifecycle_reason",
     "ai_commentary_used",
 ]
 
@@ -95,12 +104,16 @@ def rejection_key(df: pd.DataFrame) -> pd.Series:
 
 
 def outcome_classification(row: pd.Series) -> str:
+    lifecycle = str(row.get("lifecycle_state", "")).strip().upper()
+    if lifecycle:
+        return lifecycle
     result = str(row.get("result", "OPEN")).strip().upper()
     hit_target = str(row.get("hit_target", "")).strip().upper()
     if result == "WIN" and hit_target == "TP2":
         return "WIN_TP2"
     if result == "WIN":
-        return "WIN_TP1"
+        # Legacy TP1-only rows have no evidence that the remainder resolved.
+        return "TP1_TOUCHED_REMAINDER_OPEN"
     if result == "LOSS":
         return "LOSS"
     if result == "BREAKEVEN":
@@ -111,6 +124,12 @@ def outcome_classification(row: pd.Series) -> str:
 
 
 def pnl_percent(row: pd.Series) -> float:
+    lifecycle_r = pd.to_numeric(pd.Series([row.get("lifecycle_r")]), errors="coerce").iloc[0]
+    if not pd.isna(lifecycle_r):
+        return float(lifecycle_r) * risk_percent(row)
+    lifecycle = str(row.get("lifecycle_state", "")).strip().upper()
+    if lifecycle in {"TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}:
+        return 0.0
     result = str(row.get("result", "OPEN")).strip().upper()
     hit_target = str(row.get("hit_target", "")).strip().upper()
     side = str(row.get("side", "")).strip().upper()
@@ -137,6 +156,22 @@ def risk_percent(row: pd.Series) -> float:
 
 
 def real_rr(row: pd.Series) -> float:
+    lifecycle_r = pd.to_numeric(pd.Series([row.get("lifecycle_r")]), errors="coerce").iloc[0]
+    if not pd.isna(lifecycle_r):
+        return float(lifecycle_r)
+    lifecycle = str(row.get("lifecycle_state", "")).strip().upper()
+    if lifecycle in {"TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}:
+        return 0.0
+    if not lifecycle and str(row.get("result", "")).strip().upper() == "WIN" and str(row.get("hit_target", "")).strip().upper() in {"", "TP1"}:
+        return 0.0
+    if not lifecycle and str(row.get("result", "")).strip().upper() == "WIN" and str(row.get("hit_target", "")).strip().upper() == "TP2":
+        entry = safe_float(row.get("entry"))
+        stop = safe_float(row.get("stop_loss", row.get("sl")))
+        tp1 = safe_float(row.get("tp1"))
+        tp2 = safe_float(row.get("tp2"))
+        risk = abs(entry - stop)
+        if min(entry, stop, tp1, tp2, risk) > 0:
+            return 0.5 * abs(tp1 - entry) / risk + 0.5 * abs(tp2 - entry) / risk
     risk = risk_percent(row)
     if risk <= 0:
         return 0.0
@@ -145,7 +180,9 @@ def real_rr(row: pd.Series) -> float:
 
 def holding_minutes(row: pd.Series) -> float:
     start = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
-    end = pd.to_datetime(row.get("closed_at"), utc=True, errors="coerce")
+    lifecycle_end = row.get("remainder_resolution_time_utc", "")
+    end_source = lifecycle_end if str(lifecycle_end).strip() else row.get("closed_at")
+    end = pd.to_datetime(end_source, utc=True, errors="coerce")
     if pd.isna(start) or pd.isna(end):
         return 0.0
     return max(0.0, float((end - start).total_seconds() / 60))
@@ -165,6 +202,17 @@ def journal_to_history(df: pd.DataFrame) -> pd.DataFrame:
         status = pd.Series(["sent"] * len(df), index=df.index)
     sent = df[status == "sent"].copy()
     for _, row in sent.iterrows():
+        lifecycle = str(row.get("lifecycle_state", "")).strip().upper()
+        source_result = str(row.get("result", "OPEN") or "OPEN").upper()
+        lifecycle_r_value = pd.to_numeric(pd.Series([row.get("lifecycle_r")]), errors="coerce").iloc[0]
+        if lifecycle in {"TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"} or (
+            not lifecycle and source_result == "WIN" and str(row.get("hit_target", "")).upper() in {"", "TP1"}
+        ):
+            reporting_result = "OPEN"
+        elif lifecycle and not pd.isna(lifecycle_r_value):
+            reporting_result = "WIN" if float(lifecycle_r_value) > 0 else "LOSS" if float(lifecycle_r_value) < 0 else "BREAKEVEN"
+        else:
+            reporting_result = source_result
         rows.append({
             "timestamp": row.get("timestamp", ""),
             "symbol": clean_symbol(row.get("symbol", "")),
@@ -187,10 +235,19 @@ def journal_to_history(df: pd.DataFrame) -> pd.DataFrame:
             "body_percent": safe_float(row.get("body_ratio", 0.0)) * 100,
             "atr_expansion": row.get("atr_expansion_ratio", ""),
             "btc_regime": row.get("btc_regime", ""),
-            "result": str(row.get("result", "OPEN") or "OPEN").upper(),
+            "result": reporting_result,
             "pnl_percent": f"{pnl_percent(row):.4f}",
             "holding_minutes": f"{holding_minutes(row):.1f}",
             "outcome": outcome_classification(row),
+            "lifecycle_state": lifecycle or outcome_classification(row),
+            "lifecycle_r": "" if pd.isna(lifecycle_r_value) else f"{float(lifecycle_r_value):.6f}",
+            "lifecycle_terminal": row.get("lifecycle_terminal", 0),
+            "tp1_fraction": row.get("tp1_fraction", 0.5),
+            "remainder_fraction": row.get("remainder_fraction", 0.5),
+            "tp1_touch_time_utc": row.get("tp1_touch_time_utc", ""),
+            "remainder_resolution_time_utc": row.get("remainder_resolution_time_utc", ""),
+            "lifecycle_same_candle_ambiguous": row.get("lifecycle_same_candle_ambiguous", 0),
+            "lifecycle_reason": row.get("lifecycle_reason", ""),
             "ai_commentary_used": ai_commentary_used(row),
         })
     return pd.DataFrame(rows, columns=HISTORY_COLUMNS)

@@ -166,6 +166,13 @@ def normalize_scanner_data(df: pd.DataFrame, source: str = "scanner") -> pd.Data
         "tp1_alert_source": "",
         "breakeven_recommended": 0,
         "position_management_stage": "",
+        "lifecycle_state": "",
+        "lifecycle_r": "",
+        "lifecycle_terminal": 0,
+        "tp1_fraction": 0.5,
+        "remainder_fraction": 0.5,
+        "lifecycle_same_candle_ambiguous": 0,
+        "remainder_resolution_time_utc": "",
     }
     data = _ensure(df, defaults)
     normalized = pd.DataFrame(index=data.index)
@@ -198,7 +205,38 @@ def normalize_scanner_data(df: pd.DataFrame, source: str = "scanner") -> pd.Data
     normalized["result"] = data["result"].fillna("OPEN").replace("", "OPEN").astype(str).str.upper()
     normalized.loc[normalized["result"].isin(["NAN", "NONE", "NULL"]), "result"] = "OPEN"
     normalized["hit_target"] = data["hit_target"].fillna("").astype(str).str.upper()
+    normalized["lifecycle_state"] = data["lifecycle_state"].fillna("").astype(str).str.upper()
+    normalized["lifecycle_r"] = _num(data["lifecycle_r"])
+    normalized["lifecycle_terminal"] = data["lifecycle_terminal"].fillna(0).astype(str).str.lower().isin(["1", "true", "yes"])
+    normalized["tp1_fraction"] = _num(data["tp1_fraction"]).fillna(0.5)
+    normalized["remainder_fraction"] = _num(data["remainder_fraction"]).fillna(0.5)
+    normalized["lifecycle_same_candle_ambiguous"] = data["lifecycle_same_candle_ambiguous"].fillna(0).astype(str).str.lower().isin(["1", "true", "yes"])
+    legacy_tp2 = normalized["lifecycle_state"].eq("") & normalized["result"].eq("WIN") & normalized["hit_target"].eq("TP2")
+    legacy_loss = normalized["lifecycle_state"].eq("") & normalized["result"].eq("LOSS")
+    risk_distance = (normalized["entry"] - normalized["sl"]).abs()
+    valid_geometry = legacy_tp2 & risk_distance.gt(0) & normalized[["entry", "sl", "tp1", "tp2"]].notna().all(axis=1)
+    normalized.loc[valid_geometry, "lifecycle_r"] = (
+        0.5 * (normalized.loc[valid_geometry, "tp1"] - normalized.loc[valid_geometry, "entry"]).abs() / risk_distance.loc[valid_geometry]
+        + 0.5 * (normalized.loc[valid_geometry, "tp2"] - normalized.loc[valid_geometry, "entry"]).abs() / risk_distance.loc[valid_geometry]
+    )
+    normalized.loc[valid_geometry, "lifecycle_state"] = "TP2_WIN"
+    normalized.loc[valid_geometry, "lifecycle_terminal"] = True
+    normalized.loc[legacy_loss, "lifecycle_r"] = -1.0
+    normalized.loc[legacy_loss, "lifecycle_state"] = "ORIGINAL_SL"
+    normalized.loc[legacy_loss, "lifecycle_terminal"] = True
+    unresolved_lifecycle = normalized["lifecycle_state"].isin(["TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"])
+    legacy_tp1_only = normalized["lifecycle_state"].eq("") & normalized["result"].eq("WIN") & normalized["hit_target"].isin(["", "TP1"])
+    normalized.loc[unresolved_lifecycle | legacy_tp1_only, "result"] = "OPEN"
+    resolved_lifecycle = normalized["lifecycle_r"].notna() & normalized["lifecycle_terminal"]
+    normalized.loc[resolved_lifecycle & normalized["lifecycle_r"].gt(0), "result"] = "WIN"
+    normalized.loc[resolved_lifecycle & normalized["lifecycle_r"].lt(0), "result"] = "LOSS"
+    normalized.loc[resolved_lifecycle & normalized["lifecycle_r"].eq(0), "result"] = "BREAKEVEN"
+    normalized.loc[normalized["lifecycle_r"].notna(), "real_rr"] = normalized.loc[normalized["lifecycle_r"].notna(), "lifecycle_r"]
+    normalized.loc[unresolved_lifecycle | legacy_tp1_only, "real_rr"] = pd.NA
+    lifecycle_closed_at = _date_series(data["remainder_resolution_time_utc"])
+    normalized.loc[normalized["lifecycle_terminal"] & lifecycle_closed_at.notna(), "closed_at"] = lifecycle_closed_at
     normalized["outcome"] = data["outcome"].fillna("").astype(str).str.upper()
+    normalized.loc[normalized["lifecycle_state"].ne(""), "outcome"] = normalized.loc[normalized["lifecycle_state"].ne(""), "lifecycle_state"]
     normalized.loc[normalized["outcome"].eq("") & normalized["result"].eq("WIN"), "outcome"] = "WIN_" + normalized["hit_target"].replace("", "TP1")
     normalized.loc[normalized["outcome"].eq("") & normalized["result"].eq("LOSS"), "outcome"] = "LOSS"
     normalized.loc[normalized["outcome"].eq("") & normalized["result"].eq("OPEN"), "outcome"] = "OPEN"
@@ -702,9 +740,10 @@ def build_complete_report(
         "wins": int(len(wins)),
         "losses": int(len(losses)),
         "win_rate": safe_percent(len(wins), len(closed)),
-        "tp1_hits": target_hits(wins, 1),
-        "tp2_hits": target_hits(wins, 2),
-        "tp3_hits": target_hits(wins, 3),
+        # Target touches are event counts; they do not imply the full lifecycle is closed.
+        "tp1_hits": target_hits(sent_day, 1),
+        "tp2_hits": target_hits(sent_day, 2),
+        "tp3_hits": target_hits(sent_day, 3),
         "sl_hits": int(len(losses)),
         "net_r_estimate": net_r,
         "avg_profit_pct": safe_mean(pd.Series([v for v in pnl_values if v is not None and v > 0])),

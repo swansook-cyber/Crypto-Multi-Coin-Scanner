@@ -1555,18 +1555,18 @@ def test_daily_summary_and_missing_telegram_env() -> None:
     assert summary["total_signals"] == 3
     assert summary["tp1_hits"] == 1
     assert summary["sl_hits"] == 1
-    assert summary["pending"] == 1
-    assert summary["win_rate"] == 50.0
+    assert summary["pending"] == 2
+    assert summary["win_rate"] == 0.0
     assert summary["btc_regime_breakdown"] == "bullish: 1, bearish: 1, sideways: 1"
     assert summary["wave_score_breakdown"] == "80-100: 1, 40-59: 1, 0-39: 1"
     assert summary["current_streak"] == "1 LOSS"
     message = daily_summary.build_telegram_message(summary)
     assert "📊 Daily Signal Summary" in message
-    assert "Today's Winrate: 50.0%" in message
-    assert "Best Coin: BTCUSDT" in message
+    assert "Today's Winrate: 0.0%" in message
+    assert "Best Coin: ETHUSDT" in message
     assert "Worst Coin: ETHUSDT" in message
     assert "Best Session: London" in message
-    assert "Best Bucket: A+" in message
+    assert "Best Bucket: B" in message
     assert "BTC Regime: bullish: 1, bearish: 1, sideways: 1" in message
     assert "Wave Score: 80-100: 1, 40-59: 1, 0-39: 1" in message
     assert "Current Streak: 1 LOSS" in message
@@ -1740,15 +1740,15 @@ def test_daily_performance_report_metrics() -> None:
     )
     report = performance_report.build_report(df, "2026-05-30")
     assert report["total_sent_signals"] == 4
-    assert report["closed_signals"] == 3
-    assert report["open_signals"] == 1
-    assert report["wins"] == 2
+    assert report["closed_signals"] == 2
+    assert report["open_signals"] == 2
+    assert report["wins"] == 1
     assert report["losses"] == 1
-    assert round(report["win_rate"], 1) == 66.7
+    assert round(report["win_rate"], 1) == 50.0
     assert report["tp1_hits"] == 2
     assert report["tp2_hits"] == 1
     assert report["sl_hits"] == 1
-    assert report["net_r_estimate"] == 2.2
+    assert round(report["net_r_estimate"], 6) == 0.6
     assert report["small_sample_warning"] is True
     message = performance_report.format_report(report)
     assert "Daily Performance Report" in message
@@ -1952,7 +1952,7 @@ def test_scheduled_performance_report_reaches_reports_channel_path() -> None:
         assert "Closed: 1" in payload
         assert "Wins / Losses: 1 / 0" in payload
         assert "Win Rate: 100.0%" in payload
-        assert "Net R: 2.00R" in payload
+        assert "Net R: 1.50R" in payload
         assert "Entry Timing Shadow" in payload
         assert "Decision" in payload
         assert "Market Timing: COLLECTING DATA" in payload
@@ -2444,23 +2444,23 @@ def test_complete_performance_analytics_v1_outputs() -> None:
     assert report["external_win_rate"] == 100.0
     assert report["external_net_r_estimate"] == 1.8
     assert report["tier_c_report_count"] == 2
-    assert report["tier_c_report_wins"] == 1
+    assert report["tier_c_report_wins"] == 0
     assert report["tier_c_report_losses"] == 1
-    assert report["tier_c_report_win_rate"] == 50.0
+    assert report["tier_c_report_win_rate"] == 0.0
     assert report["weak_symbol_report_count"] == 2
-    assert report["weak_symbol_report_wins"] == 1
+    assert report["weak_symbol_report_wins"] == 0
     assert report["weak_symbol_report_losses"] == 1
-    assert report["weak_symbol_report_win_rate"] == 50.0
+    assert report["weak_symbol_report_win_rate"] == 0.0
     assert report["session_risk_report_count"] == 2
-    assert report["session_risk_report_wins"] == 1
+    assert report["session_risk_report_wins"] == 0
     assert report["session_risk_report_losses"] == 1
-    assert report["session_risk_report_win_rate"] == 50.0
+    assert report["session_risk_report_win_rate"] == 0.0
     assert report["london_long_report_count"] == 3
     assert report["london_long_report_wins"] == 1
     assert report["london_long_report_losses"] == 1
     assert report["london_long_report_open"] == 1
     assert report["london_long_report_win_rate"] == 50.0
-    assert report["london_long_report_net_r"] == 1.0
+    assert report["london_long_report_net_r"] == 0.5
     assert "missing stop loss" in report["external_top_reject_reasons"]
     assert "NEARUSDT" in report["external_top_approved_symbols"]
     assert "XRPUSDT" in report["external_top_rejected_symbols"]

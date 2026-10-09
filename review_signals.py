@@ -22,6 +22,23 @@ from urllib3.util.retry import Retry
 from core.analytics_engine import update_validation_artifacts
 from core.binance_symbols import binance_usdm_market_symbol
 from core.outcome_tracker import HISTORY_COLUMNS, sync_history_files
+from core.post_tp1_lifecycle import (
+    POST_TP1_DELAYED_QUARTER_R_SHADOW_START_UTC,
+    REMAINDER_FRACTION,
+    SHADOW_NAME,
+    SHADOW_VERSION,
+    TP1_FRACTION,
+    TERMINAL_REPORTING_STATES,
+    evaluate_delayed_quarter_r_shadow,
+    evaluate_reporting_lifecycle,
+)
+from core.research_telemetry import (
+    DEFAULT_DB_PATH,
+    FailOpenResearchTelemetry,
+    ShadowDecision,
+    utc_now,
+)
+from core.signal_identity import canonical_signal_key, normalize_timestamp
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -74,6 +91,15 @@ OUTCOME_COLUMNS = {
     "position_management_stage": "",
     "holding_minutes": "",
     "net_r_estimate": "",
+    "lifecycle_state": "",
+    "lifecycle_r": "",
+    "lifecycle_terminal": 0,
+    "tp1_fraction": TP1_FRACTION,
+    "remainder_fraction": REMAINDER_FRACTION,
+    "tp1_touch_time_utc": "",
+    "remainder_resolution_time_utc": "",
+    "lifecycle_same_candle_ambiguous": 0,
+    "lifecycle_reason": "",
 }
 
 EXTERNAL_OUTCOME_COLUMNS = {
@@ -753,19 +779,137 @@ def evaluate_outcome(row: pd.Series, candles: pd.DataFrame) -> Outcome:
 
 
 def review_signal(session: requests.Session, row: pd.Series, lookahead_hours: int) -> Outcome:
+    candles = candles_for_signal(session, row, lookahead_hours)
+    review_row = row.copy()
+    review_row["symbol"] = clean_symbol(row.get("symbol", ""))
+    outcome = evaluate_outcome(review_row, candles)
+    log_outcome_price_audit(review_row, candles, outcome)
+    return outcome
+
+
+def candles_for_signal(session: requests.Session, row: pd.Series, lookahead_hours: int) -> pd.DataFrame:
     timestamp = pd.to_datetime(row["timestamp"], utc=True, errors="coerce")
     if pd.isna(timestamp):
-        return Outcome("OPEN", "", "", 0.0, 0.0)
+        return pd.DataFrame()
 
     start_ms = int(timestamp.timestamp() * 1000)
     end_ts = min(timestamp + pd.Timedelta(hours=lookahead_hours), pd.Timestamp.now(tz="UTC"))
     end_ms = int(end_ts.timestamp() * 1000)
-    review_row = row.copy()
-    review_row["symbol"] = clean_symbol(row.get("symbol", ""))
-    candles = fetch_klines(session, review_row["symbol"], start_ms, end_ms)
-    outcome = evaluate_outcome(review_row, candles)
-    log_outcome_price_audit(review_row, candles, outcome)
-    return outcome
+    candles = fetch_klines(session, clean_symbol(row.get("symbol", "")), start_ms, end_ms)
+    if candles.empty:
+        return candles
+    return candles[candles["close_time"] <= pd.Timestamp.now(tz="UTC")].copy()
+
+
+def apply_reporting_lifecycle(df: pd.DataFrame, index: Any, row: pd.Series, candles: pd.DataFrame) -> None:
+    lifecycle = evaluate_reporting_lifecycle(row, candles)
+    df.at[index, "lifecycle_state"] = lifecycle.state
+    df.at[index, "lifecycle_r"] = "" if lifecycle.lifecycle_r is None else f"{lifecycle.lifecycle_r:.6f}"
+    df.at[index, "lifecycle_terminal"] = int(lifecycle.terminal)
+    df.at[index, "tp1_fraction"] = TP1_FRACTION
+    df.at[index, "remainder_fraction"] = REMAINDER_FRACTION
+    df.at[index, "tp1_touch_time_utc"] = lifecycle.tp1_touch_time_utc
+    df.at[index, "remainder_resolution_time_utc"] = lifecycle.remainder_resolution_time_utc
+    df.at[index, "lifecycle_same_candle_ambiguous"] = int(lifecycle.same_candle_ambiguous)
+    df.at[index, "lifecycle_reason"] = lifecycle.reason
+
+
+def apply_legacy_terminal_lifecycle(df: pd.DataFrame, index: Any, row: pd.Series) -> bool:
+    """Migrate already-terminal compatibility rows without any market-data replay."""
+    result = str(row.get("result", "")).strip().upper()
+    target = str(row.get("hit_target", "")).strip().upper()
+    if result == "LOSS":
+        state, lifecycle_r = "ORIGINAL_SL", -1.0
+    elif result == "WIN" and target == "TP2":
+        entry = safe_float(row.get("entry"))
+        stop = safe_float(row.get("stop_loss", row.get("sl")))
+        tp1 = safe_float(row.get("tp1"))
+        tp2 = safe_float(row.get("tp2"))
+        risk = abs(entry - stop)
+        if min(entry, stop, tp1, tp2, risk) <= 0:
+            return False
+        lifecycle_r = TP1_FRACTION * abs(tp1 - entry) / risk + REMAINDER_FRACTION * abs(tp2 - entry) / risk
+        state = "TP2_WIN"
+    else:
+        return False
+    df.at[index, "lifecycle_state"] = state
+    df.at[index, "lifecycle_r"] = f"{lifecycle_r:.6f}"
+    df.at[index, "lifecycle_terminal"] = 1
+    df.at[index, "tp1_fraction"] = TP1_FRACTION
+    df.at[index, "remainder_fraction"] = REMAINDER_FRACTION
+    df.at[index, "remainder_resolution_time_utc"] = row.get("closed_at", "")
+    df.at[index, "lifecycle_same_candle_ambiguous"] = 0
+    df.at[index, "lifecycle_reason"] = "migrated_from_terminal_compatibility_outcome"
+    return True
+
+
+def record_post_tp1_shadow(
+    telemetry: FailOpenResearchTelemetry,
+    row: pd.Series,
+    candles: pd.DataFrame,
+    shadow_start_utc: str = POST_TP1_DELAYED_QUARTER_R_SHADOW_START_UTC,
+) -> bool:
+    timestamp = normalize_timestamp(row.get("timestamp"))
+    boundary = pd.to_datetime(shadow_start_utc, utc=True, errors="coerce")
+    candidate_time = pd.to_datetime(timestamp, utc=True, errors="coerce")
+    status = str(row.get("signal_status", "sent") or "sent").strip().lower()
+    if status != "sent" or pd.isna(candidate_time) or pd.isna(boundary) or candidate_time < boundary:
+        return False
+    shadow = evaluate_delayed_quarter_r_shadow(row, candles)
+    baseline = evaluate_reporting_lifecycle(row, candles)
+    signal_key = canonical_signal_key(
+        symbol=row.get("symbol"), side=row.get("side"), timestamp=timestamp, entry=row.get("entry")
+    )
+    metrics = shadow.metrics()
+    metrics.update(
+        {
+            "candidate_id": signal_key,
+            "signal_timestamp_utc": timestamp,
+            "entry": safe_float(row.get("entry")),
+            "original_sl": safe_float(row.get("stop_loss", row.get("sl"))),
+            "baseline_sl": safe_float(row.get("stop_loss", row.get("sl"))),
+            "tp1": safe_float(row.get("tp1")),
+            "tp1_level": safe_float(row.get("tp1")),
+            "tp2": safe_float(row.get("tp2")),
+            "tp1_touch_time_utc": baseline.tp1_touch_time_utc,
+            "tp1_touch_utc": baseline.tp1_touch_time_utc,
+            "decision_candle_utc": shadow.decision_candle_time_utc,
+            "shadow_stop": shadow.shadow_stop_price,
+            "remainder_fraction": REMAINDER_FRACTION,
+            "baseline_lifecycle_state": baseline.state,
+            "baseline_terminal_result": baseline.state if baseline.terminal else "UNRESOLVED",
+            "shadow_action": (
+                "MOVE_REMAINDER_STOP_TO_PLUS_0.25R"
+                if shadow.move_stop_to_quarter_r is True
+                else "KEEP_ORIGINAL_SL"
+                if shadow.move_stop_to_quarter_r is False
+                else "NO_DECISION_YET"
+            ),
+            "terminal_shadow_outcome": shadow.state if shadow.terminal else "",
+            "shadow_terminal_result": shadow.state if shadow.terminal else "UNRESOLVED",
+            "realized_shadow_r": shadow.shadow_r,
+            "baseline_lifecycle_r": shadow.baseline_r,
+            "shadow_lifecycle_r": shadow.shadow_r,
+            "policy": SHADOW_NAME,
+            "classification": {
+                "side": str(row.get("side", "")).upper(),
+                "session": str(row.get("market_session", row.get("session", ""))),
+                "tier": str(row.get("watchlist_tier", row.get("tier", ""))),
+            },
+        }
+    )
+    return telemetry.upsert_shadow_for_signal(
+        signal_key,
+        ShadowDecision(
+            SHADOW_NAME,
+            SHADOW_VERSION,
+            shadow.state,
+            shadow.reason,
+            metrics,
+            utc_now(),
+        ),
+        minimum_candidate_time_utc=shadow_start_utc,
+    )
 
 
 def is_external_approved(row: pd.Series) -> bool:
@@ -965,14 +1109,46 @@ def run_review_cycle(
     if df is None:
         return stats
 
+    research_path = Path(os.getenv("RESEARCH_TELEMETRY_DB", str(DEFAULT_DB_PATH)))
+    telemetry = FailOpenResearchTelemetry(
+        research_path,
+        enabled=env_bool("RESEARCH_TELEMETRY_ENABLED", True),
+    )
+    shadow_start_utc = telemetry.shadow_boundary(
+        SHADOW_NAME,
+        requested_start_utc=POST_TP1_DELAYED_QUARTER_R_SHADOW_START_UTC,
+    )
+
     open_mask = df["result"].astype(str).str.upper() == "OPEN"
     stats.open_trades = int(open_mask.sum())
 
     for index, row in df.iterrows():
         previous_result = str(row.get("result", "OPEN")).upper()
+        lifecycle_state = str(row.get("lifecycle_state", "") or "").strip().upper()
+        if not lifecycle_state and apply_legacy_terminal_lifecycle(df, index, row):
+            lifecycle_state = str(df.at[index, "lifecycle_state"])
+        needs_lifecycle_evidence = (
+            previous_result == "OPEN"
+            or (previous_result == "WIN" and str(row.get("hit_target", "")).upper() in {"", "TP1"})
+            or lifecycle_state in {"", "TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}
+        )
+        candles = pd.DataFrame()
+        if needs_lifecycle_evidence:
+            try:
+                candles = candles_for_signal(session, row, lookahead_hours)
+                apply_reporting_lifecycle(df, index, row, candles)
+                record_post_tp1_shadow(telemetry, row, candles, shadow_start_utc)
+            except (requests.RequestException, ValueError, KeyError) as exc:
+                stats.errors += 1
+                LOGGER.error("Lifecycle review skipped for %s: %s", row.get("symbol", "UNKNOWN"), exc)
+                if previous_result == "OPEN":
+                    continue
         if previous_result == "OPEN":
             try:
-                outcome = review_signal(session, row, lookahead_hours)
+                review_row = row.copy()
+                review_row["symbol"] = clean_symbol(row.get("symbol", ""))
+                outcome = evaluate_outcome(review_row, candles)
+                log_outcome_price_audit(review_row, candles, outcome)
             except (requests.RequestException, ValueError, KeyError) as exc:
                 stats.errors += 1
                 LOGGER.error("Review skipped for %s: %s", row.get("symbol", "UNKNOWN"), exc)

@@ -35,10 +35,19 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
         "mfi": "",
         "atr": "",
         "result": "OPEN",
+        "hit_target": "",
         "outcome": "",
+        "entry": "",
+        "sl": "",
+        "stop_loss": "",
+        "tp1": "",
+        "tp2": "",
         "pnl_percent": "",
         "holding_minutes": "",
         "ai_commentary_used": "",
+        "lifecycle_state": "",
+        "lifecycle_r": "",
+        "lifecycle_terminal": 0,
     }.items():
         if column not in df.columns:
             df[column] = default
@@ -54,10 +63,32 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
         df["outcome"] = result.where(~result.eq("WIN"), "WIN_" + target.replace("", "TP1"))
         df.loc[result.eq("LOSS"), "outcome"] = "LOSS"
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-    for column in ["rr", "real_rr", "setup_strength", "score", "pnl_percent", "holding_minutes", "atr"]:
+    for column in ["rr", "real_rr", "lifecycle_r", "setup_strength", "score", "pnl_percent", "holding_minutes", "atr"]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
     df["result"] = df["result"].fillna("OPEN").astype(str).str.upper()
+    df["hit_target"] = df["hit_target"].fillna("").astype(str).str.upper()
     df["outcome"] = df["outcome"].fillna("").astype(str).str.upper()
+    df["lifecycle_state"] = df["lifecycle_state"].fillna("").astype(str).str.upper()
+    lifecycle_terminal = df["lifecycle_terminal"].fillna(0).astype(str).str.lower().isin(["1", "true", "yes"])
+    df.loc[df["lifecycle_state"].ne(""), "outcome"] = df.loc[df["lifecycle_state"].ne(""), "lifecycle_state"]
+    df.loc[df["lifecycle_r"].notna(), "real_rr"] = df.loc[df["lifecycle_r"].notna(), "lifecycle_r"]
+    df.loc[lifecycle_terminal & df["lifecycle_r"].gt(0), "result"] = "WIN"
+    df.loc[lifecycle_terminal & df["lifecycle_r"].lt(0), "result"] = "LOSS"
+    df.loc[lifecycle_terminal & df["lifecycle_r"].eq(0), "result"] = "BREAKEVEN"
+    df.loc[df["lifecycle_state"].isin(["TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"]), "result"] = "OPEN"
+    legacy_tp1 = df["lifecycle_state"].eq("") & df["result"].eq("WIN") & df["hit_target"].isin(["", "TP1"])
+    df.loc[legacy_tp1, "lifecycle_state"] = "TP1_TOUCHED_REMAINDER_OPEN"
+    df.loc[legacy_tp1, "outcome"] = "TP1_TOUCHED_REMAINDER_OPEN"
+    df.loc[legacy_tp1, "result"] = "OPEN"
+    df.loc[legacy_tp1, "real_rr"] = pd.NA
+    legacy_tp2 = df["lifecycle_state"].eq("") & df["result"].eq("WIN") & df["hit_target"].eq("TP2")
+    entry = pd.to_numeric(df["entry"], errors="coerce")
+    stop = pd.to_numeric(df["sl"].where(df["sl"].fillna("").astype(str).str.strip().ne(""), df["stop_loss"]), errors="coerce")
+    tp1_price = pd.to_numeric(df["tp1"], errors="coerce")
+    tp2_price = pd.to_numeric(df["tp2"], errors="coerce")
+    risk = (entry - stop).abs()
+    valid_tp2 = legacy_tp2 & risk.gt(0) & pd.concat([entry, stop, tp1_price, tp2_price], axis=1).notna().all(axis=1)
+    df.loc[valid_tp2, "real_rr"] = 0.5 * (tp1_price[valid_tp2] - entry[valid_tp2]).abs() / risk[valid_tp2] + 0.5 * (tp2_price[valid_tp2] - entry[valid_tp2]).abs() / risk[valid_tp2]
     df["symbol"] = df["symbol"].fillna("").astype(str).str.upper()
     df["tier"] = df["tier"].fillna("-").replace("", "-").astype(str).str.upper()
     df["session"] = df["session"].fillna("Other").replace("", "Other")
@@ -66,11 +97,14 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def closed_trades(df: pd.DataFrame) -> pd.DataFrame:
-    return df[df["outcome"].isin(["WIN_TP1", "WIN_TP2", "LOSS", "BREAKEVEN", "EXPIRED"])].copy()
+    return df[
+        df["result"].isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED"])
+        & ~df["lifecycle_state"].isin(["TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"])
+    ].copy()
 
 
 def wins(df: pd.DataFrame) -> pd.Series:
-    return df["outcome"].isin(["WIN_TP1", "WIN_TP2"])
+    return df["result"].eq("WIN")
 
 
 def performance_by(df: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -82,15 +116,15 @@ def performance_by(df: pd.DataFrame, column: str) -> pd.DataFrame:
     for key, group in closed.groupby(closed[column].fillna("-").astype(str)):
         trade_count = len(group)
         win_count = int(wins(group).sum())
-        loss_count = int((group["outcome"] == "LOSS").sum())
+        loss_count = int((group["result"] == "LOSS").sum())
         rows.append({
             column: key,
             "trades": trade_count,
             "wins": win_count,
             "losses": loss_count,
             "win_rate": win_count / trade_count * 100 if trade_count else 0.0,
-            "tp1_rate": (group["outcome"] == "WIN_TP1").mean() * 100 if trade_count else 0.0,
-            "tp2_rate": (group["outcome"] == "WIN_TP2").mean() * 100 if trade_count else 0.0,
+            "tp1_rate": group["outcome"].isin(["WIN_TP1", "WIN_TP2", "TP2_WIN", "TP1_THEN_ORIGINAL_SL", "TP1_THEN_PROTECTIVE_STOP"]).mean() * 100 if trade_count else 0.0,
+            "tp2_rate": group["outcome"].isin(["WIN_TP2", "TP2_WIN"]).mean() * 100 if trade_count else 0.0,
             "sl_rate": loss_count / trade_count * 100 if trade_count else 0.0,
             "avg_rr": group["rr"].mean(),
             "net_rr": group["real_rr"].fillna(0).sum(),
@@ -126,7 +160,7 @@ def summary(df: pd.DataFrame) -> dict[str, Any]:
     closed = closed_trades(normalized)
     total = len(normalized)
     win_count = int(wins(closed).sum()) if not closed.empty else 0
-    loss_count = int((closed["outcome"] == "LOSS").sum()) if not closed.empty else 0
+    loss_count = int((closed["result"] == "LOSS").sum()) if not closed.empty else 0
     closed_count = len(closed)
     symbol_perf = performance_by(normalized, "symbol")
     tier_perf = performance_by(normalized, "tier")
