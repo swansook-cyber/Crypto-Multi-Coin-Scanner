@@ -1125,19 +1125,28 @@ def run_review_cycle(
     for index, row in df.iterrows():
         previous_result = str(row.get("result", "OPEN")).upper()
         lifecycle_state = str(row.get("lifecycle_state", "") or "").strip().upper()
-        if not lifecycle_state and apply_legacy_terminal_lifecycle(df, index, row):
+        candidate_time = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+        lifecycle_boundary = pd.to_datetime(shadow_start_utc, utc=True, errors="coerce")
+        is_prospective_lifecycle = (
+            not pd.isna(candidate_time)
+            and not pd.isna(lifecycle_boundary)
+            and candidate_time >= lifecycle_boundary
+        )
+        if is_prospective_lifecycle and not lifecycle_state and apply_legacy_terminal_lifecycle(df, index, row):
             lifecycle_state = str(df.at[index, "lifecycle_state"])
-        needs_lifecycle_evidence = (
+        needs_lifecycle_evidence = is_prospective_lifecycle and (
             previous_result == "OPEN"
             or (previous_result == "WIN" and str(row.get("hit_target", "")).upper() in {"", "TP1"})
             or lifecycle_state in {"", "TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}
         )
+        needs_candles = previous_result == "OPEN" or needs_lifecycle_evidence
         candles = pd.DataFrame()
-        if needs_lifecycle_evidence:
+        if needs_candles:
             try:
                 candles = candles_for_signal(session, row, lookahead_hours)
-                apply_reporting_lifecycle(df, index, row, candles)
-                record_post_tp1_shadow(telemetry, row, candles, shadow_start_utc)
+                if needs_lifecycle_evidence:
+                    apply_reporting_lifecycle(df, index, row, candles)
+                    record_post_tp1_shadow(telemetry, row, candles, shadow_start_utc)
             except (requests.RequestException, ValueError, KeyError) as exc:
                 stats.errors += 1
                 LOGGER.error("Lifecycle review skipped for %s: %s", row.get("symbol", "UNKNOWN"), exc)
