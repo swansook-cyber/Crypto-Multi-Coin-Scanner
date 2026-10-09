@@ -115,7 +115,7 @@ def outcome_classification(row: pd.Series) -> str:
         # Legacy TP1-only rows have no evidence that the remainder resolved.
         return "TP1_TOUCHED_REMAINDER_OPEN"
     if result == "LOSS":
-        return "LOSS"
+        return "ORIGINAL_SL"
     if result == "BREAKEVEN":
         return "BREAKEVEN"
     if result == "EXPIRED":

@@ -186,10 +186,17 @@ def test_shadow_recording_does_not_mutate_signal_or_call_live_paths() -> None:
 
 
 def test_legacy_history_remains_readable_but_tp1_is_open() -> None:
-    history = journal_to_history(pd.DataFrame([{**trade(), "result": "WIN", "hit_target": "TP1"}]))
+    history = journal_to_history(pd.DataFrame([
+        {**trade(), "result": "WIN", "hit_target": "TP1"},
+        {**trade(), "symbol": "ETHUSDT", "result": "LOSS"},
+    ]))
     assert history.iloc[0]["result"] == "OPEN"
     assert history.iloc[0]["outcome"] == "TP1_TOUCHED_REMAINDER_OPEN"
     assert float(history.iloc[0]["real_rr"]) == 0.0
+    assert history.iloc[1]["result"] == "LOSS"
+    assert history.iloc[1]["outcome"] == "ORIGINAL_SL"
+    assert history.iloc[1]["lifecycle_state"] == "ORIGINAL_SL"
+    assert float(history.iloc[1]["real_rr"]) == pytest.approx(-1.0)
 
 
 def test_reporting_pipeline_uses_lifecycle_r() -> None:
