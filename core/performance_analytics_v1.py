@@ -226,6 +226,7 @@ def normalize_scanner_data(df: pd.DataFrame, source: str = "scanner") -> pd.Data
     normalized.loc[legacy_loss, "lifecycle_terminal"] = True
     unresolved_lifecycle = normalized["lifecycle_state"].isin(["TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"])
     legacy_tp1_only = normalized["lifecycle_state"].eq("") & normalized["result"].eq("WIN") & normalized["hit_target"].isin(["", "TP1"])
+    normalized.loc[legacy_tp1_only, "lifecycle_state"] = "TP1_TOUCHED_REMAINDER_OPEN"
     normalized.loc[unresolved_lifecycle | legacy_tp1_only, "result"] = "OPEN"
     resolved_lifecycle = normalized["lifecycle_r"].notna() & normalized["lifecycle_terminal"]
     normalized.loc[resolved_lifecycle & normalized["lifecycle_r"].gt(0), "result"] = "WIN"

@@ -7,6 +7,8 @@ import pandas as pd
 import pytest
 
 from core.performance_analytics_v1 import build_complete_report, normalize_scanner_data
+from core.performance_stats import summary as performance_summary
+from daily_summary import ensure_columns as normalize_daily_summary
 from core.post_tp1_lifecycle import (
     SHADOW_NAME,
     SHADOW_VERSION,
@@ -204,6 +206,26 @@ def test_reporting_pipeline_uses_lifecycle_r() -> None:
     assert report["net_r_estimate"] == pytest.approx(0.0)
     assert report["wins"] == 0
     assert report["losses"] == 0
+
+
+def test_legacy_reporting_outputs_share_lifecycle_compatibility_semantics() -> None:
+    rows = pd.DataFrame([
+        {**trade(), "result": "WIN", "hit_target": "TP1"},
+        {**trade(), "symbol": "ETHUSDT", "result": "LOSS"},
+    ])
+
+    analytics = normalize_scanner_data(rows)
+    assert analytics["lifecycle_state"].tolist() == ["TP1_TOUCHED_REMAINDER_OPEN", "ORIGINAL_SL"]
+    report, _ = build_complete_report(rows, pd.DataFrame(), pd.DataFrame(), "ALL")
+    stats = performance_summary(rows)
+    daily = normalize_daily_summary(rows)
+
+    assert report["closed_signals"] == 1
+    assert report["net_r_estimate"] == pytest.approx(-1.0)
+    assert stats["closed_trades"] == 1
+    assert stats["net_rr"] == pytest.approx(-1.0)
+    assert daily["result"].tolist() == ["OPEN", "LOSS"]
+    assert daily["real_rr"].fillna(0).sum() == pytest.approx(-1.0)
 
 
 def test_unified_shadow_upsert_is_idempotent_and_survives_restart(tmp_path: Path) -> None:

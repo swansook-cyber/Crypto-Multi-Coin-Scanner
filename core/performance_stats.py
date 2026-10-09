@@ -70,6 +70,10 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     df["outcome"] = df["outcome"].fillna("").astype(str).str.upper()
     df["lifecycle_state"] = df["lifecycle_state"].fillna("").astype(str).str.upper()
     lifecycle_terminal = df["lifecycle_terminal"].fillna(0).astype(str).str.lower().isin(["1", "true", "yes"])
+    legacy_loss = df["lifecycle_state"].eq("") & df["result"].eq("LOSS")
+    df.loc[legacy_loss, "lifecycle_state"] = "ORIGINAL_SL"
+    df.loc[legacy_loss, "lifecycle_r"] = -1.0
+    lifecycle_terminal = lifecycle_terminal | legacy_loss
     df.loc[df["lifecycle_state"].ne(""), "outcome"] = df.loc[df["lifecycle_state"].ne(""), "lifecycle_state"]
     df.loc[df["lifecycle_r"].notna(), "real_rr"] = df.loc[df["lifecycle_r"].notna(), "lifecycle_r"]
     df.loc[lifecycle_terminal & df["lifecycle_r"].gt(0), "result"] = "WIN"
