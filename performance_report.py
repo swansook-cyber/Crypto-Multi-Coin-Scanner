@@ -39,6 +39,7 @@ from core.reporting_truth import (
 BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
 HISTORY = BASE_DIR / "logs" / "signals_history.csv"
+RESEARCH_DB = BASE_DIR / "research" / "scanner_research_v1.db"
 EXTERNAL = BASE_DIR / "logs" / "external_signals.csv"
 ENTRY_TIMING = BASE_DIR / "logs" / "entry_timing_engine.csv"
 LOGS_DIR = BASE_DIR / "logs"
@@ -77,6 +78,10 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
         "signal_status": "sent",
         "pnl_percent": "",
         "closed_at": "",
+        "lifecycle_state": "",
+        "lifecycle_r": "",
+        "lifecycle_terminal": 0,
+        "terminal_event_utc": "",
     }
     for column, default in defaults.items():
         if column not in data.columns:
@@ -90,8 +95,15 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     data["result"] = data["result"].fillna("OPEN").replace("", "OPEN").astype(str).str.upper()
     data["hit_target"] = data["hit_target"].fillna("").astype(str).str.upper()
     data["signal_status"] = data["signal_status"].fillna("sent").replace("", "sent").astype(str).str.lower()
-    for column in ["entry", "stop_loss", "tp1", "tp2", "risk_reward", "pnl_percent"]:
+    for column in ["entry", "stop_loss", "tp1", "tp2", "risk_reward", "pnl_percent", "lifecycle_r"]:
         data[column] = pd.to_numeric(data[column], errors="coerce")
+    terminal = data["lifecycle_terminal"].fillna(0).astype(str).str.lower().isin(["1", "true", "yes"])
+    terminal_time = pd.to_datetime(data["terminal_event_utc"], utc=True, errors="coerce")
+    data.loc[terminal & terminal_time.notna(), "closed_at"] = terminal_time
+    data.loc[terminal & data["lifecycle_r"].gt(0), "result"] = "WIN"
+    data.loc[terminal & data["lifecycle_r"].lt(0), "result"] = "LOSS"
+    data.loc[terminal & data["lifecycle_r"].eq(0), "result"] = "BREAKEVEN"
+    data.loc[data["lifecycle_state"].fillna("").astype(str).str.upper().eq("LIVE_OPEN_REMAINDER"), "result"] = "OPEN"
     return data
 
 
@@ -101,6 +113,9 @@ def sent_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def estimate_r(row: pd.Series) -> float:
+    lifecycle_r = pd.to_numeric(pd.Series([row.get("lifecycle_r")]), errors="coerce").iloc[0]
+    if not pd.isna(lifecycle_r):
+        return float(lifecycle_r)
     result = str(row.get("result", "")).upper()
     target = str(row.get("hit_target", "")).upper()
     rr = pd.to_numeric(pd.Series([row.get("risk_reward")]), errors="coerce").iloc[0]
@@ -750,6 +765,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-report", action="store_true", help="Send a diagnostic message to TELEGRAM_REPORTS_CHAT_ID only.")
     parser.add_argument("--journal", type=Path, default=JOURNAL, help="Path to signals.csv.")
     parser.add_argument("--history", type=Path, default=HISTORY, help="Path to signals_history.csv.")
+    parser.add_argument("--db", type=Path, default=RESEARCH_DB, help="Path to Unified Research DB.")
     parser.add_argument("--external", type=Path, default=EXTERNAL, help="Path to external_signals.csv.")
     parser.add_argument("--entry-timing", type=Path, default=ENTRY_TIMING, help="Path to entry_timing_engine.csv.")
     parser.add_argument("--snapshot-dir", type=Path, default=REPORT_SNAPSHOTS_DIR, help="Immutable report-snapshot directory.")
@@ -757,8 +773,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_report(args: argparse.Namespace, session: requests.Session | None = None) -> int:
-    journal = load_csv_safely(args.journal)
-    history = load_csv_safely(args.history)
+    from core.historical_lifecycle_reconstruction import load_canonical_reporting_population
+
+    raw_journal = load_csv_safely(args.journal)
+    raw_history = load_csv_safely(args.history)
+    journal, _population_counts = load_canonical_reporting_population(
+        args.journal, args.history, getattr(args, "db", RESEARCH_DB)
+    )
+    history = pd.DataFrame()
     external = load_csv_safely(args.external)
     entry_timing = load_csv_safely(args.entry_timing)
     report, tables = build_full_report(journal, history, external, args.date)
@@ -769,8 +791,8 @@ def run_report(args: argparse.Namespace, session: requests.Session | None = None
         # ALL is a mutable aggregate view, not finalized daily evidence.
         LOGGER.info("REPORT SNAPSHOT SKIPPED: Date=ALL is not an immutable daily snapshot")
     else:
-        source_path = args.journal if not journal.empty else args.history
-        source_rows = journal if not journal.empty else history
+        source_path = args.journal if not raw_journal.empty else args.history
+        source_rows = raw_journal if not raw_journal.empty else raw_history
         snapshot_rows = source_rows
         if "timestamp" in source_rows.columns:
             timestamp = pd.to_datetime(source_rows["timestamp"], utc=True, errors="coerce")

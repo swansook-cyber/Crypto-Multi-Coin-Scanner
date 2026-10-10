@@ -27,6 +27,7 @@ from core.binance_execution_truth_collector import report_records
 from core.binance_execution_truth_health import HealthConfig, evaluate_health, probe_systemd
 from core.performance_analytics_v2 import build_performance_v2, generate_performance_warnings
 from core.signal_identity import identity_from_record
+from core.historical_lifecycle_reconstruction import load_canonical_reporting_population
 from performance_report import build_report, estimate_r, normalize, sent_signals
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -51,6 +52,8 @@ DATA_PATHS = {
     "tier_performance_v2": LOGS_DIR / "tier_performance_v2.csv",
     "performance_warnings": LOGS_DIR / "performance_warnings.csv",
 }
+RESEARCH_DB = BASE_DIR / "research" / "scanner_research_v1.db"
+SIGNALS_HISTORY = LOGS_DIR / "signals_history.csv"
 
 LOG_PATHS = [
     LOGS_DIR / "cornix_agent.log",
@@ -282,7 +285,11 @@ def _report_safe_signals(df: pd.DataFrame) -> pd.DataFrame:
 def load_dashboard_data(paths: dict[str, Path] | None = None) -> dict[str, pd.DataFrame]:
     source_paths = paths or DATA_PATHS
     data = {name: load_csv_safely(path) for name, path in source_paths.items()}
-    signals = _report_safe_signals(data.get("signals", pd.DataFrame()))
+    if paths is None:
+        canonical, _counts = load_canonical_reporting_population(DATA_PATHS["signals"], SIGNALS_HISTORY, RESEARCH_DB)
+        signals = _report_safe_signals(canonical)
+    else:
+        signals = _report_safe_signals(data.get("signals", pd.DataFrame()))
     if "source" not in signals.columns:
         signals["source"] = "Unknown"
     signals["source"] = signals["source"].fillna("Unknown").replace("", "Unknown").astype(str)
@@ -1029,6 +1036,7 @@ def dashboard_kpis(df: pd.DataFrame) -> dict[str, Any]:
     if not symbol_perf.empty:
         best_net_symbol = str(symbol_perf.sort_values(["net_r", "closed"], ascending=[False, False]).iloc[0]["symbol"])
         worst_net_symbol = str(symbol_perf.sort_values(["net_r", "closed"], ascending=[True, False]).iloc[0]["symbol"])
+    lifecycle = sent.get("lifecycle_state", pd.Series("", index=sent.index)).fillna("").astype(str).str.upper()
     return {
         "Total sent signals": int(len(sent)),
         "Closed trades": int(len(closed)),
@@ -1053,6 +1061,12 @@ def dashboard_kpis(df: pd.DataFrame) -> dict[str, Any]:
         "Avg time to TP": float(tp_minutes.mean()) if not tp_minutes.dropna().empty else None,
         "Avg time to SL": float(sl_minutes.mean()) if not sl_minutes.dropna().empty else None,
         "Net R": _net_r(sent),
+        "Live open remainder": int(lifecycle.eq("LIVE_OPEN_REMAINDER").sum()),
+        "Historical unknown": int(lifecycle.eq("HISTORICAL_REMAINDER_UNKNOWN").sum()),
+        "TP2 wins": int(lifecycle.eq("TP2_WIN").sum()),
+        "TP1->SL partial outcomes": int(lifecycle.eq("TP1_THEN_ORIGINAL_SL").sum()),
+        "Original SL": int(lifecycle.eq("ORIGINAL_SL").sum()),
+        "Lifecycle max drawdown R": max_drawdown_r(sent),
         "Best symbol": best_symbol,
         "Worst symbol": worst_symbol,
         "Best symbol by net R": best_net_symbol,
@@ -1120,7 +1134,7 @@ def equity_curve(df: pd.DataFrame) -> pd.DataFrame:
     if closed.empty:
         return pd.DataFrame(columns=["closed_at", "r", "cumulative_r"])
     data = closed.copy()
-    sort_column = "closed_at" if "closed_at" in data.columns else "timestamp"
+    sort_column = "timestamp"
     data[sort_column] = pd.to_datetime(data[sort_column], utc=True, errors="coerce")
     data = data.dropna(subset=[sort_column]).sort_values(sort_column)
     data["r"] = data.apply(estimate_r, axis=1)

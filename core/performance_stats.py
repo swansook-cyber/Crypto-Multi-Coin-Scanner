@@ -48,6 +48,8 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
         "lifecycle_state": "",
         "lifecycle_r": "",
         "lifecycle_terminal": 0,
+        "terminal_event_utc": "",
+        "canonical_signal_key": "",
     }.items():
         if column not in df.columns:
             df[column] = default
@@ -63,6 +65,7 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
         df["outcome"] = result.where(~result.eq("WIN"), "WIN_" + target.replace("", "TP1"))
         df.loc[result.eq("LOSS"), "outcome"] = "LOSS"
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["terminal_event_utc"] = pd.to_datetime(df["terminal_event_utc"], utc=True, errors="coerce")
     for column in ["rr", "real_rr", "lifecycle_r", "setup_strength", "score", "pnl_percent", "holding_minutes", "atr"]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
     df["result"] = df["result"].fillna("OPEN").astype(str).str.upper()
@@ -79,11 +82,12 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[lifecycle_terminal & df["lifecycle_r"].gt(0), "result"] = "WIN"
     df.loc[lifecycle_terminal & df["lifecycle_r"].lt(0), "result"] = "LOSS"
     df.loc[lifecycle_terminal & df["lifecycle_r"].eq(0), "result"] = "BREAKEVEN"
-    df.loc[df["lifecycle_state"].isin(["TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"]), "result"] = "OPEN"
+    df.loc[df["lifecycle_state"].eq("LIVE_OPEN_REMAINDER"), "result"] = "OPEN"
+    df.loc[df["lifecycle_state"].isin(["UNRESOLVED_REMAINDER", "HISTORICAL_REMAINDER_UNKNOWN", "SAME_CANDLE_AMBIGUOUS"]), "result"] = "UNKNOWN"
     legacy_tp1 = df["lifecycle_state"].eq("") & df["result"].eq("WIN") & df["hit_target"].isin(["", "TP1"])
-    df.loc[legacy_tp1, "lifecycle_state"] = "TP1_TOUCHED_REMAINDER_OPEN"
-    df.loc[legacy_tp1, "outcome"] = "TP1_TOUCHED_REMAINDER_OPEN"
-    df.loc[legacy_tp1, "result"] = "OPEN"
+    df.loc[legacy_tp1, "lifecycle_state"] = "HISTORICAL_REMAINDER_UNKNOWN"
+    df.loc[legacy_tp1, "outcome"] = "HISTORICAL_REMAINDER_UNKNOWN"
+    df.loc[legacy_tp1, "result"] = "UNKNOWN"
     df.loc[legacy_tp1, "real_rr"] = pd.NA
     legacy_tp2 = df["lifecycle_state"].eq("") & df["result"].eq("WIN") & df["hit_target"].eq("TP2")
     entry = pd.to_numeric(df["entry"], errors="coerce")
@@ -103,7 +107,7 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
 def closed_trades(df: pd.DataFrame) -> pd.DataFrame:
     return df[
         df["result"].isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED"])
-        & ~df["lifecycle_state"].isin(["TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"])
+        & ~df["lifecycle_state"].isin(["LIVE_OPEN_REMAINDER", "UNRESOLVED_REMAINDER", "HISTORICAL_REMAINDER_UNKNOWN", "SAME_CANDLE_AMBIGUOUS"])
     ].copy()
 
 
@@ -162,6 +166,8 @@ def equity_status(drawdown: float, cumulative_rr: float) -> str:
 def summary(df: pd.DataFrame) -> dict[str, Any]:
     normalized = normalize(df.copy())
     closed = closed_trades(normalized)
+    if not closed.empty:
+        closed = closed.sort_values(["timestamp", "canonical_signal_key"], na_position="last")
     total = len(normalized)
     win_count = int(wins(closed).sum()) if not closed.empty else 0
     loss_count = int((closed["result"] == "LOSS").sum()) if not closed.empty else 0

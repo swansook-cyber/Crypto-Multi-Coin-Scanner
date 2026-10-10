@@ -173,6 +173,10 @@ def normalize_scanner_data(df: pd.DataFrame, source: str = "scanner") -> pd.Data
         "remainder_fraction": 0.5,
         "lifecycle_same_candle_ambiguous": 0,
         "remainder_resolution_time_utc": "",
+        "canonical_signal_key": "",
+        "population_provenance": "",
+        "lifecycle_source": "",
+        "terminal_event_utc": "",
     }
     data = _ensure(df, defaults)
     normalized = pd.DataFrame(index=data.index)
@@ -211,6 +215,10 @@ def normalize_scanner_data(df: pd.DataFrame, source: str = "scanner") -> pd.Data
     normalized["tp1_fraction"] = _num(data["tp1_fraction"]).fillna(0.5)
     normalized["remainder_fraction"] = _num(data["remainder_fraction"]).fillna(0.5)
     normalized["lifecycle_same_candle_ambiguous"] = data["lifecycle_same_candle_ambiguous"].fillna(0).astype(str).str.lower().isin(["1", "true", "yes"])
+    normalized["canonical_signal_key"] = data["canonical_signal_key"].fillna("").astype(str)
+    normalized["population_provenance"] = data["population_provenance"].fillna("").astype(str)
+    normalized["lifecycle_source"] = data["lifecycle_source"].fillna("").astype(str)
+    normalized["terminal_event_utc"] = data["terminal_event_utc"].fillna("").astype(str)
     legacy_tp2 = normalized["lifecycle_state"].eq("") & normalized["result"].eq("WIN") & normalized["hit_target"].eq("TP2")
     legacy_loss = normalized["lifecycle_state"].eq("") & normalized["result"].eq("LOSS")
     risk_distance = (normalized["entry"] - normalized["sl"]).abs()
@@ -224,10 +232,11 @@ def normalize_scanner_data(df: pd.DataFrame, source: str = "scanner") -> pd.Data
     normalized.loc[legacy_loss, "lifecycle_r"] = -1.0
     normalized.loc[legacy_loss, "lifecycle_state"] = "ORIGINAL_SL"
     normalized.loc[legacy_loss, "lifecycle_terminal"] = True
-    unresolved_lifecycle = normalized["lifecycle_state"].isin(["TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"])
+    unresolved_lifecycle = normalized["lifecycle_state"].isin(["LIVE_OPEN_REMAINDER", "UNRESOLVED_REMAINDER", "HISTORICAL_REMAINDER_UNKNOWN", "SAME_CANDLE_AMBIGUOUS"])
     legacy_tp1_only = normalized["lifecycle_state"].eq("") & normalized["result"].eq("WIN") & normalized["hit_target"].isin(["", "TP1"])
-    normalized.loc[legacy_tp1_only, "lifecycle_state"] = "TP1_TOUCHED_REMAINDER_OPEN"
-    normalized.loc[unresolved_lifecycle | legacy_tp1_only, "result"] = "OPEN"
+    normalized.loc[legacy_tp1_only, "lifecycle_state"] = "HISTORICAL_REMAINDER_UNKNOWN"
+    normalized.loc[normalized["lifecycle_state"].eq("LIVE_OPEN_REMAINDER"), "result"] = "OPEN"
+    normalized.loc[normalized["lifecycle_state"].isin(["UNRESOLVED_REMAINDER", "HISTORICAL_REMAINDER_UNKNOWN", "SAME_CANDLE_AMBIGUOUS"]), "result"] = "UNKNOWN"
     resolved_lifecycle = normalized["lifecycle_r"].notna() & normalized["lifecycle_terminal"]
     normalized.loc[resolved_lifecycle & normalized["lifecycle_r"].gt(0), "result"] = "WIN"
     normalized.loc[resolved_lifecycle & normalized["lifecycle_r"].lt(0), "result"] = "LOSS"
@@ -357,20 +366,16 @@ def normalize_external_data(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def combine_scanner_sources(journal: pd.DataFrame, history: pd.DataFrame) -> pd.DataFrame:
-    if not journal.empty:
-        return normalize_scanner_data(journal, "scanner")
-    frames = []
-    if not history.empty:
-        frames.append(normalize_scanner_data(history, "scanner"))
-    if not frames:
-        return normalize_scanner_data(pd.DataFrame(), "scanner")
-    combined = pd.concat(frames, ignore_index=True)
-    if combined.empty:
-        return combined
-    key_columns = ["timestamp", "symbol", "side", "entry"]
-    combined["_key"] = combined[key_columns].apply(lambda row: "|".join(str(value) for value in row), axis=1)
-    combined = combined.drop_duplicates("_key", keep="last").drop(columns="_key")
-    return combined
+    from core.historical_lifecycle_reconstruction import canonical_sent_population
+
+    sent_population, _counts = canonical_sent_population(journal, history)
+    sent_normalized = normalize_scanner_data(sent_population, "scanner")
+    supplemental = []
+    for frame in (journal, history):
+        if frame is not None and not frame.empty and "signal_status" in frame.columns:
+            normalized = normalize_scanner_data(frame, "scanner")
+            supplemental.append(normalized[normalized["signal_status"].ne("sent")])
+    return pd.concat([sent_normalized, *supplemental], ignore_index=True) if supplemental else sent_normalized
 
 
 def latest_report_date(scanner_df: pd.DataFrame, date: str | None = None) -> str:
@@ -722,6 +727,18 @@ def build_complete_report(
     breakeven = scanner_day["breakeven_recommended"] if "breakeven_recommended" in scanner_day else pd.Series(dtype=bool)
     pnl_values = closed.apply(calculate_pnl, axis=1) if not closed.empty else pd.Series(dtype=float)
     net_r = closed.apply(estimated_r, axis=1).sum() if not closed.empty else 0.0
+    equity_rows = closed.copy()
+    if not equity_rows.empty:
+        equity_rows["_r"] = equity_rows.apply(estimated_r, axis=1)
+        equity_rows = equity_rows.sort_values(["timestamp", "canonical_signal_key"], na_position="last")
+        equity = equity_rows["_r"].cumsum()
+        running_peak = equity.cummax()
+        peak_r = float(running_peak.max())
+        max_drawdown_r = float((equity - running_peak).min())
+        longest_losing_streak = max((len(list(group)) for losing, group in __import__("itertools").groupby(equity_rows["_r"].lt(0)) if losing), default=0)
+    else:
+        peak_r = max_drawdown_r = 0.0
+        longest_losing_streak = 0
     pos_counts = position_management_counts(journal, report_date)
     ext_counts = external_counts(external, report_date)
 
@@ -747,6 +764,9 @@ def build_complete_report(
         "tp3_hits": target_hits(sent_day, 3),
         "sl_hits": int(len(losses)),
         "net_r_estimate": net_r,
+        "peak_r": peak_r,
+        "max_drawdown_r": max_drawdown_r,
+        "longest_losing_streak": longest_losing_streak,
         "avg_profit_pct": safe_mean(pd.Series([v for v in pnl_values if v is not None and v > 0])),
         "avg_loss_pct": safe_mean(pd.Series([v for v in pnl_values if v is not None and v < 0])),
         "avg_drawdown_pct": safe_mean(closed["max_drawdown_pct"]) if not closed.empty else None,

@@ -1555,7 +1555,8 @@ def test_daily_summary_and_missing_telegram_env() -> None:
     assert summary["total_signals"] == 3
     assert summary["tp1_hits"] == 1
     assert summary["sl_hits"] == 1
-    assert summary["pending"] == 2
+    # Legacy TP1 is historical-unknown, not a proven live-open remainder.
+    assert summary["pending"] == 1
     assert summary["win_rate"] == 0.0
     assert summary["btc_regime_breakdown"] == "bullish: 1, bearish: 1, sideways: 1"
     assert summary["wave_score_breakdown"] == "80-100: 1, 40-59: 1, 0-39: 1"
@@ -1741,7 +1742,7 @@ def test_daily_performance_report_metrics() -> None:
     report = performance_report.build_report(df, "2026-05-30")
     assert report["total_sent_signals"] == 4
     assert report["closed_signals"] == 2
-    assert report["open_signals"] == 2
+    assert report["open_signals"] == 1
     assert report["wins"] == 1
     assert report["losses"] == 1
     assert round(report["win_rate"], 1) == 50.0

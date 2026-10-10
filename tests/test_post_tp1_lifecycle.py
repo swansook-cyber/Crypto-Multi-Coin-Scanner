@@ -54,7 +54,7 @@ def test_tp1_touch_is_not_a_final_win_or_full_trade_r() -> None:
     assert lifecycle.state == "TP1_TOUCHED_REMAINDER_OPEN"
     assert lifecycle.lifecycle_r is None
     normalized = normalize_scanner_data(pd.DataFrame([{**row, "result": "WIN", "hit_target": "TP1"}]))
-    assert normalized.iloc[0]["result"] == "OPEN"
+    assert normalized.iloc[0]["result"] == "UNKNOWN"
     assert pd.isna(normalized.iloc[0]["real_rr"])
 
 
@@ -190,8 +190,8 @@ def test_legacy_history_remains_readable_but_tp1_is_open() -> None:
         {**trade(), "result": "WIN", "hit_target": "TP1", "lifecycle_state": pd.NA},
         {**trade(), "symbol": "ETHUSDT", "result": "LOSS", "lifecycle_state": pd.NA},
     ]))
-    assert history.iloc[0]["result"] == "OPEN"
-    assert history.iloc[0]["outcome"] == "TP1_TOUCHED_REMAINDER_OPEN"
+    assert history.iloc[0]["result"] == "UNKNOWN"
+    assert history.iloc[0]["outcome"] == "HISTORICAL_REMAINDER_UNKNOWN"
     assert float(history.iloc[0]["real_rr"]) == 0.0
     assert history.iloc[1]["result"] == "LOSS"
     assert history.iloc[1]["outcome"] == "ORIGINAL_SL"
@@ -222,7 +222,7 @@ def test_legacy_reporting_outputs_share_lifecycle_compatibility_semantics() -> N
     ])
 
     analytics = normalize_scanner_data(rows)
-    assert analytics["lifecycle_state"].tolist() == ["TP1_TOUCHED_REMAINDER_OPEN", "ORIGINAL_SL"]
+    assert analytics["lifecycle_state"].tolist() == ["HISTORICAL_REMAINDER_UNKNOWN", "ORIGINAL_SL"]
     report, _ = build_complete_report(rows, pd.DataFrame(), pd.DataFrame(), "ALL")
     stats = performance_summary(rows)
     daily = normalize_daily_summary(rows)
@@ -231,7 +231,7 @@ def test_legacy_reporting_outputs_share_lifecycle_compatibility_semantics() -> N
     assert report["net_r_estimate"] == pytest.approx(-1.0)
     assert stats["closed_trades"] == 1
     assert stats["net_rr"] == pytest.approx(-1.0)
-    assert daily["result"].tolist() == ["OPEN", "LOSS"]
+    assert daily["result"].tolist() == ["UNKNOWN", "LOSS"]
     assert daily["real_rr"].fillna(0).sum() == pytest.approx(-1.0)
 
 

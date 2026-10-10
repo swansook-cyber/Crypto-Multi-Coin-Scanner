@@ -26,6 +26,7 @@ from core.performance_stats import rejection_counts, summary as performance_summ
 BASE_DIR = Path(__file__).resolve().parent
 JOURNAL = BASE_DIR / "logs" / "signals.csv"
 HISTORY = BASE_DIR / "logs" / "signals_history.csv"
+RESEARCH_DB = BASE_DIR / "research" / "scanner_research_v1.db"
 REJECTED = BASE_DIR / "logs" / "rejected_signals.csv"
 EQUITY = BASE_DIR / "logs" / "equity_curve.csv"
 DAILY_SUMMARY = BASE_DIR / "logs" / "daily_summary.csv"
@@ -106,10 +107,11 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[valid_tp2, "lifecycle_state"] = "TP2_WIN"
     df.loc[valid_tp2, "lifecycle_r"] = 0.5 * (tp1_price[valid_tp2] - entry[valid_tp2]).abs() / risk[valid_tp2] + 0.5 * (tp2_price[valid_tp2] - entry[valid_tp2]).abs() / risk[valid_tp2]
     df.loc[valid_tp2, "lifecycle_terminal"] = True
-    unresolved = df["lifecycle_state"].isin(["TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"])
+    unresolved = df["lifecycle_state"].isin(["LIVE_OPEN_REMAINDER", "UNRESOLVED_REMAINDER", "HISTORICAL_REMAINDER_UNKNOWN", "SAME_CANDLE_AMBIGUOUS"])
     legacy_tp1_only = df["lifecycle_state"].eq("") & df["result"].eq("WIN") & df["hit_target"].isin(["", "TP1"])
-    df.loc[legacy_tp1_only, "lifecycle_state"] = "TP1_TOUCHED_REMAINDER_OPEN"
-    df.loc[unresolved | legacy_tp1_only, "result"] = "OPEN"
+    df.loc[legacy_tp1_only, "lifecycle_state"] = "HISTORICAL_REMAINDER_UNKNOWN"
+    df.loc[df["lifecycle_state"].eq("LIVE_OPEN_REMAINDER"), "result"] = "OPEN"
+    df.loc[df["lifecycle_state"].isin(["UNRESOLVED_REMAINDER", "HISTORICAL_REMAINDER_UNKNOWN", "SAME_CANDLE_AMBIGUOUS"]), "result"] = "UNKNOWN"
     resolved = df["lifecycle_terminal"] & df["lifecycle_r"].notna()
     df.loc[resolved & df["lifecycle_r"].gt(0), "result"] = "WIN"
     df.loc[resolved & df["lifecycle_r"].lt(0), "result"] = "LOSS"
@@ -142,8 +144,10 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_journal(path: Path = JOURNAL) -> pd.DataFrame:
-    if path == JOURNAL and HISTORY.exists():
-        path = HISTORY
+    if path == JOURNAL:
+        from core.historical_lifecycle_reconstruction import load_canonical_reporting_population
+        frame, _counts = load_canonical_reporting_population(JOURNAL, HISTORY, RESEARCH_DB)
+        return ensure_columns(frame)
     if not path.exists():
         LOGGER.warning("Journal not found: %s", path)
         return ensure_columns(pd.DataFrame())
@@ -218,13 +222,16 @@ def build_daily_summary(df: pd.DataFrame, date: str | None = None) -> dict[str, 
         date = latest_journal_day(df)
     if df.empty:
         day_df = df.copy()
+    elif str(date).upper() == "ALL":
+        day_df = df.copy()
     else:
         day_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == date].copy()
 
     total = int(len(day_df))
     lifecycle = day_df["lifecycle_state"] if total else pd.Series(dtype=str)
-    tp1 = int((lifecycle.isin(["TP1_TOUCHED_REMAINDER_OPEN", "TP1_THEN_ORIGINAL_SL", "TP1_THEN_PROTECTIVE_STOP", "TP2_WIN"]) | day_df["outcome"].eq("WIN_TP1")).sum()) if total else 0
-    tp2 = int((lifecycle.eq("TP2_WIN") | day_df["outcome"].eq("WIN_TP2")).sum()) if total else 0
+    hit_target = day_df["hit_target"].fillna("").astype(str).str.upper() if total else pd.Series(dtype=str)
+    tp1 = int((lifecycle.isin(["LIVE_OPEN_REMAINDER", "TP1_THEN_ORIGINAL_SL", "TP1_THEN_PROTECTIVE_STOP", "TP2_WIN"]) | hit_target.isin(["TP1", "TP2", "TP3"])).sum()) if total else 0
+    tp2 = int((lifecycle.eq("TP2_WIN") | hit_target.isin(["TP2", "TP3"])).sum()) if total else 0
     sl = int((day_df["result"] == "LOSS").sum()) if total else 0
     pending = int((day_df["result"] == "OPEN").sum()) if total else 0
     wins = int((day_df["result"] == "WIN").sum()) if total else 0

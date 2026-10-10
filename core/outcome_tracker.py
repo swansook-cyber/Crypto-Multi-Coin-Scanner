@@ -118,7 +118,7 @@ def outcome_classification(row: pd.Series) -> str:
         return "WIN_TP2"
     if result == "WIN":
         # Legacy TP1-only rows have no evidence that the remainder resolved.
-        return "TP1_TOUCHED_REMAINDER_OPEN"
+        return "HISTORICAL_REMAINDER_UNKNOWN"
     if result == "LOSS":
         return "ORIGINAL_SL"
     if result == "BREAKEVEN":
@@ -133,7 +133,7 @@ def pnl_percent(row: pd.Series) -> float:
     if not pd.isna(lifecycle_r):
         return float(lifecycle_r) * risk_percent(row)
     lifecycle = lifecycle_state(row)
-    if lifecycle in {"TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}:
+    if lifecycle in {"LIVE_OPEN_REMAINDER", "TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER", "HISTORICAL_REMAINDER_UNKNOWN"}:
         return 0.0
     result = str(row.get("result", "OPEN")).strip().upper()
     hit_target = str(row.get("hit_target", "")).strip().upper()
@@ -165,7 +165,7 @@ def real_rr(row: pd.Series) -> float:
     if not pd.isna(lifecycle_r):
         return float(lifecycle_r)
     lifecycle = lifecycle_state(row)
-    if lifecycle in {"TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}:
+    if lifecycle in {"LIVE_OPEN_REMAINDER", "TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER", "HISTORICAL_REMAINDER_UNKNOWN"}:
         return 0.0
     if not lifecycle and str(row.get("result", "")).strip().upper() == "WIN" and str(row.get("hit_target", "")).strip().upper() in {"", "TP1"}:
         return 0.0
@@ -210,10 +210,12 @@ def journal_to_history(df: pd.DataFrame) -> pd.DataFrame:
         lifecycle = lifecycle_state(row)
         source_result = str(row.get("result", "OPEN") or "OPEN").upper()
         lifecycle_r_value = pd.to_numeric(pd.Series([row.get("lifecycle_r")]), errors="coerce").iloc[0]
-        if lifecycle in {"TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"} or (
+        if lifecycle in {"LIVE_OPEN_REMAINDER", "TP1_TOUCHED_REMAINDER_OPEN"}:
+            reporting_result = "OPEN"
+        elif lifecycle in {"UNRESOLVED_REMAINDER", "HISTORICAL_REMAINDER_UNKNOWN", "SAME_CANDLE_AMBIGUOUS"} or (
             not lifecycle and source_result == "WIN" and str(row.get("hit_target", "")).upper() in {"", "TP1"}
         ):
-            reporting_result = "OPEN"
+            reporting_result = "UNKNOWN"
         elif lifecycle and not pd.isna(lifecycle_r_value):
             reporting_result = "WIN" if float(lifecycle_r_value) > 0 else "LOSS" if float(lifecycle_r_value) < 0 else "BREAKEVEN"
         else:
@@ -244,7 +246,7 @@ def journal_to_history(df: pd.DataFrame) -> pd.DataFrame:
             "pnl_percent": f"{pnl_percent(row):.4f}",
             "holding_minutes": f"{holding_minutes(row):.1f}",
             "outcome": outcome_classification(row),
-            "lifecycle_state": lifecycle or outcome_classification(row),
+            "lifecycle_state": "LIVE_OPEN_REMAINDER" if lifecycle == "TP1_TOUCHED_REMAINDER_OPEN" else (lifecycle or outcome_classification(row)),
             "lifecycle_r": "" if pd.isna(lifecycle_r_value) else f"{float(lifecycle_r_value):.6f}",
             "lifecycle_terminal": row.get("lifecycle_terminal", 0),
             "tp1_fraction": row.get("tp1_fraction", 0.5),

@@ -29,7 +29,7 @@ from core.signal_identity import canonical_signal_key, normalize_side, normalize
 
 
 LOGGER = logging.getLogger(__name__)
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 FEATURE_SCHEMA_VERSION = 1
 DEFAULT_DB_PATH = Path("research/scanner_research_v1.db")
 VALID_SOURCE_MODES = {"PROSPECTIVE", "HISTORICAL_BACKFILL"}
@@ -508,7 +508,35 @@ CREATE TABLE IF NOT EXISTS shadow_boundaries (
 """
 
 
-MIGRATIONS = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3, 4: MIGRATION_4}
+MIGRATION_5 = """
+CREATE TABLE IF NOT EXISTS historical_lifecycle_reconstructions (
+    canonical_signal_key TEXT PRIMARY KEY,
+    timestamp_utc TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    lifecycle_state TEXT NOT NULL,
+    lifecycle_r REAL,
+    tp1_touch_utc TEXT,
+    terminal_event_utc TEXT,
+    tp1_fraction REAL NOT NULL,
+    remainder_fraction REAL NOT NULL,
+    ambiguity_flag INTEGER NOT NULL DEFAULT 0,
+    ambiguity_reason TEXT,
+    source TEXT NOT NULL,
+    reconstruction_version TEXT NOT NULL,
+    reconstructed_at_utc TEXT NOT NULL,
+    price_source TEXT NOT NULL,
+    price_interval TEXT NOT NULL,
+    closed_candle_cutoff_utc TEXT NOT NULL,
+    geometry_hash TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_historical_lifecycle_terminal
+    ON historical_lifecycle_reconstructions(terminal_event_utc,lifecycle_state);
+"""
+
+
+MIGRATIONS = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3, 4: MIGRATION_4, 5: MIGRATION_5}
 
 
 def _sql_statements(script: str) -> Iterable[str]:
@@ -587,6 +615,46 @@ class ResearchTelemetryStore:
             except Exception:
                 connection.rollback()
                 raise
+
+    def upsert_historical_lifecycle(self, records: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+        """Idempotently persist derived lifecycle rows without touching source evidence."""
+        inserted = updated = unchanged = 0
+        columns = (
+            "canonical_signal_key", "timestamp_utc", "symbol", "side", "lifecycle_state", "lifecycle_r",
+            "tp1_touch_utc", "terminal_event_utc", "tp1_fraction", "remainder_fraction", "ambiguity_flag",
+            "ambiguity_reason", "source", "reconstruction_version", "reconstructed_at_utc", "price_source",
+            "price_interval", "closed_candle_cutoff_utc", "geometry_hash", "evidence_hash",
+        )
+        compare_columns = tuple(column for column in columns if column != "reconstructed_at_utc")
+        placeholders = ",".join("?" for _ in columns)
+        updates = ",".join(f"{column}=excluded.{column}" for column in columns if column != "canonical_signal_key")
+        with closing(self.connect()) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                for record in records:
+                    key = _text(record.get("canonical_signal_key"))
+                    existing = connection.execute(
+                        "SELECT * FROM historical_lifecycle_reconstructions WHERE canonical_signal_key=?", (key,)
+                    ).fetchone()
+                    incoming = tuple(record.get(column) for column in compare_columns)
+                    if existing is not None:
+                        current = tuple(existing[column] for column in compare_columns)
+                        if current == incoming:
+                            unchanged += 1
+                            continue
+                        updated += 1
+                    else:
+                        inserted += 1
+                    connection.execute(
+                        f"INSERT INTO historical_lifecycle_reconstructions ({','.join(columns)}) VALUES ({placeholders}) "
+                        f"ON CONFLICT(canonical_signal_key) DO UPDATE SET {updates}",
+                        tuple(record.get(column) for column in columns),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return {"inserted": inserted, "updated": updated, "unchanged": unchanged}
 
     def boundary(self) -> str:
         if self._prospective_start_utc:
@@ -1710,6 +1778,57 @@ def _print_mapping(title: str, data: Mapping[str, Any]) -> None:
         print(f"{key.replace('_', ' ').title()}: {value if value not in (None, '') else 'N/A'}")
 
 
+def backfill_historical_lifecycle(
+    store: ResearchTelemetryStore,
+    signals_path: Path,
+    history_path: Path,
+    cutoff_utc: str = "",
+) -> dict[str, Any]:
+    """Reconstruct and store only derived historical lifecycle evidence."""
+    import pandas as pd
+    from core.historical_lifecycle_reconstruction import (
+        canonical_sent_population,
+        lifecycle_metrics,
+        load_db_sent_candidates,
+        reconstruct_population,
+        records_as_dicts,
+    )
+
+    def read(path: Path) -> pd.DataFrame:
+        try:
+            return pd.read_csv(path)
+        except (FileNotFoundError, pd.errors.EmptyDataError, OSError):
+            return pd.DataFrame()
+
+    if cutoff_utc:
+        cutoff = normalize_utc(cutoff_utc)
+    else:
+        now = pd.Timestamp.now(tz="UTC")
+        cutoff = (now.floor("15min") - pd.Timedelta(milliseconds=1)).isoformat().replace("+00:00", "Z")
+    population, provenance = canonical_sent_population(
+        read(signals_path), read(history_path), load_db_sent_candidates(store.path)
+    )
+    records, errors = reconstruct_population(population, cutoff)
+    changes = store.upsert_historical_lifecycle(records_as_dicts(records))
+    reconstructed = pd.DataFrame(records_as_dicts(records))
+    metrics = lifecycle_metrics(reconstructed)
+    return {
+        "canonical SENT": provenance["canonical_sent"],
+        "current CSV": provenance["current_csv"],
+        "history-only": provenance["history_only"],
+        "DB-only": provenance["db_only"],
+        "reconstructed": len(records),
+        "TP2_WIN": metrics["tp2_win"],
+        "TP1_THEN_ORIGINAL_SL": metrics["tp1_then_original_sl"],
+        "ORIGINAL_SL": metrics["original_sl"],
+        "AMBIGUOUS": metrics["ambiguous"],
+        "UNRESOLVED": metrics["unresolved"],
+        "Net R": metrics["net_r"],
+        **changes,
+        "errors": errors,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Unified scanner research telemetry (read-only by default).")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
@@ -1727,6 +1846,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="NAME=PATH",
         help="Compatibility-ingest a shadow CSV after candidates (repeatable).",
     )
+    lifecycle_parser = sub.add_parser("backfill-historical-lifecycle")
+    lifecycle_parser.add_argument("--signals", type=Path, default=Path("logs/signals.csv"))
+    lifecycle_parser.add_argument("--history", type=Path, default=Path("logs/signals_history.csv"))
+    lifecycle_parser.add_argument("--cutoff", default="")
     enrich_commands = {}
     for command in ("enrich", "enrich-all"):
         enrich_commands[command] = sub.add_parser(command)
@@ -1792,6 +1915,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             name, raw_path = spec.split("=", 1)
             result[f"shadow:{name}"] = ingest_shadow_csv(store, Path(raw_path), name)
         print(json.dumps(result, indent=2, sort_keys=True))
+    elif args.command == "backfill-historical-lifecycle":
+        try:
+            result = backfill_historical_lifecycle(store, args.signals, args.history, args.cutoff)
+            print(json.dumps(result, indent=2, sort_keys=False))
+        except Exception as exc:
+            print(f"Historical lifecycle backfill failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
     elif args.command in {"enrich", "enrich-all", "enrich-outcomes", "enrich-execution"}:
         try:
             if args.command == "enrich-outcomes":

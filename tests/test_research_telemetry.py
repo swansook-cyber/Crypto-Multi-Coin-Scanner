@@ -280,7 +280,7 @@ def test_schema_v2_to_v3_preserves_enrichment_status(tmp_path: Path) -> None:
         assert row["high_water"] == "100"
         assert row["last_attempt_utc"] is None
         assert row["source_rows_seen"] == 0
-        assert connection.execute("SELECT schema_version FROM research_meta").fetchone()[0] == 4
+        assert connection.execute("SELECT schema_version FROM research_meta").fetchone()[0] == 5
 
 
 def test_corrupt_db_fails_open(tmp_path: Path) -> None:
