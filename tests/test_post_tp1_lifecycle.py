@@ -187,8 +187,8 @@ def test_shadow_recording_does_not_mutate_signal_or_call_live_paths() -> None:
 
 def test_legacy_history_remains_readable_but_tp1_is_open() -> None:
     history = journal_to_history(pd.DataFrame([
-        {**trade(), "result": "WIN", "hit_target": "TP1"},
-        {**trade(), "symbol": "ETHUSDT", "result": "LOSS"},
+        {**trade(), "result": "WIN", "hit_target": "TP1", "lifecycle_state": pd.NA},
+        {**trade(), "symbol": "ETHUSDT", "result": "LOSS", "lifecycle_state": pd.NA},
     ]))
     assert history.iloc[0]["result"] == "OPEN"
     assert history.iloc[0]["outcome"] == "TP1_TOUCHED_REMAINDER_OPEN"

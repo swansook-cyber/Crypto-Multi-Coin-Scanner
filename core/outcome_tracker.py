@@ -83,6 +83,11 @@ def normalize_bool(value: Any) -> str:
     return text or "NO"
 
 
+def lifecycle_state(row: pd.Series) -> str:
+    value = row.get("lifecycle_state", "")
+    return "" if pd.isna(value) else str(value).strip().upper()
+
+
 def history_key(df: pd.DataFrame) -> pd.Series:
     parts = []
     for column in ["timestamp", "symbol", "side", "entry"]:
@@ -104,7 +109,7 @@ def rejection_key(df: pd.DataFrame) -> pd.Series:
 
 
 def outcome_classification(row: pd.Series) -> str:
-    lifecycle = str(row.get("lifecycle_state", "")).strip().upper()
+    lifecycle = lifecycle_state(row)
     if lifecycle:
         return lifecycle
     result = str(row.get("result", "OPEN")).strip().upper()
@@ -127,7 +132,7 @@ def pnl_percent(row: pd.Series) -> float:
     lifecycle_r = pd.to_numeric(pd.Series([row.get("lifecycle_r")]), errors="coerce").iloc[0]
     if not pd.isna(lifecycle_r):
         return float(lifecycle_r) * risk_percent(row)
-    lifecycle = str(row.get("lifecycle_state", "")).strip().upper()
+    lifecycle = lifecycle_state(row)
     if lifecycle in {"TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}:
         return 0.0
     result = str(row.get("result", "OPEN")).strip().upper()
@@ -159,7 +164,7 @@ def real_rr(row: pd.Series) -> float:
     lifecycle_r = pd.to_numeric(pd.Series([row.get("lifecycle_r")]), errors="coerce").iloc[0]
     if not pd.isna(lifecycle_r):
         return float(lifecycle_r)
-    lifecycle = str(row.get("lifecycle_state", "")).strip().upper()
+    lifecycle = lifecycle_state(row)
     if lifecycle in {"TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}:
         return 0.0
     if not lifecycle and str(row.get("result", "")).strip().upper() == "WIN" and str(row.get("hit_target", "")).strip().upper() in {"", "TP1"}:
@@ -202,7 +207,7 @@ def journal_to_history(df: pd.DataFrame) -> pd.DataFrame:
         status = pd.Series(["sent"] * len(df), index=df.index)
     sent = df[status == "sent"].copy()
     for _, row in sent.iterrows():
-        lifecycle = str(row.get("lifecycle_state", "")).strip().upper()
+        lifecycle = lifecycle_state(row)
         source_result = str(row.get("result", "OPEN") or "OPEN").upper()
         lifecycle_r_value = pd.to_numeric(pd.Series([row.get("lifecycle_r")]), errors="coerce").iloc[0]
         if lifecycle in {"TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"} or (
