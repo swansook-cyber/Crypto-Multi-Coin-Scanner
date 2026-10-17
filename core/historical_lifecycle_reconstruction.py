@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 import pandas as pd
-from core.utc_time import timestamp_to_epoch_ms
 import requests
 
 from core.post_tp1_lifecycle import evaluate_reporting_lifecycle
@@ -364,8 +363,8 @@ def reconstruct_one(row: Mapping[str, Any], candles: pd.DataFrame, cutoff_utc: s
 
 def fetch_binance_closed_klines(symbol: str, start_utc: str, cutoff_utc: str, *, session: requests.Session | None = None) -> pd.DataFrame:
     client = session or requests.Session()
-    start_ms = timestamp_to_epoch_ms(parse_utc_mixed(start_utc))
-    end_ms = timestamp_to_epoch_ms(parse_utc_mixed(cutoff_utc))
+    start_ms = int(parse_utc_mixed(start_utc).timestamp() * 1000)
+    end_ms = int(parse_utc_mixed(cutoff_utc).timestamp() * 1000)
     rows: list[list[Any]] = []
     while start_ms <= end_ms:
         response = client.get(
