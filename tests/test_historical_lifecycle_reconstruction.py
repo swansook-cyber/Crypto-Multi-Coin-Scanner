@@ -261,7 +261,7 @@ def test_shadow_boundary_is_unchanged_by_lifecycle_upsert(tmp_path: Path):
 def test_schema_migration_preserves_existing_table(tmp_path: Path):
     store = ResearchTelemetryStore(tmp_path / "research.db")
     with store.connect(read_only=True) as connection:
-        assert connection.execute("SELECT schema_version FROM research_meta").fetchone()[0] == 5
+        assert connection.execute("SELECT schema_version FROM research_meta").fetchone()[0] == 6
         assert connection.execute("SELECT name FROM sqlite_master WHERE name='historical_lifecycle_reconstructions'").fetchone()
 
 

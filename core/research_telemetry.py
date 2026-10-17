@@ -29,7 +29,7 @@ from core.signal_identity import canonical_signal_key, normalize_side, normalize
 
 
 LOGGER = logging.getLogger(__name__)
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 FEATURE_SCHEMA_VERSION = 1
 DEFAULT_DB_PATH = Path("research/scanner_research_v1.db")
 VALID_SOURCE_MODES = {"PROSPECTIVE", "HISTORICAL_BACKFILL"}
@@ -536,7 +536,19 @@ CREATE INDEX IF NOT EXISTS idx_historical_lifecycle_terminal
 """
 
 
-MIGRATIONS = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3, 4: MIGRATION_4, 5: MIGRATION_5}
+MIGRATION_6 = """
+CREATE TABLE IF NOT EXISTS lifecycle_review_progress (
+    journal_scope TEXT NOT NULL,
+    canonical_signal_key TEXT NOT NULL,
+    geometry_hash TEXT NOT NULL,
+    candles_json TEXT NOT NULL DEFAULT '[]',
+    cursor_utc TEXT,
+    terminal INTEGER NOT NULL DEFAULT 0,
+    updated_at_utc TEXT NOT NULL,
+    PRIMARY KEY (journal_scope, canonical_signal_key)
+);
+"""
+MIGRATIONS = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3, 4: MIGRATION_4, 5: MIGRATION_5, 6: MIGRATION_6}
 
 
 def _sql_statements(script: str) -> Iterable[str]:
