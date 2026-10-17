@@ -10,6 +10,7 @@ already scored.
 from __future__ import annotations
 
 import csv
+import io
 import hashlib
 import json
 import logging
@@ -33,6 +34,7 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from core.durable_journal import merge_frame, read_frame
 from core.binance_symbols import binance_usdm_market_symbol
 from core.btc_regime_filter import detect_btc_regime
 from core.cross_scan_exposure_shadow import (
@@ -1187,67 +1189,20 @@ class TradeJournalLogger:
 
     def __init__(self, path: Path = SIGNAL_JOURNAL) -> None:
         self.path = path
-        self.path.parent.mkdir(exist_ok=True)
-        if not self.path.exists():
-            with self.path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
-                writer.writeheader()
-        else:
+        try:
             self._migrate_schema()
+        except Exception:
+            LOGGER.exception("Journal initialization failed; scanner continues with telemetry")
 
     def _migrate_schema(self) -> None:
-        try:
-            df = pd.read_csv(self.path)
-        except pd.errors.EmptyDataError:
-            df = pd.DataFrame(columns=self.FIELDNAMES)
-        changed = False
-        defaults = {
-            "result": "OPEN",
-            "hit_target": "",
-            "closed_at": "",
-            "max_profit_pct": "",
-            "max_drawdown_pct": "",
-            "mfi": "",
-            "mfi_confirmed": "",
-            "watchlist_tier": "B",
-            "setup_strength": "",
-            "raw_score": "",
-            "score_bucket": "",
-            "body_ratio": "",
-            "opposite_wick_ratio": "",
-            "atr_expansion_ratio": "",
-            "quality_flags": "",
-            "wave_score": "",
-            "wave_structure": "",
-            "wave_phase": "",
-            "wave_notes": "",
-            "btc_regime": "",
-            "risk_mode": "",
-            "btc_regime_notes": "",
-            "market_session": "",
-            "htf_regime": "",
-            "htf_alignment": "",
-            "htf_conflict": "",
-            "signal_version": SIGNAL_VERSION,
-            "signal_status": "",
-            "skip_reason": "",
-            "position_recommendation": "",
-            "current_r": "",
-            "distance_to_tp1_pct": "",
-            "distance_to_sl_pct": "",
-            "position_confidence": "",
-            "position_reason": "",
-            "outcome_alert_sent": 0,
-            "outcome_alert_at": "",
-            "outcome_id": "",
-        }
+        # Union headers under the same process lock; preserve unknown evidence.
+        frame = read_frame(self.path)
+        defaults = {"result": "OPEN", "watchlist_tier": "B", "signal_version": SIGNAL_VERSION,
+                    "outcome_alert_sent": 0}
         for column in self.FIELDNAMES:
-            if column not in df.columns:
-                df[column] = defaults.get(column, "")
-                changed = True
-        if changed:
-            df = df[self.FIELDNAMES]
-            df.to_csv(self.path, index=False)
+            if column not in frame:
+                frame[column] = defaults.get(column, "")
+        merge_frame(self.path, frame)
 
     def log_signal(self, signal: TradeSignal, signal_status: str = "sent", skip_reason: str = "") -> None:
         active_report_statuses = {
@@ -1258,8 +1213,9 @@ class TradeJournalLogger:
             "london_long_report_only",
         }
         result = "OPEN" if signal_status in active_report_statuses else "SKIPPED"
-        with self.path.open("a", newline="", encoding="utf-8") as handle:
+        with io.StringIO(newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
+            writer.writeheader()
             writer.writerow(
                 {
                     "timestamp": signal.timestamp.isoformat(),
@@ -1315,6 +1271,9 @@ class TradeJournalLogger:
                     "outcome_id": "",
                 }
             )
+
+            handle.seek(0)
+            merge_frame(self.path, pd.read_csv(handle, dtype=str, keep_default_na=False))
 
     def is_recent_loss(self, signal: TradeSignal, minutes: int) -> bool:
         if not self.path.exists():
@@ -2079,7 +2038,10 @@ class AgentRunner:
             LOGGER.warning("Setup Strength prospective shadow failed for %s: %s", signal.symbol, exc)
 
     def log_signal_status(self, signal: TradeSignal, signal_status: str = "sent", skip_reason: str = "") -> None:
-        self.journal.log_signal(signal, signal_status, skip_reason)
+        try:
+            self.journal.log_signal(signal, signal_status, skip_reason)
+        except Exception:
+            LOGGER.exception("Journal write failed for %s; scanner continues and will attempt telemetry", signal.symbol)
         self.evaluate_setup_strength_shadow(signal, signal_status, skip_reason)
         try:
             self.record_research_telemetry(signal, signal_status, skip_reason)

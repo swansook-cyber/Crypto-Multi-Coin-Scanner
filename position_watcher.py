@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from core.analytics_reporting import load_csv_safely
+from core.durable_journal import read_frame, merge_frame
 from core.binance_symbols import binance_usdm_market_symbol
 from telegram_sender import TelegramRoutes, send_text
 
@@ -193,6 +193,15 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     ]
     for column in string_columns:
         data[column] = data[column].fillna("").astype(str)
+    # CSV readers return text; pandas 3 string columns reject integer updates.
+    # Delivery/recommendation flags have a numeric 0/1 contract, preserving
+    # the positive numeric and legacy text semantics of alert_already_sent.
+    for column in ("tp1_alert_sent", "breakeven_recommended",
+                   "cornix_be_command_sent", "new_stop_notification_sent"):
+        numeric = pd.to_numeric(data[column], errors="coerce")
+        legacy_sent = data[column].astype("string").str.strip().str.lower().isin(
+            {"1", "1.0", "true", "yes", "sent"})
+        data[column] = (numeric.ge(1) | legacy_sent).fillna(False).astype("int64")
     return data
 
 
@@ -426,11 +435,8 @@ def build_report_copy(row: pd.Series, current_price: float, cornix_message: str,
 
 
 def save_journal(df: pd.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    df.to_csv(tmp_path, index=False)
-    tmp_path.replace(path)
-    LOGGER.info("Position watcher CSV persisted: %s", path)
+    merge_frame(path, df)
+    LOGGER.info("Position watcher CSV merged: %s", path)
 
 
 def send_breakeven_alert(
@@ -548,7 +554,7 @@ def process_once(
         )
     session = session or build_session()
     stats = WatcherStats()
-    df = ensure_columns(load_csv_safely(journal_path))
+    df = ensure_columns(read_frame(journal_path))
     active_statuses = {"sent", "tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only", "london_long_report_only"}
     final_mask = df.apply(final_outcome_reached, axis=1) if not df.empty else pd.Series(dtype=bool)
     closed_candidates = df[(final_mask) & (df["signal_status"].isin(active_statuses))]

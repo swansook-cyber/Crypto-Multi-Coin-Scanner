@@ -9,6 +9,8 @@ CSV history is preserved.
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import subprocess
 from dataclasses import dataclass
@@ -72,6 +74,7 @@ class CleanupClassification:
     blocked_identity_ambiguous: int = 0
     removable_items: int = 0
     affected_symbols: list[str] | None = None
+    journal_input_status: str = "UNKNOWN"
 
 
 @dataclass
@@ -132,10 +135,36 @@ def numeric_text(value: Any) -> str:
     return f"{float(numeric):.8f}".rstrip("0").rstrip(".")
 
 
+class JournalInputError(ValueError):
+    """Invalid journal evidence; never classify corrupt input as healthy empty."""
+
+
 def load_journal(path: Path = JOURNAL) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_csv(path)
+    columns = ["timestamp", "symbol", "side", "entry", "tp1", "result"]
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        frame = pd.DataFrame(columns=columns)
+        frame.attrs["journal_input_status"] = "MISSING"
+        return frame
+    except UnicodeDecodeError as exc:
+        raise JournalInputError(f"Invalid journal encoding: {path}") from exc
+    if not text.strip():
+        frame = pd.DataFrame(columns=columns)
+        frame.attrs["journal_input_status"] = "EMPTY"
+        return frame
+    try:
+        # Validate row widths before pandas can infer an index or pad a partial row.
+        rows = [row for row in csv.reader(io.StringIO(text), strict=True) if row]
+        header = rows[0]
+        if (len(set(header)) != len(header) or not {"timestamp", "symbol"}.issubset(header)
+                or any(len(row) != len(header) for row in rows[1:])):
+            raise JournalInputError(f"Invalid journal columns/row width: {path}")
+        frame = pd.read_csv(io.StringIO(text))
+    except (csv.Error, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+        raise JournalInputError(f"Invalid journal CSV: {path}") from exc
+    frame.attrs["journal_input_status"] = "EMPTY" if frame.empty else "HEALTHY"
+    return frame
 
 
 def approved_lock_dir(journal_path: Path = JOURNAL) -> Path:
@@ -372,8 +401,8 @@ def evaluate_row(
     return make_item(symbol, side, timestamp, result, alert_key, safe_path, True, False, True, True, canonical_active, identity_confidence, "STALE_LOCK_FILE", SAFE_TO_REMOVE, True, "confirmed closed stale lock")
 
 
-def all_state_items(journal_path: Path = JOURNAL) -> list[StaleStateItem]:
-    df = load_journal(journal_path)
+def all_state_items(journal_path: Path = JOURNAL, *, frame: pd.DataFrame | None = None) -> list[StaleStateItem]:
+    df = load_journal(journal_path) if frame is None else frame
     if df.empty:
         return []
     runtime_index = build_runtime_index(df, journal_path)
@@ -400,8 +429,9 @@ def stale_state_items(journal_path: Path = JOURNAL) -> list[StaleStateItem]:
 
 
 def classify_cleanup(journal_path: Path = JOURNAL) -> CleanupClassification:
-    items = all_state_items(journal_path)
-    classification = CleanupClassification(affected_symbols=[])
+    frame = load_journal(journal_path)
+    items = all_state_items(journal_path, frame=frame)
+    classification = CleanupClassification(affected_symbols=[], journal_input_status=frame.attrs["journal_input_status"])
     symbols: set[str] = set()
     classification.canonical_active_entries = len(canonical_lock_files(journal_path))
     for item in items:
