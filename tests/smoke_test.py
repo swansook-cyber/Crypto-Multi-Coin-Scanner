@@ -3719,9 +3719,7 @@ def test_position_watcher_cross_row_new_stop_dedupe() -> None:
 
         stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
         assert stats.cornix_commands_sent == 0
-        # Durable canonical-key persistence coalesces the duplicate source row.
-        assert stats.skipped_duplicates == 1
-        assert len(pd.read_csv(path)) == 1
+        assert stats.skipped_duplicates == 2
         assert len(session.posts) == 2
     finally:
         _reset_position_watcher_test_path(path)

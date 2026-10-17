@@ -60,7 +60,6 @@
 - RC1.4 audit performance optimization: `data_integrity_audit.py --profile` and `--benchmark` are available; stale watcher cleanup now builds runtime indexes once per run.
 - RC1.5/RC1.6 provenance optimization: Entry Timing audit now uses canonical candidate identity with deterministic source priority, reducing false cross-source ambiguity while preserving true ambiguity warnings.
 - Unified Scanner Research Telemetry V1: fail-open SQLite sidecar captures immutable prospective candidate, feature, market, exposure, and shadow evidence; existing CSV/shadow outputs remain in compatibility dual-write mode. Outcome and Binance Execution Truth enrichment are standalone and read existing artifacts only.
-- Lifecycle journal durability and review coverage V1: scanner, outcome checker, watcher, history synchronization, and safe CSV repair share process-safe atomic merge persistence. Research schema v6 stores bounded incremental review progress; unresolved prospective lifecycles remain eligible beyond 24h. Orphan recovery is reporting-only and cannot trigger retrospective alerts or shadow decisions. Rollout/reboot validation is recorded in the deployment audit; strategy and execution semantics are unchanged.
 
 ## Telegram Channels
 

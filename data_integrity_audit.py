@@ -14,8 +14,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from core.durable_journal import process_lock, atomic_csv
-
 import pandas as pd
 
 
@@ -999,11 +997,6 @@ def _normalize_bool(value: Any) -> Any:
 
 
 def repair_safe(path: Path) -> tuple[int, Path | None]:
-    with process_lock(path.with_suffix(path.suffix + ".lock")):
-        return _repair_safe_locked(path)
-
-
-def _repair_safe_locked(path: Path) -> tuple[int, Path | None]:
     if not path.exists():
         return 0, None
     df = pd.read_csv(path)
@@ -1018,7 +1011,7 @@ def _repair_safe_locked(path: Path) -> tuple[int, Path | None]:
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         backup = BACKUP_DIR / f"{path.stem}_safe_repair_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.csv.bak"
         shutil.copy2(path, backup)
-        atomic_csv(path, list(df.columns), df.fillna("").to_dict("records"))
+        df.to_csv(path, index=False)
         return changed, backup
     return 0, None
 
