@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from core.analytics_reporting import load_csv_safely
+from core.durable_journal import read_frame, merge_frame
 from core.binance_symbols import binance_usdm_market_symbol
 from telegram_sender import TelegramRoutes, send_text
 
@@ -426,11 +426,8 @@ def build_report_copy(row: pd.Series, current_price: float, cornix_message: str,
 
 
 def save_journal(df: pd.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    df.to_csv(tmp_path, index=False)
-    tmp_path.replace(path)
-    LOGGER.info("Position watcher CSV persisted: %s", path)
+    merge_frame(path, df)
+    LOGGER.info("Position watcher CSV merged: %s", path)
 
 
 def send_breakeven_alert(
@@ -548,7 +545,7 @@ def process_once(
         )
     session = session or build_session()
     stats = WatcherStats()
-    df = ensure_columns(load_csv_safely(journal_path))
+    df = ensure_columns(read_frame(journal_path))
     active_statuses = {"sent", "tier_c_report_only", "weak_symbol_report_only", "session_risk_report_only", "london_long_report_only"}
     final_mask = df.apply(final_outcome_reached, axis=1) if not df.empty else pd.Series(dtype=bool)
     closed_candidates = df[(final_mask) & (df["signal_status"].isin(active_statuses))]
