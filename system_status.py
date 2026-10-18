@@ -251,18 +251,10 @@ def disk_free_gb(path: Path = BASE_DIR) -> float:
 
 
 def safety_status() -> dict[str, Any]:
-    try:
-        watcher_state = position_watcher_state_cleanup.classify_cleanup(JOURNAL)
-    except position_watcher_state_cleanup.JournalInputError:
-        journal_status = "INVALID"
-        watcher_warnings = None
-    else:
-        journal_status = watcher_state.journal_input_status
-        watcher_warnings = watcher_state.stale_canonical_active_entries + watcher_state.safe_to_remove + watcher_state.blocked_unsafe_path + watcher_state.blocked_identity_ambiguous
+    watcher_state = position_watcher_state_cleanup.classify_cleanup(JOURNAL)
+    watcher_warnings = watcher_state.stale_canonical_active_entries + watcher_state.safe_to_remove + watcher_state.blocked_unsafe_path + watcher_state.blocked_identity_ambiguous
     return {
-        "data_integrity": "FAIL" if journal_status == "INVALID" else audit_status(),
-        "watcher_journal_status": journal_status,
-        "watcher_journal_check": "FAIL" if journal_status == "INVALID" else "PASS" if journal_status == "HEALTHY" else "WARNING",
+        "data_integrity": audit_status(),
         "active_stale_watcher_state": watcher_warnings,
         "duplicate_alert_protection": duplicate_protection_status(),
         "latest_runtime_backup": latest_backup(),
@@ -303,7 +295,6 @@ def build_status(include_services: bool = True) -> dict[str, Any]:
     }
     status_inputs = [
         safety["data_integrity"],
-        safety["watcher_journal_check"],
         safety["duplicate_alert_protection"],
         reporting["executive_report"],
         reporting["full_report_html"],
@@ -406,7 +397,6 @@ def format_status(status: dict[str, Any]) -> str:
         "",
         "Safety",
         f"- Data Integrity: {safety['data_integrity']}",
-        f"- Watcher Journal: {safety.get('watcher_journal_status', 'UNKNOWN')}",
         f"- Active Stale Watcher State: {safety['active_stale_watcher_state']}",
         f"- Duplicate Alert Protection: {safety['duplicate_alert_protection']}",
         f"- Latest Runtime Backup: {safety['latest_runtime_backup']}",

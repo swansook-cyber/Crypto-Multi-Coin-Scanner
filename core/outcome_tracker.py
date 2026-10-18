@@ -3,10 +3,9 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
-
-from core.durable_journal import merge_frame, record_key
 
 import pandas as pd
 
@@ -284,14 +283,28 @@ def journal_to_rejections(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def upsert_csv(path: Path, current: pd.DataFrame, columns: list[str], key_func) -> pd.DataFrame:
-    current = current.copy()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            existing = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            existing = pd.DataFrame(columns=columns)
+    else:
+        existing = pd.DataFrame(columns=columns)
     for column in columns:
-        if column not in current:
+        if column not in existing.columns:
+            existing[column] = ""
+        if column not in current.columns:
             current[column] = ""
-    # Rejected rows have a status/reason identity; lifecycle history uses the
-    # canonical signal key, independent of numeric/timestamp CSV formatting.
-    identity = record_key if key_func is history_key else lambda row: str(key_func(pd.DataFrame([row])).iloc[0])
-    return merge_frame(path, current[columns], key_func=identity)
+    combined = pd.concat([existing[columns], current[columns]], ignore_index=True)
+    if not combined.empty:
+        combined["_key"] = key_func(combined)
+        combined = combined.drop_duplicates("_key", keep="last").drop(columns=["_key"])
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        combined.to_csv(handle, index=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return combined
 
 
 def sync_history_files(journal: pd.DataFrame, history_path: Path, rejected_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:

@@ -14,14 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from core.utc_time import timestamp_to_epoch_ms
 import requests
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from core.durable_journal import read_frame, merge_frame, process_lock
-from core.lifecycle_review_queue import LifecycleReviewQueue, MAX_REVIEWS_PER_CYCLE
 from core.analytics_engine import update_validation_artifacts
 from core.binance_symbols import binance_usdm_market_symbol
 from core.outcome_tracker import HISTORY_COLUMNS, sync_history_files
@@ -279,7 +276,7 @@ def reload_journal() -> pd.DataFrame | None:
         LOGGER.info("No journal found at logs/signals.csv")
         return None
     try:
-        df = read_frame(JOURNAL)
+        df = pd.read_csv(JOURNAL)
     except pd.errors.EmptyDataError:
         LOGGER.info("Journal is empty.")
         return None
@@ -298,13 +295,12 @@ def reload_journal() -> pd.DataFrame | None:
 
 
 def persist_journal(df: pd.DataFrame) -> None:
-    try:
-        merge_frame(JOURNAL, df)
-    except Exception as exc:
-        # Do not let the market-data exception handler swallow a failed commit
-        # and continue reporting an in-memory terminal as durable truth.
-        raise RuntimeError("Lifecycle journal commit failed; review will retry") from exc
-    LOGGER.info("CSV merged atomically: %s", JOURNAL)
+    JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+    with JOURNAL.open("w", newline="", encoding="utf-8") as handle:
+        df.to_csv(handle, index=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    LOGGER.info("CSV persisted: %s", JOURNAL)
 
 
 def ensure_external_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -796,9 +792,9 @@ def candles_for_signal(session: requests.Session, row: pd.Series, lookahead_hour
     if pd.isna(timestamp):
         return pd.DataFrame()
 
-    start_ms = timestamp_to_epoch_ms(timestamp)
+    start_ms = int(timestamp.timestamp() * 1000)
     end_ts = min(timestamp + pd.Timedelta(hours=lookahead_hours), pd.Timestamp.now(tz="UTC"))
-    end_ms = timestamp_to_epoch_ms(end_ts)
+    end_ms = int(end_ts.timestamp() * 1000)
     candles = fetch_klines(session, clean_symbol(row.get("symbol", "")), start_ms, end_ms)
     if candles.empty:
         return candles
@@ -1100,62 +1096,7 @@ def should_skip_outcome_alert(row: pd.Series, outcome_id: str, resend_unsent: bo
     return outcome_id in PROCESSED_OUTCOMES
 
 
-def restore_review_population(df, research_path, boundary):
-    """Recover orphan SENT identities, never execution ownership or shadows."""
-    import sqlite3
-    from core.historical_lifecycle_reconstruction import canonical_sent_population
-    from core.durable_journal import record_key
-
-    history = read_frame(HISTORY) if HISTORY.exists() else pd.DataFrame()
-    candidates = pd.DataFrame()
-    if Path(research_path).exists():
-        with sqlite3.connect(f"file:{Path(research_path).resolve().as_posix()}?mode=ro", uri=True) as connection:
-            candidates = pd.read_sql_query("SELECT * FROM candidates WHERE source_mode='PROSPECTIVE' AND decision='SENT' AND timestamp_utc>=?", connection, params=(boundary,))
-    population, _ = canonical_sent_population(df, history, candidates)
-    keys = {record_key(row) for row in df.to_dict("records")}
-    recovered = []
-    for row in population.to_dict("records"):
-        if record_key(row) in keys:
-            continue
-        timestamp = row.get("timestamp")
-        if pd.isna(timestamp) or not str(timestamp).strip():
-            timestamp = row.get("timestamp_utc")
-        if pd.to_datetime(timestamp, utc=True) < pd.to_datetime(boundary, utc=True):
-            continue
-        row["timestamp"] = timestamp
-        for column in ("entry", "tp1", "tp2"):
-            row[column] = format_price(row.get(column))
-        stop = row.get("stop_loss")
-        if pd.isna(stop) or not str(stop).strip():
-            stop = row.get("sl")
-        row["stop_loss"] = format_price(stop)
-        row["signal_status"] = "sent"
-        row["lifecycle_recovery"] = 1
-        row["lifecycle_recovery_original_result"] = row.get("result", "")
-        # Orphan evidence must not become a fresh OPEN position visible to the
-        # watcher/scanner while replay is still running (or after a failed GET).
-        # Canonical reporting derives terminal WIN/LOSS from lifecycle_r.
-        row["result"] = "UNKNOWN"
-        recovered.append(row)
-    if recovered:
-        baseline = df.attrs.get("journal_baseline", {})
-        df = pd.concat([df, pd.DataFrame(recovered)], ignore_index=True)
-        df.attrs["journal_baseline"] = baseline
-        df = ensure_columns(df)
-        persist_journal(df)
-        LOGGER.warning("Recovered orphan lifecycle identities: %d; retrospective alerts/shadows suppressed", len(recovered))
-    return df
-
-
-def run_review_cycle(*args, **kwargs):
-    # Prevent overlapping manual/timer invocations from claiming the same cursor
-    # or duplicating existing notification work. Scanner writes take a different,
-    # short-lived lock and remain available during market-data requests.
-    with process_lock(JOURNAL.with_suffix(JOURNAL.suffix + ".review.lock"), timeout=1):
-        return _run_review_cycle(*args, **kwargs)
-
-
-def _run_review_cycle(
+def run_review_cycle(
     notify: bool,
     session: requests.Session,
     lookahead_hours: int,
@@ -1178,21 +1119,10 @@ def _run_review_cycle(
         requested_start_utc=POST_TP1_DELAYED_QUARTER_R_SHADOW_START_UTC,
     )
 
-    queue = LifecycleReviewQueue(research_path, JOURNAL)
-    df = restore_review_population(df, research_path, shadow_start_utc)
-    prospective_times = pd.to_datetime(df["timestamp"], utc=True, errors="coerce", format="mixed")
-    pending = df[~df["lifecycle_state"].isin(TERMINAL_REPORTING_STATES) & df["signal_status"].eq("sent")
-                 & prospective_times.ge(pd.to_datetime(shadow_start_utc, utc=True))]
-    oldest = pd.to_datetime(pending["timestamp"], utc=True, errors="coerce").min() if not pending.empty else pd.NaT
-    LOGGER.info("Lifecycle queue pending=%d oldest_age_hours=%s", len(pending),
-                round((pd.Timestamp.now(tz="UTC") - oldest).total_seconds()/3600, 1) if not pd.isna(oldest) else "N/A")
-
     open_mask = df["result"].astype(str).str.upper() == "OPEN"
     stats.open_trades = int(open_mask.sum())
 
-    review_budget = MAX_REVIEWS_PER_CYCLE
-    for index in queue.ordered_indices(df):
-        row = df.loc[index].copy()
+    for index, row in df.iterrows():
         previous_result = str(row.get("result", "OPEN")).upper()
         lifecycle_state = str(row.get("lifecycle_state", "") or "").strip().upper()
         candidate_time = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
@@ -1204,46 +1134,24 @@ def _run_review_cycle(
         )
         if is_prospective_lifecycle and not lifecycle_state and apply_legacy_terminal_lifecycle(df, index, row):
             lifecycle_state = str(df.at[index, "lifecycle_state"])
-        terminal_proven = lifecycle_state in TERMINAL_REPORTING_STATES
-        if (terminal_proven or (not is_prospective_lifecycle and previous_result in {"WIN", "LOSS"})) and not resend_unsent and not force_resend and should_skip_outcome_alert(row, build_outcome_id(row), False, False):
-            stats.skipped_alerts += 1
-            continue
-        needs_lifecycle_evidence = is_prospective_lifecycle and not terminal_proven and (
-            str(row.get("lifecycle_recovery", "")).startswith("1")
-            or previous_result == "OPEN"
+        needs_lifecycle_evidence = is_prospective_lifecycle and (
+            previous_result == "OPEN"
             or (previous_result == "WIN" and str(row.get("hit_target", "")).upper() in {"", "TP1"})
             or lifecycle_state in {"", "TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}
         )
-        needs_candles = (previous_result == "OPEN" and not terminal_proven) or needs_lifecycle_evidence
+        needs_candles = previous_result == "OPEN" or needs_lifecycle_evidence
         candles = pd.DataFrame()
-        if needs_lifecycle_evidence:
-            if review_budget <= 0:
-                continue  # Durable pending row remains eligible next cycle.
-            review_budget -= 1
         if needs_candles:
             try:
-                candles = queue.candles(session, row, fetch_klines) if needs_lifecycle_evidence else candles_for_signal(session, row, lookahead_hours)
+                candles = candles_for_signal(session, row, lookahead_hours)
                 if needs_lifecycle_evidence:
                     apply_reporting_lifecycle(df, index, row, candles)
-                    # Keep the shadow's existing window/policy. Recovery must
-                    # never fabricate a prospective decision for missing rows.
-                    if not str(row.get("lifecycle_recovery", "")).startswith("1") and pd.Timestamp.now(tz="UTC") <= candidate_time + pd.Timedelta(hours=lookahead_hours):
-                        shadow_end = candidate_time + pd.Timedelta(hours=lookahead_hours)
-                        shadow_candles = candles[pd.to_datetime(candles["open_time"], utc=True) <= shadow_end]
-                        record_post_tp1_shadow(telemetry, row, shadow_candles, shadow_start_utc)
-                    persist_journal(df)
-                    queue.acknowledge(df.loc[index])
-                    if str(df.at[index, "lifecycle_terminal"]) in {"1", "1.0"} and pd.Timestamp.now(tz="UTC") - candidate_time > pd.Timedelta(hours=24):
-                        LOGGER.info("Lifecycle resolved after >24h: %s", canonical_signal_key(symbol=row.get("symbol"), side=row.get("side"), timestamp=row.get("timestamp"), entry=row.get("entry")))
+                    record_post_tp1_shadow(telemetry, row, candles, shadow_start_utc)
             except (requests.RequestException, ValueError, KeyError) as exc:
                 stats.errors += 1
                 LOGGER.error("Lifecycle review skipped for %s: %s", row.get("symbol", "UNKNOWN"), exc)
                 if previous_result == "OPEN":
                     continue
-        if str(row.get("lifecycle_recovery", "")).startswith("1"):
-            # Evidence recovery is reporting-only; no retrospective alerts or
-            # shadow decisions, and no execution-ownership assignment.
-            continue
         if previous_result == "OPEN":
             try:
                 review_row = row.copy()
