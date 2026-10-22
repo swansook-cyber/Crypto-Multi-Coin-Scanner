@@ -141,10 +141,12 @@ def authorize(request: ControlRequest, evidence: ExposureEvidence | None,
 class LiveCommandGateway:
     def __init__(self, audit_path: Path, *, session: requests.Session | None = None,
                  exposure_provider: Callable[[ControlRequest], ExposureEvidence | None] | None = None,
-                 token: str | None = None, chat_id: str | None = None):
+                 token: str | None = None, chat_id: str | None = None,
+                 entry_role: str = ""):
         self.audit_path = Path(audit_path)
         self.session = session or requests.Session()
         self.exposure_provider = exposure_provider
+        self.entry_role = entry_role
         self._token = token if token is not None else os.getenv("LIVE_CONTROL_TELEGRAM_BOT_TOKEN", "")
         self._chat_id = chat_id if chat_id is not None else os.getenv("LIVE_CONTROL_CORNIX_CHAT_ID", "")
         self._entry_token = os.getenv("LIVE_ENTRY_TELEGRAM_BOT_TOKEN", "")
@@ -239,12 +241,16 @@ class LiveCommandGateway:
         return "DELIVERY_RECEIPT"
 
     def send_entry(self, request: EntryRequest) -> str:
-        """Route approved prospective entry signals through a distinct credential."""
+        """Approved entries may share the notification bot, never its routing.
+
+        Role is an explicit application contract, not an OS security boundary.
+        Control authorization and credential restrictions remain independent.
+        """
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             prior = db.execute("SELECT state FROM commands WHERE action_id=?", (request.action_id,)).fetchone()
             if prior and prior[0] in {"SEND_ATTEMPTED", "DELIVERY_RECEIPT", "RECONCILIATION_REQUIRED", "ACKNOWLEDGED", "RECONCILED"}:
-                return "DUPLICATE_ACTION_ID"
+                return "RECONCILIATION_REQUIRED" if prior[0] in {"SEND_ATTEMPTED", "RECONCILIATION_REQUIRED"} else "DUPLICATE_ACTION_ID"
             self._state(db, request, "REQUESTED", "entry notification requested")
             valid = (request.provenance in {"SCANNER_PROSPECTIVE", "EXTERNAL_APPROVED"}
                      and request.approved and request.live_intent
@@ -254,12 +260,22 @@ class LiveCommandGateway:
             if not valid:
                 self._state(db, request, "DENIED", "INVALID_ENTRY_AUTHORIZATION")
                 return "INVALID_ENTRY_AUTHORIZATION"
+            expected_provenance = {"crypto-scanner": "SCANNER_PROSPECTIVE",
+                                   "crypto-external-inbox": "EXTERNAL_APPROVED"}.get(self.entry_role)
+            if expected_provenance is None or request.provenance != expected_provenance:
+                self._state(db, request, "DENIED", "INVALID_ENTRY_SERVICE_ROLE")
+                return "INVALID_ENTRY_SERVICE_ROLE"
             if not self._entry_token or not self._entry_chat_id:
                 self._state(db, request, "DENIED", "MISSING_DEDICATED_ENTRY_ROUTE")
                 return "MISSING_DEDICATED_ENTRY_ROUTE"
-            if self._entry_token == os.getenv("TELEGRAM_BOT_TOKEN", ""):
-                self._state(db, request, "DENIED", "SHARED_LIVE_CREDENTIAL")
-                return "SHARED_LIVE_CREDENTIAL"
+            notification_chats = {os.getenv(key, "").strip() for key in (
+                "TELEGRAM_SIGNALS_CHAT_ID", "TELEGRAM_REPORTS_CHAT_ID", "TELEGRAM_CHAT_ID",
+                "TELEGRAM_EXTERNAL_INBOX_CHAT_ID")}
+            legacy_cornix = os.getenv("TELEGRAM_CORNIX_CHAT_ID", "").strip()
+            if (not self._entry_chat_id.strip() or self._entry_chat_id.strip() in notification_chats
+                    or (legacy_cornix and self._entry_chat_id != legacy_cornix)):
+                self._state(db, request, "DENIED", "INVALID_ENTRY_DESTINATION")
+                return "INVALID_ENTRY_DESTINATION"
             self._state(db, request, "AUTHORIZED", "prospective entry authorized")
             self._state(db, request, "SEND_ATTEMPTED", "durable pre-send record")
         try:

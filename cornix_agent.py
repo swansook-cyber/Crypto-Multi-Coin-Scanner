@@ -1617,7 +1617,9 @@ class TelegramNotifier:
             live_intent=True,
             payload=self.build_cornix_message(signal),
         )
-        status = LiveCommandGateway(LOG_DIR / "live_command_audit.sqlite3").send_entry(entry)
+        status = LiveCommandGateway(
+            LOG_DIR / "live_command_audit.sqlite3", entry_role="crypto-scanner",
+        ).send_entry(entry)
         delivered = status == "DELIVERY_RECEIPT" or delivered
         return delivered
 

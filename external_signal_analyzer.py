@@ -880,7 +880,9 @@ def route_analysis(
             payload=build_cornix_message(analysis),
         )
         analysis.sent_to_cornix = (
-            LiveCommandGateway(LOG_DIR / "live_command_audit.sqlite3").send_entry(entry)
+            LiveCommandGateway(
+                LOG_DIR / "live_command_audit.sqlite3", entry_role="crypto-external-inbox",
+            ).send_entry(entry)
             == "DELIVERY_RECEIPT"
         )
         LOGGER.info("External signal routed to cornix: message_id=%s success=%s", analysis.parsed.message_id, analysis.sent_to_cornix)

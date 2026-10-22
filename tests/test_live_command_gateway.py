@@ -17,6 +17,17 @@ NOW = datetime(2026, 10, 20, 0, 0, tzinfo=timezone.utc)
 SUI_ID = canonical_entry_id("2026-10-17T01:00:33Z", "SUIUSDT", "SHORT", "1.0075", "0.99064")
 
 
+@pytest.fixture(autouse=True)
+def isolated_routes(monkeypatch):
+    for key in ("LIVE_ENTRY_TELEGRAM_BOT_TOKEN", "LIVE_ENTRY_CORNIX_CHAT_ID",
+                "LIVE_CONTROL_TELEGRAM_BOT_TOKEN", "LIVE_CONTROL_CORNIX_CHAT_ID",
+                "TELEGRAM_CORNIX_CHAT_ID", "TELEGRAM_CHAT_ID", "TELEGRAM_EXTERNAL_INBOX_CHAT_ID"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "notification-token")
+    monkeypatch.setenv("TELEGRAM_SIGNALS_CHAT_ID", "signals")
+    monkeypatch.setenv("TELEGRAM_REPORTS_CHAT_ID", "reports")
+
+
 def request(**changes):
     base = ControlRequest(SUI_ID, "trade-1", "order-1", "SUIUSDT", "SHORT", "10",
                           "1.0075", "STOP_UPDATE", 1, "TRUSTED_CURRENT_LIVE", True,
@@ -153,22 +164,100 @@ def test_intended_entry_notification_and_no_binance_write(tmp_path, monkeypatch)
     monkeypatch.setenv("LIVE_ENTRY_TELEGRAM_BOT_TOKEN", "test-entry-token")
     monkeypatch.setenv("LIVE_ENTRY_CORNIX_CHAT_ID", "test-entry-chat")
     session = FakeSession()
-    gateway = LiveCommandGateway(tmp_path / "audit.sqlite3", session=session)
+    gateway = LiveCommandGateway(tmp_path / "audit.sqlite3", session=session, entry_role="crypto-scanner")
     entry = EntryRequest(SUI_ID, "SUIUSDT", "SHORT", "SCANNER_PROSPECTIVE", True, True, "SHORT SUIUSDT\nEntry: 1.0075")
     assert gateway.send_entry(entry) == "DELIVERY_RECEIPT"
     assert len(session.posts) == 1
     assert all("binance.com" not in url for url, _ in session.posts)
 
 
-def test_shared_notification_credential_cannot_send_entry(tmp_path, monkeypatch):
+@pytest.mark.parametrize("role,provenance", [("crypto-scanner", "SCANNER_PROSPECTIVE"),
+                                            ("crypto-external-inbox", "EXTERNAL_APPROVED")])
+def test_shared_notification_credential_can_send_entry(tmp_path, monkeypatch, role, provenance):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "shared-token")
     monkeypatch.setenv("LIVE_ENTRY_TELEGRAM_BOT_TOKEN", "shared-token")
     monkeypatch.setenv("LIVE_ENTRY_CORNIX_CHAT_ID", "test-entry-chat")
     session = FakeSession()
-    gateway = LiveCommandGateway(tmp_path / "audit.sqlite3", session=session)
+    monkeypatch.setenv("TELEGRAM_CORNIX_CHAT_ID", "test-entry-chat")
+    gateway = LiveCommandGateway(tmp_path / "audit.sqlite3", session=session, entry_role=role)
+    entry = EntryRequest(SUI_ID, "SUIUSDT", "SHORT", provenance, True, True, "SHORT SUIUSDT\n\nEntry:\n1.0-1.01\n\nTargets:\n0.99\n0.98\n\nStop:\n1.02\n\nLeverage:\n20x")
+    assert gateway.send_entry(entry) == "DELIVERY_RECEIPT"
+    assert session.posts == [("https://api.telegram.org/botshared-token/sendMessage",
+                              {"chat_id": "test-entry-chat", "text": entry.payload})]
+    assert gateway.send_entry(entry) == "DUPLICATE_ACTION_ID"
+    assert len(session.posts) == 1
+
+
+def shared_entry_gateway(tmp_path, monkeypatch, *, role="crypto-scanner", uncertain=False):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "shared-token")
+    monkeypatch.setenv("LIVE_ENTRY_TELEGRAM_BOT_TOKEN", "shared-token")
+    monkeypatch.setenv("LIVE_ENTRY_CORNIX_CHAT_ID", "cornix")
+    monkeypatch.setenv("TELEGRAM_CORNIX_CHAT_ID", "cornix")
+    session = FakeSession(uncertain=uncertain)
+    gateway = LiveCommandGateway(tmp_path / "audit.sqlite3", session=session, entry_role=role)
     entry = EntryRequest(SUI_ID, "SUIUSDT", "SHORT", "SCANNER_PROSPECTIVE", True, True, "SHORT SUIUSDT")
-    assert gateway.send_entry(entry) == "SHARED_LIVE_CREDENTIAL"
+    return gateway, entry, session
+
+
+@pytest.mark.parametrize("destination", ["", " ", "signals", "reports", "wrong-cornix"])
+def test_shared_entry_requires_correct_explicit_destination(tmp_path, monkeypatch, destination):
+    _, entry, session = shared_entry_gateway(tmp_path, monkeypatch)
+    monkeypatch.setenv("LIVE_ENTRY_CORNIX_CHAT_ID", destination)
+    gateway = LiveCommandGateway(tmp_path / "audit.sqlite3", session=session, entry_role="crypto-scanner")
+    assert gateway.send_entry(entry) in {"MISSING_DEDICATED_ENTRY_ROUTE", "INVALID_ENTRY_DESTINATION"}
     assert session.posts == []
+
+
+@pytest.mark.parametrize("changes", [{"provenance": "RESEARCH"}, {"provenance": "SHADOW"},
+    {"provenance": "REPORT_ONLY"}, {"canonical_signal_id": "bad"}, {"approved": False},
+    {"live_intent": False}, {"side": "BOTH"}, {"symbol": "invalid/symbol"}, {"payload": ""}])
+def test_shared_entry_does_not_weaken_authorization(tmp_path, monkeypatch, changes):
+    gateway, entry, session = shared_entry_gateway(tmp_path, monkeypatch)
+    assert gateway.send_entry(replace(entry, **changes)) == "INVALID_ENTRY_AUTHORIZATION"
+    assert session.posts == []
+
+
+@pytest.mark.parametrize("role", ["", "crypto-position-watcher", "crypto-outcome-checker", "research", "shadow", "crypto-external-inbox"])
+def test_entry_role_is_explicit_and_matches_provenance(tmp_path, monkeypatch, role):
+    gateway, entry, session = shared_entry_gateway(tmp_path, monkeypatch, role=role)
+    assert gateway.send_entry(entry) == "INVALID_ENTRY_SERVICE_ROLE"
+    assert session.posts == []
+
+
+def test_shared_entry_uncertainty_survives_restart_without_resend(tmp_path, monkeypatch):
+    gateway, entry, session = shared_entry_gateway(tmp_path, monkeypatch, uncertain=True)
+    assert gateway.send_entry(entry) == "RECONCILIATION_REQUIRED"
+    restarted = LiveCommandGateway(gateway.audit_path, session=session, entry_role="crypto-scanner")
+    assert restarted.send_entry(entry) == "RECONCILIATION_REQUIRED"
+    assert len(session.posts) == 1
+
+
+@pytest.mark.parametrize("control_route", ["absent", "shared"])
+def test_shared_entry_token_never_enables_position_control(tmp_path, monkeypatch, control_route):
+    _, _, session = shared_entry_gateway(tmp_path, monkeypatch)
+    if control_route == "shared":
+        monkeypatch.setenv("LIVE_CONTROL_TELEGRAM_BOT_TOKEN", "shared-token")
+        monkeypatch.setenv("LIVE_CONTROL_CORNIX_CHAT_ID", "cornix")
+    gateway = LiveCommandGateway(tmp_path / "audit.sqlite3", session=session,
+        exposure_provider=lambda _: exposure(observed_at=datetime.now(timezone.utc)))
+    expected = "SHARED_LIVE_CREDENTIAL" if control_route == "shared" else "MISSING_DEDICATED_CONTROL_ROUTE"
+    assert gateway.send_position_control(request()) == expected
+    assert session.posts == []
+
+
+def test_only_supported_entry_callers_are_scanner_and_external_analyzer():
+    import ast
+    root = Path(__file__).resolve().parents[1]
+    callers = set()
+    # Application sources only; historical backup scripts and tests are not service entrypoints.
+    for source in [*root.glob("*.py"), *root.joinpath("core").rglob("*.py"), *root.joinpath("research").rglob("*.py")]:
+        if source.name.startswith("test_") or ".backup_" in source.name:
+            continue
+        tree = ast.parse(source.read_text(encoding="utf-8-sig"))
+        if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+               and node.func.attr == "send_entry" for node in ast.walk(tree)):
+            callers.add(source.name)
+    assert callers == {"cornix_agent.py", "external_signal_analyzer.py"}
 
 
 def test_watcher_and_research_have_no_direct_control_sender():
