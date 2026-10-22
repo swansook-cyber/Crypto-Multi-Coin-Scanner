@@ -1584,6 +1584,8 @@ class TelegramNotifier:
         )
 
     def send_signal(self, signal: TradeSignal) -> bool:
+        if signal.market_session in self.config.session_report_only_sessions:
+            return self.send_session_risk_report_signal(signal)
         message = self.build_message(signal)
         if self.config.dry_run:
             LOGGER.info("DRY_RUN Telegram signal for %s:\n%s", signal.symbol, message)
@@ -1634,11 +1636,30 @@ class TelegramNotifier:
         )
 
     def send_session_risk_report_signal(self, signal: TradeSignal) -> bool:
-        return self.send_report_only_signal(
-            signal,
-            "SESSION RISK REPORT ONLY",
-            "Session risk report-only",
+        # Notification only: never construct EntryRequest or enter the gateway.
+        message = (
+            "⚠️ MANUAL REVIEW — SESSION/RISK BLOCKED\n"
+            "Sent to Signals for manual review.\n"
+            "NOT SENT TO CORNIX.\n\n"
+            f"{self.build_message(signal)}"
         )
+        if self.config.dry_run:
+            LOGGER.info("DRY_RUN session risk manual review for %s:\n%s", signal.symbol, message)
+            return True
+        if not self.config.send_telegram:
+            LOGGER.info("SEND_TELEGRAM=0, skipped session risk manual review for %s", signal.symbol)
+            return True
+        chat_id = self._channel_chat_id("signals")
+        if not self.config.telegram_bot_token or not chat_id:
+            LOGGER.warning("Signals notification credentials missing; skipped manual review for %s", signal.symbol)
+            return False
+        if signal.chart_path and signal.chart_path.exists():
+            delivered = self._send_photo(signal.chart_path, message, chat_id, "signals")
+            # Telegram photo captions are limited to 1024 characters. Keep the
+            # full manual-review details visible when the caption is truncated.
+            if len(message) <= 1024:
+                return delivered
+        return self._send_message(message, chat_id, "signals")
 
     def send_london_long_report_signal(self, signal: TradeSignal) -> bool:
         return self.send_report_only_signal(
@@ -2627,7 +2648,7 @@ class AgentRunner:
                 self.evaluate_entry_timing_shadow(signal, "session_risk_report_only")
                 if self.notifier.send_session_risk_report_signal(signal) and not self.config.dry_run:
                     self.mark_sent(signal)
-                LOGGER.info("%s routed to reports only: session risk mode %s", signal.symbol, signal.market_session)
+                LOGGER.info("%s routed to Signals for manual review only (Cornix blocked): session risk mode %s", signal.symbol, signal.market_session)
                 continue
             if signal.symbol in self.config.weak_symbol_report_only_symbols:
                 self.log_signal_status(signal, "weak_symbol_report_only", "weak_symbol_experimental_report_only")

@@ -368,13 +368,16 @@ def test_session_risk_report_only_routing() -> None:
     notifier._send_message = fake_message  # type: ignore[method-assign]
     notifier._send_photo = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
 
-    assert notifier.send_session_risk_report_signal(signal) is True
+    with patch.object(scanner, "LiveCommandGateway") as gateway, patch.object(scanner, "EntryRequest") as entry:
+        assert notifier.send_session_risk_report_signal(signal) is True
+        gateway.assert_not_called()
+        entry.assert_not_called()
     assert len(calls) == 1
-    assert calls[0][0] == "reports"
-    assert calls[0][1] == "reports"
-    assert "SESSION RISK REPORT ONLY" in calls[0][2]
-    assert "Not sent to Signals channel" in calls[0][2]
-    assert "Not sent to Cornix channel" in calls[0][2]
+    assert calls[0][0] == "signals"
+    assert calls[0][1] == "signals"
+    assert "⚠️ MANUAL REVIEW — SESSION/RISK BLOCKED" in calls[0][2]
+    assert "Sent to Signals for manual review." in calls[0][2]
+    assert "NOT SENT TO CORNIX." in calls[0][2]
 
 
 def test_london_long_report_only_routing_and_unaffected_signals() -> None:
