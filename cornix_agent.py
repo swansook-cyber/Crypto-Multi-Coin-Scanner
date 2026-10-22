@@ -1807,6 +1807,8 @@ class AgentRunner:
             research_path,
             enabled=env_bool("RESEARCH_TELEMETRY_ENABLED", True),
         )
+        self.breakout_shadow_enabled = env_bool("BREAKOUT_CONFIRMATION_SHADOW_ENABLED", False)
+        self.breakout_shadow_boundary = ""
         self.research_run_id = ""
         self.research_scan_started_at_utc = ""
         self.research_scan_candle_utc = ""
@@ -1909,6 +1911,14 @@ class AgentRunner:
             self.scan_once()
 
     def scan_once(self) -> None:
+        if getattr(self, "breakout_shadow_enabled", False) and not self.breakout_shadow_boundary:
+            try:
+                from core.breakout_confirmation_shadow import activate
+                self.breakout_shadow_boundary = activate(
+                    self.research_telemetry, enabled=True, dry_run=self.config.dry_run,
+                )
+            except Exception as exc:
+                LOGGER.warning("Breakout shadow activation failed open: %s", exc)
         self.maybe_send_daily_summary()
         self.ai_commentary.reset_run_budget()
         self.cross_scan_price_history = {}
@@ -2262,6 +2272,7 @@ class AgentRunner:
             )
             LOGGER.warning("Research correlation snapshot failed open for %s: %s", signal.symbol, exc)
         features = dict(signal.research_features)
+        breakout_source = features.pop("_breakout_source_v1", None)
         try:
             entry_timing = self.entry_timing.evaluate(signal)
             features["entry_timing_state"] = entry_timing.recommendation
@@ -2318,6 +2329,12 @@ class AgentRunner:
             exposure=self.research_exposure_snapshot(signal),
             shadows=tuple(signal.research_shadows),
         )
+        if getattr(self, "breakout_shadow_enabled", False):
+            try:
+                from core.breakout_confirmation_shadow import attach_observation
+                snapshot = attach_observation(snapshot, breakout_source, self.breakout_shadow_boundary)
+            except Exception as exc:
+                LOGGER.warning("Breakout shadow capture gap for %s; SENT unchanged: %s", signal.symbol, exc)
         self.research_telemetry.record_candidate(snapshot)
 
     def evaluate_sr_trade_weight_shadow(self, signal: TradeSignal, signal_status: str = "candidate") -> str:
@@ -2509,6 +2526,15 @@ class AgentRunner:
             )
         except Exception as exc:
             LOGGER.warning("Research feature snapshot unavailable for %s; live scanner continues: %s", symbol, exc)
+        if getattr(self, "breakout_shadow_enabled", False) and getattr(self, "breakout_shadow_boundary", ""):
+            try:
+                from core.breakout_confirmation_shadow import capture_source
+                signal.research_features["_breakout_source_v1"] = capture_source(
+                    df_1h, signal.timestamp, signal.direction, bool(signal.breakout_confirmed),
+                    timeframe=self.config.trend_timeframe,
+                )
+            except Exception as exc:
+                LOGGER.warning("Breakout shadow source unavailable for %s; live scanner continues: %s", symbol, exc)
         sr_gate_decision = self.evaluate_sr_trade_weight_shadow(signal, "candidate")
         self.evaluate_market_exhaustion_shadow(signal, df_1h, df_15m, "candidate", sr_gate_decision)
         signal.ai_commentary = ""
