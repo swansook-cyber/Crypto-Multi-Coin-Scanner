@@ -1,0 +1,83 @@
+{
+  "production_head": "b11ed426750f8c6a7b4ca84b7299c564890d6f97",
+  "exported_utc": "2026-10-22T13:21:34.199573+00:00",
+  "tables": {
+    "scanner_runs": {
+      "schema": "CREATE TABLE scanner_runs (\n    run_id TEXT PRIMARY KEY,\n    scan_started_at_utc TEXT NOT NULL,\n    scan_candle_time_utc TEXT,\n    btc_regime TEXT,\n    market_context_version TEXT,\n    source_mode TEXT NOT NULL CHECK (source_mode IN ('PROSPECTIVE','HISTORICAL_BACKFILL')),\n    source_name TEXT NOT NULL,\n    source_version TEXT,\n    imported_at_utc TEXT\n)",
+      "rows": [
+        {
+          "run_id": "run_v1_f3d08df804fe4e12b926",
+          "scan_started_at_utc": "2026-10-22T13:00:20Z",
+          "scan_candle_time_utc": "2026-10-22T13:00:00Z",
+          "btc_regime": "",
+          "market_context_version": "1",
+          "source_mode": "PROSPECTIVE",
+          "source_name": "scanner",
+          "source_version": "UNIFIED_SCANNER_RESEARCH_TELEMETRY_V1",
+          "imported_at_utc": null
+        }
+      ]
+    },
+    "candidates": {
+      "schema": "CREATE TABLE candidates (\n    candidate_key TEXT PRIMARY KEY,\n    run_id TEXT NOT NULL REFERENCES scanner_runs(run_id),\n    timestamp_utc TEXT NOT NULL,\n    closed_candle_time_utc TEXT NOT NULL,\n    symbol TEXT NOT NULL,\n    side TEXT NOT NULL,\n    candidate_stage TEXT NOT NULL,\n    decision TEXT NOT NULL,\n    decision_stage TEXT,\n    decision_reason TEXT,\n    signal_status TEXT,\n    canonical_signal_key TEXT,\n    entry REAL,\n    sl REAL,\n    tp1 REAL,\n    tp2 REAL,\n    rr REAL,\n    score REAL,\n    confidence REAL,\n    setup_strength REAL,\n    tier TEXT,\n    session TEXT,\n    source_mode TEXT NOT NULL CHECK (source_mode IN ('PROSPECTIVE','HISTORICAL_BACKFILL')),\n    source_name TEXT NOT NULL,\n    source_version TEXT,\n    imported_at_utc TEXT,\n    recorded_at_utc TEXT NOT NULL\n)",
+      "rows": [
+        {
+          "candidate_key": "candidate_v1_670141b652a3d30671257b5a4df57d9bf5a679d16914174de7ced0eb12d470d2",
+          "run_id": "run_v1_f3d08df804fe4e12b926",
+          "timestamp_utc": "2026-10-22T13:00:34Z",
+          "closed_candle_time_utc": "2026-10-22T12:59:59Z",
+          "symbol": "SUIUSDT",
+          "side": "SHORT",
+          "candidate_stage": "FINAL_CANDIDATE",
+          "decision": "SENT",
+          "decision_stage": "sent",
+          "decision_reason": "",
+          "signal_status": "sent",
+          "canonical_signal_key": "sig:v1:SUIUSDT|SHORT|2026-10-22T13:00:34Z|0.982900",
+          "entry": 0.9829,
+          "sl": 0.9931312587543962,
+          "tp1": 0.9706224894947245,
+          "tp2": 0.9624374824912076,
+          "rr": 1.9999999999999891,
+          "score": 83.0,
+          "confidence": 84.0,
+          "setup_strength": 84.0,
+          "tier": "B",
+          "session": "London",
+          "source_mode": "PROSPECTIVE",
+          "source_name": "scanner",
+          "source_version": "internal-lab-v2",
+          "imported_at_utc": null,
+          "recorded_at_utc": "2026-10-22T13:01:26.491820Z"
+        }
+      ]
+    },
+    "shadow_boundaries": {
+      "schema": "CREATE TABLE shadow_boundaries (\n    shadow_name TEXT PRIMARY KEY,\n    prospective_start_utc TEXT NOT NULL,\n    created_at_utc TEXT NOT NULL\n)",
+      "rows": [
+        {
+          "shadow_name": "breakout_confirmation_prospective_v1",
+          "prospective_start_utc": "2026-10-22T13:00:20.087460Z",
+          "created_at_utc": "2026-10-22T13:00:20.087460Z"
+        }
+      ]
+    },
+    "shadow_decisions": {
+      "schema": "CREATE TABLE shadow_decisions (\n    candidate_key TEXT NOT NULL REFERENCES candidates(candidate_key) ON DELETE CASCADE,\n    shadow_name TEXT NOT NULL,\n    shadow_version TEXT NOT NULL,\n    decision TEXT NOT NULL,\n    reason TEXT,\n    metrics_json TEXT NOT NULL DEFAULT '{}',\n    evaluated_at_utc TEXT NOT NULL,\n    PRIMARY KEY (candidate_key, shadow_name, shadow_version)\n)",
+      "rows": [
+        {
+          "candidate_key": "candidate_v1_670141b652a3d30671257b5a4df57d9bf5a679d16914174de7ced0eb12d470d2",
+          "shadow_name": "breakout_confirmation_prospective_v1",
+          "shadow_version": "BREAKOUT_CONFIRMATION_V1",
+          "decision": "UNCONFIRMED",
+          "reason": "Observation only; SENT decision unchanged",
+          "metrics_json": "{\"activation_boundary_utc\":\"2026-10-22T13:00:20.087460Z\",\"breakout_confirmed\":false,\"btc_regime\":\"bearish\",\"canonical_signal_key\":\"sig:v1:SUIUSDT|SHORT|2026-10-22T13:00:34Z|0.982900\",\"definition\":\"Latest closed 1h candle close strictly > max(high) of the immediately preceding 20 closed 1h candles for LONG; strictly < min(low) for SHORT. Current candle excluded from lookback. Equality is unconfirmed. 21 finite contiguous closed 1h candles required for auditable capture.\",\"definition_hash\":\"bbc09c5a7dfb79d66ae1e7030b10d34a81100c4fa2e7399acc120dc0470c4bae\",\"definition_version\":\"BREAKOUT_CONFIRMATION_V1\",\"episode_id\":\"2026-10-22|bearish|SHORT\",\"lookback_high\":1.0564,\"lookback_low\":0.9773,\"session\":\"London\",\"side\":\"SHORT\",\"signal_timestamp_utc\":\"2026-10-22T13:00:34.784812Z\",\"source_candle_timestamp_utc\":\"2026-10-22T12:59:59.999000Z\",\"source_candles\":[{\"close\":1.0435,\"close_time\":\"2026-10-21T16:59:59.999000Z\",\"high\":1.0526,\"low\":1.0431,\"open_time\":\"2026-10-21T16:00:00Z\"},{\"close\":1.0453,\"close_time\":\"2026-10-21T17:59:59.999000Z\",\"high\":1.0502,\"low\":1.0412,\"open_time\":\"2026-10-21T17:00:00Z\"},{\"close\":1.0423,\"close_time\":\"2026-10-21T18:59:59.999000Z\",\"high\":1.0564,\"low\":1.0407,\"open_time\":\"2026-10-21T18:00:00Z\"},{\"close\":1.0422,\"close_time\":\"2026-10-21T19:59:59.999000Z\",\"high\":1.044,\"low\":1.0336,\"open_time\":\"2026-10-21T19:00:00Z\"},{\"close\":1.0434,\"close_time\":\"2026-10-21T20:59:59.999000Z\",\"high\":1.049,\"low\":1.0393,\"open_time\":\"2026-10-21T20:00:00Z\"},{\"close\":1.0454,\"close_time\":\"2026-10-21T21:59:59.999000Z\",\"high\":1.0491,\"low\":1.0415,\"open_time\":\"2026-10-21T21:00:00Z\"},{\"close\":1.0339,\"close_time\":\"2026-10-21T22:59:59.999000Z\",\"high\":1.0457,\"low\":1.0322,\"open_time\":\"2026-10-21T22:00:00Z\"},{\"close\":1.0288,\"close_time\":\"2026-10-21T23:59:59.999000Z\",\"high\":1.035,\"low\":1.026,\"open_time\":\"2026-10-21T23:00:00Z\"},{\"close\":1.0317,\"close_time\":\"2026-10-22T00:59:59.999000Z\",\"high\":1.0354,\"low\":1.0276,\"open_time\":\"2026-10-22T00:00:00Z\"},{\"close\":1.0162,\"close_time\":\"2026-10-22T01:59:59.999000Z\",\"high\":1.0363,\"low\":1.0124,\"open_time\":\"2026-10-22T01:00:00Z\"},{\"close\":1.0082,\"close_time\":\"2026-10-22T02:59:59.999000Z\",\"high\":1.0174,\"low\":1.0035,\"open_time\":\"2026-10-22T02:00:00Z\"},{\"close\":1.0055,\"close_time\":\"2026-10-22T03:59:59.999000Z\",\"high\":1.0115,\"low\":0.9989,\"open_time\":\"2026-10-22T03:00:00Z\"},{\"close\":1.0055,\"close_time\":\"2026-10-22T04:59:59.999000Z\",\"high\":1.0082,\"low\":1.0005,\"open_time\":\"2026-10-22T04:00:00Z\"},{\"close\":0.9988,\"close_time\":\"2026-10-22T05:59:59.999000Z\",\"high\":1.0078,\"low\":0.9943,\"open_time\":\"2026-10-22T05:00:00Z\"},{\"close\":0.9969,\"close_time\":\"2026-10-22T06:59:59.999000Z\",\"high\":1.0013,\"low\":0.9938,\"open_time\":\"2026-10-22T06:00:00Z\"},{\"close\":0.9925,\"close_time\":\"2026-10-22T07:59:59.999000Z\",\"high\":0.9981,\"low\":0.9906,\"open_time\":\"2026-10-22T07:00:00Z\"},{\"close\":0.9824,\"close_time\":\"2026-10-22T08:59:59.999000Z\",\"high\":0.9924,\"low\":0.981,\"open_time\":\"2026-10-22T08:00:00Z\"},{\"close\":0.9858,\"close_time\":\"2026-10-22T09:59:59.999000Z\",\"high\":0.9859,\"low\":0.9773,\"open_time\":\"2026-10-22T09:00:00Z\"},{\"close\":0.9862,\"close_time\":\"2026-10-22T10:59:59.999000Z\",\"high\":0.9905,\"low\":0.984,\"open_time\":\"2026-10-22T10:00:00Z\"},{\"close\":0.9863,\"close_time\":\"2026-10-22T11:59:59.999000Z\",\"high\":0.9911,\"low\":0.9848,\"open_time\":\"2026-10-22T11:00:00Z\"},{\"close\":0.9829,\"close_time\":\"2026-10-22T12:59:59.999000Z\",\"high\":0.9881,\"low\":0.9815,\"open_time\":\"2026-10-22T12:00:00Z\"}],\"source_hash\":\"b6c702ddb9597815c2d52e6ad5fc6a22268de1030747def516f46a6b0ac82f62\",\"source_mode\":\"PROSPECTIVE\",\"source_provenance\":\"BINANCE_USDM_FETCH_CLOSED_KLINES:scorer_input\",\"source_timeframe\":\"1h\",\"symbol\":\"SUIUSDT\",\"utc_day\":\"2026-10-22\"}",
+          "evaluated_at_utc": "2026-10-22T13:01:26.491820Z"
+        }
+      ]
+    }
+  },
+  "metrics_sha256": {
+    "candidate_v1_670141b652a3d30671257b5a4df57d9bf5a679d16914174de7ced0eb12d470d2": "8c368a8ca046fdf617e668d5eedb67d7e69f6b795416f860af2037aa9bbadfb9"
+  }
+}

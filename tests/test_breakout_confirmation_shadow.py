@@ -301,3 +301,126 @@ def test_cli_read_only_no_database_creation_or_live_import(tmp_path, capsys):
     assert result["status"] == "NOT_ACTIVATED"
     assert not path.exists()
     assert result["references_only"]["frozen_prospective"]["N"] == 25
+
+
+@pytest.fixture
+def production_timestamp_snapshot(tmp_path):
+    from pathlib import Path
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "breakout_shadow_timestamp_production_v1.json").read_text())
+    path = tmp_path / "production-snapshot.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        for name, table in fixture["tables"].items():
+            conn.execute(table["schema"])
+            for row in table["rows"]:
+                columns = ",".join('"' + column + '"' for column in row)
+                placeholders = ",".join("?" for _ in row)
+                conn.execute(f'INSERT INTO "{name}" ({columns}) VALUES ({placeholders})', list(row.values()))
+    return path, fixture
+
+
+def test_real_production_timestamp_reconciliation_is_readonly(production_timestamp_snapshot):
+    import hashlib
+    path, fixture = production_timestamp_snapshot
+    before = path.read_bytes()
+    result = shadow.report(path)
+    assert len(fixture["tables"]["shadow_decisions"]["rows"]) == 1
+    assert len(result["records"]) == 1
+    record = result["records"][0]
+    assert record["canonical_signal_key"] == "sig:v1:SUIUSDT|SHORT|2026-10-22T13:00:34Z|0.982900"
+    assert record["signal_timestamp_utc"] == "2026-10-22T13:00:34.784812Z"
+    assert result["activation_boundary_utc"] == "2026-10-22T13:00:20.087460Z"
+    assert result["classification"] == "INSUFFICIENT_EVIDENCE"
+    assert result["gaps"] == result["missing_observation_keys"] == []
+    assert path.read_bytes() == before
+    with sqlite3.connect(path) as conn:
+        raw = conn.execute("SELECT metrics_json FROM shadow_decisions").fetchone()[0]
+    assert hashlib.sha256(raw.encode()).hexdigest() == fixture["metrics_sha256"][fixture["tables"]["candidates"]["rows"][0]["candidate_key"]]
+
+
+@pytest.mark.parametrize("value", [
+    "2026-10-22T13:00:20Z", "2026-10-22T13:00:20.000000Z",
+    "2026-10-22T13:00:20+00:00",
+    pd.Timestamp("2026-10-22T13:00:20Z").as_unit("us"),
+    pd.Timestamp("2026-10-22T13:00:20Z").as_unit("ns"),
+    pd.Timestamp("2026-10-22T13:00:20Z").to_pydatetime(),
+])
+def test_report_timestamp_equivalent_instants(value):
+    assert shadow.normalize_report_timestamp(value) == pd.Timestamp("2026-10-22T13:00:20Z")
+
+
+@pytest.mark.parametrize("fraction", ["123", "123456", "123456789"])
+def test_report_timestamp_preserves_fraction(fraction):
+    stamp = pd.Timestamp("2026-10-22T13:00:20." + fraction + "Z")
+    assert shadow.normalize_report_timestamp(stamp) == stamp
+    assert shadow.normalize_report_timestamp(stamp) != stamp.floor("s")
+    assert shadow.normalize_report_timestamp(stamp) != stamp + pd.Timedelta(1, unit="ns")
+
+
+@pytest.mark.parametrize("value", [None, "", 123, "2026-10-22T13:00:20", pd.NaT])
+def test_report_timestamp_rejects_unqualified_time(value):
+    with pytest.raises(ValueError):
+        shadow.normalize_report_timestamp(value)
+
+
+def test_distinct_canonical_keys_within_same_second_are_not_merged(collection):
+    base = pd.Timestamp(collection[2])
+    keys = []
+    for fraction, symbol in [(100, "BTCUSDT"), (900, "ETHUSDT")]:
+        stamp = (base + pd.Timedelta(milliseconds=fraction)).isoformat()
+        keys.append(insert(collection, stamp=stamp, symbol=symbol)[3])
+    result = shadow.report(collection[0].path, lifecycle_rows=[
+        {"canonical_signal_key": keys[0], "lifecycle_state": "TP2_WIN", "lifecycle_r": 2},
+        {"canonical_signal_key": keys[1], "lifecycle_state": "ORIGINAL_SL", "lifecycle_r": -1},
+    ])
+    assert len(set(keys)) == 2
+    assert {r["canonical_signal_key"] for r in result["records"]} == set(keys)
+    assert {r["canonical_signal_key"]: r["modeled_r"] for r in result["records"]} == {keys[0]: 2, keys[1]: -1}
+    assert result["gaps"] == []
+
+
+def test_report_uses_precise_source_for_same_second_boundary(collection):
+    stamp = (pd.Timestamp(collection[1]).floor("s") + pd.Timedelta(nanoseconds=999999999)).isoformat()
+    insert(collection, stamp=stamp)
+    result = shadow.report(collection[0].path)
+    assert len(result["records"]) == 1
+    assert result["gaps"] == []
+
+
+def test_precise_candidate_disagreement_is_not_rounded(production_timestamp_snapshot):
+    path, _ = production_timestamp_snapshot
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE candidates SET timestamp_utc='2026-10-22T13:00:34.784811Z'")
+    result = shadow.report(path)
+    assert result["records"] == []
+    assert result["gaps"]
+
+
+def test_duplicate_canonical_candidate_without_observation_is_quarantined(production_timestamp_snapshot):
+    path, _ = production_timestamp_snapshot
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = dict(conn.execute("SELECT * FROM candidates").fetchone())
+        row["candidate_key"] += ":duplicate"
+        columns = ",".join(row)
+        conn.execute(f"INSERT INTO candidates ({columns}) VALUES ({','.join('?' for _ in row)})", list(row.values()))
+    result = shadow.report(path)
+    assert result["records"] == []
+    assert result["gaps"][0]["reason"] == "Conflicting identity/definition"
+
+
+def test_raw_source_before_boundary_is_rejected(production_timestamp_snapshot):
+    path, _ = production_timestamp_snapshot
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE shadow_boundaries SET prospective_start_utc='2026-10-22T13:00:34.784812001Z'")
+    result = shadow.report(path)
+    assert result["records"] == []
+    assert result["gaps"][0]["reason"] == "Observation precedes activation"
+
+
+@pytest.mark.parametrize("timestamp", ["2026-10-22T13:00:34.000000Z", "2026-10-22T13:00:34+00:00"])
+def test_equivalent_candidate_representation_reconciles_identity(production_timestamp_snapshot, timestamp):
+    path, _ = production_timestamp_snapshot
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE candidates SET timestamp_utc=?", (timestamp,))
+    assert len(shadow.report(path)["records"]) == 1

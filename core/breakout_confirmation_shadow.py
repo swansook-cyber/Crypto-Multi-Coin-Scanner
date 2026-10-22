@@ -226,6 +226,11 @@ def _execution_links(execution_rows):
     return result, bad_keys
 
 
+def normalize_report_timestamp(value):
+    """An aware UTC instant, preserving pandas microsecond/nanosecond precision."""
+    return _utc(value)
+
+
 def report(db_path, lifecycle_rows=(), execution_rows=()):
     """Read-only snapshot join; no enrichment writes and no market evaluation."""
     result = {"shadow_name": NAME, "definition_version": VERSION, "definition": DEFINITION,
@@ -249,12 +254,14 @@ def report(db_path, lifecycle_rows=(), execution_rows=()):
             return result
         result["activation_boundary_utc"] = boundary[0]
         observations = connection.execute(
-            "SELECT c.canonical_signal_key,c.timestamp_utc,c.symbol,c.side,c.entry,s.decision,s.metrics_json FROM candidates c "
+            "SELECT c.candidate_key,c.canonical_signal_key,c.timestamp_utc,c.symbol,c.side,c.entry,s.decision,s.metrics_json FROM candidates c "
             "JOIN shadow_decisions s USING(candidate_key) WHERE s.shadow_name=? AND s.shadow_version=? "
             "AND c.source_mode='PROSPECTIVE' AND c.decision='SENT'", (NAME, VERSION)).fetchall()
+        candidate_counts = dict(connection.execute(
+            "SELECT canonical_signal_key,COUNT(*) FROM candidates GROUP BY canonical_signal_key"))
         eligible = {r[0] for r in connection.execute(
             "SELECT canonical_signal_key,timestamp_utc FROM candidates WHERE source_mode='PROSPECTIVE' AND decision='SENT'")
-            if _utc(r[1]) >= _utc(boundary[0])}
+            if normalize_report_timestamp(r[1]) >= normalize_report_timestamp(boundary[0])}
     outcomes = defaultdict(list)
     for row in lifecycle_rows:
         outcomes[str(row.get("canonical_signal_key", ""))].append(row)
@@ -267,16 +274,27 @@ def report(db_path, lifecycle_rows=(), execution_rows=()):
         key = row["canonical_signal_key"]
         try:
             record = json.loads(row["metrics_json"])
-            if _utc(row["timestamp_utc"]) < _utc(boundary[0]):
-                raise ValueError("Observation precedes activation")
-            if key_counts[key] != 1 or record.get("canonical_signal_key") != key or record.get("definition_hash") != DEFINITION_HASH:
+            if (not key or not row["candidate_key"] or candidate_counts.get(key) != 1
+                    or key_counts[key] != 1 or record.get("canonical_signal_key") != key
+                    or record.get("definition_hash") != DEFINITION_HASH):
                 raise ValueError("Conflicting identity/definition")
+            candidate_time = normalize_report_timestamp(row["timestamp_utc"])
+            source_time = normalize_report_timestamp(record["signal_timestamp_utc"])
+            # The telemetry writer stores whole seconds. Only that known lossy
+            # representation may reconcile to a finer source time, after the
+            # canonical key and unique candidate FK have already matched.
+            timestamp_matches = (candidate_time == source_time or (
+                candidate_time == candidate_time.floor("s")
+                and candidate_time == source_time.floor("s")))
+            if source_time < normalize_report_timestamp(boundary[0]):
+                raise ValueError("Observation precedes activation")
             if (record.get("symbol") != row["symbol"] or record.get("side") != row["side"]
-                    or _utc(record["signal_timestamp_utc"]) != _utc(row["timestamp_utc"])
-                    or record.get("activation_boundary_utc") != boundary[0]
+                    or not timestamp_matches
+                    or normalize_report_timestamp(record.get("activation_boundary_utc")) != normalize_report_timestamp(boundary[0])
                     or record.get("source_mode") != "PROSPECTIVE"
                     or row["decision"] != ("CONFIRMED" if record["breakout_confirmed"] else "UNCONFIRMED")
-                    or canonical_signal_key(symbol=row["symbol"], side=row["side"], timestamp=row["timestamp_utc"], entry=row["entry"]) != key):
+                    or canonical_signal_key(symbol=row["symbol"], side=row["side"], timestamp=row["timestamp_utc"], entry=row["entry"]) != key
+                    or canonical_signal_key(symbol=row["symbol"], side=row["side"], timestamp=record["signal_timestamp_utc"], entry=row["entry"]) != key):
                 raise ValueError("Candidate/source identity or boundary mismatch")
             rebuilt = capture_source(pd.DataFrame(record["source_candles"]), record["signal_timestamp_utc"], record["side"], record["breakout_confirmed"])
             if any(record.get(k) != v for k, v in rebuilt.items()):
