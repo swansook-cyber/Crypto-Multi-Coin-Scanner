@@ -27,6 +27,7 @@ from urllib3.util.retry import Retry
 
 from core.analytics_reporting import load_csv_safely
 from core.binance_symbols import binance_usdm_market_symbol
+from live_command_gateway import ControlRequest, LiveCommandGateway
 from telegram_sender import TelegramRoutes, send_text
 
 
@@ -80,6 +81,7 @@ class WatcherStats:
     alerts_sent: int = 0
     skipped_duplicates: int = 0
     cornix_commands_sent: int = 0
+    control_denied: int = 0
     report_copies_sent: int = 0
     errors: int = 0
 
@@ -125,7 +127,8 @@ def load_config() -> WatcherConfig:
         send_telegram=env_bool("SEND_TELEGRAM", True),
         token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         reports_chat_id=os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip(),
-        cornix_chat_id=os.getenv("POSITION_WATCHER_CORNIX_CHAT_ID", os.getenv("TELEGRAM_CORNIX_CHAT_ID", "")).strip(),
+        # This process has no Cornix route. The gateway alone reads dedicated control credentials.
+        cornix_chat_id="",
         command_mode=command_mode,
         send_report_copy=env_bool("POSITION_WATCHER_SEND_REPORT_COPY", True),
         dry_run=env_bool("POSITION_WATCHER_DRY_RUN", False),
@@ -450,78 +453,9 @@ def send_breakeven_alert(
     return send_text(session, routes, "reports", message, "position watcher")
 
 
-def send_cornix_breakeven_command(
-    session: requests.Session,
-    config: WatcherConfig,
-    message: str,
-    symbol: str,
-    direction: str = "",
-) -> tuple[bool, str]:
-    LOGGER.info("Position watcher Cornix command attempt: symbol=%s dry_run=%s", symbol, config.dry_run)
-    LOGGER.info(
-        "Cornix BE format=%s symbol=%s direction=%s",
-        config.cornix_breakeven_format,
-        symbol,
-        direction or "-",
-    )
-    LOGGER.info("CORNIX COMMAND TEXT symbol=%s\n%s", symbol, message)
-    if config.dry_run:
-        LOGGER.info("DRY_RUN Cornix breakeven command for %s:\n%s", symbol, message)
-        return True, "DRY_RUN"
-    if not config.send_telegram or not config.send_alerts:
-        return False, "telegram disabled"
-    if not config.token or not config.cornix_chat_id:
-        LOGGER.error("Cornix command skipped: TELEGRAM_BOT_TOKEN or Cornix chat id missing")
-        return False, "missing telegram config"
-    payload = {"chat_id": config.cornix_chat_id, "text": message}
-    LOGGER.info("CORNIX COMMAND ROUTE chat_id=%s symbol=%s", config.cornix_chat_id, symbol)
-    LOGGER.info("CORNIX COMMAND PAYLOAD chat_id=%s text=%r", config.cornix_chat_id, message)
-    try:
-        response = session.post(
-            f"https://api.telegram.org/bot{config.token}/sendMessage",
-            data=payload,
-            timeout=20,
-        )
-    except requests.RequestException as exc:
-        LOGGER.error("Cornix command Telegram request failed: %s", exc)
-        return False, f"request failed: {exc}"
-    response_text = getattr(response, "text", "")
-    message_id = "-"
-    try:
-        response_json = response.json()
-        message_id = str(response_json.get("result", {}).get("message_id", "-"))
-    except (ValueError, AttributeError, TypeError):
-        response_json = {}
-    LOGGER.info(
-        "CORNIX COMMAND RESPONSE status=%s message_id=%s body=%s",
-        getattr(response, "status_code", "-"),
-        message_id,
-        response_text,
-    )
-    if getattr(response, "status_code", 0) != 200:
-        return False, f"telegram failed: {response_text}"
-    return True, f"SENT message_id={message_id}"
-
-
 def send_cornix_test_command(session: requests.Session, config: WatcherConfig) -> bool:
-    test_row = pd.Series(
-        {
-            "symbol": "HYPEUSDT",
-            "side": "LONG",
-            "entry": 70.744,
-        }
-    )
-    LOGGER.info("CORNIX_TEST_MODE enabled; sending Cornix command test")
-    message = format_cornix_breakeven_command(test_row, config.cornix_breakeven_format)
-    sent, status = send_cornix_breakeven_command(
-        session,
-        config,
-        message,
-        str(test_row["symbol"]),
-        str(test_row["side"]),
-    )
-    LOGGER.info("CORNIX_TEST_MODE result sent=%s status=%s", sent, status)
-    return sent
+    LOGGER.error("Cornix test command disabled: test traffic has no live authorization")
+    return False
 
 
 def process_once(
@@ -673,28 +607,51 @@ def process_once(
         command_error = ""
         if config.command_mode == "cornix_command" and not report_only_status:
             command = format_cornix_breakeven_command(row, config.cornix_breakeven_format)
-            sent_command, command_status = send_cornix_breakeven_command(
-                session,
-                config,
-                command,
-                symbol,
-                str(row.get("side", "")).upper(),
-            )
+            if config.dry_run:
+                command_status = "DRY_RUN"
+            elif not config.send_telegram or not config.send_alerts:
+                command_status = "TELEGRAM_DISABLED"
+            else:
+                request = ControlRequest(
+                    canonical_signal_id=str(row.get("canonical_signal_key", "")),
+                    trade_id=str(row.get("binance_trade_id", "")),
+                    order_id=str(row.get("binance_order_id", "")),
+                    symbol=symbol,
+                    side=str(row.get("side", "")).upper(),
+                    quantity=str(row.get("current_remainder_qty", "")),
+                    target_price=str(new_stop_price or ""),
+                    action="STOP_UPDATE",
+                    action_version=1,
+                    provenance=str(row.get("live_action_provenance", "")),
+                    live_intent=str(row.get("explicit_live_intent", "")).strip().lower() == "true",
+                    payload=command,
+                )
+                # No provider is inferred from the journal. Production must supply an
+                # independently verified live exposure adapter to the gateway.
+                gateway = LiveCommandGateway(journal_path.parent / "live_command_audit.sqlite3")
+                command_status = gateway.send_position_control(request)
+            sent_command = command_status == "DELIVERY_RECEIPT" or command_status == "DRY_RUN"
             if sent_command:
                 sent_any = True
-                stats.cornix_commands_sent += 1
+                if command_status == "DELIVERY_RECEIPT":
+                    stats.cornix_commands_sent += 1
                 if not config.dry_run:
                     df.at[index, "cornix_be_command_sent"] = 1
                     df.at[index, "cornix_be_stop_price"] = new_stop_price if new_stop_price is not None else ""
                 df.at[index, "cornix_be_command_at"] = datetime.now(timezone.utc).isoformat()
             else:
                 command_error = command_status or "Cornix send failed"
+                stats.control_denied += 1
+                LOGGER.warning("Live position control denied: symbol=%s reason=%s", symbol, command_error)
             df.at[index, "cornix_be_command_status"] = command_status
             df.at[index, "cornix_be_command_error"] = command_error
             if sent_command and config.send_report_copy:
                 report_copy = build_report_copy(row, current_price, command, config.dry_run)
                 if send_breakeven_alert(session, config, report_copy, dry_run=False):
                     stats.report_copies_sent += 1
+            if not sent_command:
+                # A denied control command may still generate a report-only advisory.
+                sent_any = send_breakeven_alert(session, config, build_alert_message(row, current_price), dry_run=config.dry_run)
         else:
             if report_only_status and config.command_mode == "cornix_command":
                 LOGGER.info("Report-only status %s blocked Cornix breakeven command for %s", signal_status, symbol)
@@ -738,11 +695,12 @@ def run_loop(config: WatcherConfig, journal_path: Path, dry_run: bool = False) -
         try:
             stats = process_once(journal_path, session, config, dry_run=dry_run)
             LOGGER.info(
-                "Position watcher loop: open=%s tp1_reached=%s alerts=%s cornix=%s report_copies=%s duplicates=%s errors=%s",
+                "Position watcher loop: open=%s tp1_reached=%s alerts=%s cornix=%s control_denied=%s report_copies=%s duplicates=%s errors=%s",
                 stats.checked,
                 stats.tp1_reached,
                 stats.alerts_sent,
                 stats.cornix_commands_sent,
+                stats.control_denied,
                 stats.report_copies_sent,
                 stats.skipped_duplicates,
                 stats.errors,
@@ -760,7 +718,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--journal", type=Path, default=JOURNAL)
     parser.add_argument("--once", action="store_true", help="Run one check and exit.")
     parser.add_argument("--dry-run", action="store_true", help="Print alerts and mark CSV in test mode without Telegram.")
-    parser.add_argument("--test-cornix", action="store_true", help="Send one Cornix breakeven test command and exit.")
+    parser.add_argument("--test-cornix", action="store_true", help="Legacy option: denied without live authorization.")
     return parser.parse_args()
 
 
@@ -776,7 +734,7 @@ def main() -> int:
         print(
             "Position watcher checked="
             f"{stats.checked} tp1_reached={stats.tp1_reached} alerts={stats.alerts_sent} "
-            f"duplicates={stats.skipped_duplicates} errors={stats.errors}"
+            f"control_denied={stats.control_denied} duplicates={stats.skipped_duplicates} errors={stats.errors}"
         )
         return 0 if stats.errors == 0 else 1
     run_loop(config, args.journal, dry_run=args.dry_run)

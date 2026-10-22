@@ -272,9 +272,13 @@ def test_internal_signal_channel_routing() -> None:
     notifier._send_message = fake_message  # type: ignore[method-assign]
     notifier._send_photo = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
 
-    assert notifier.send_signal(sample_signal()) is True
+    with patch.object(scanner, "LiveCommandGateway") as gateway:
+        gateway.return_value.send_entry.return_value = "DELIVERY_RECEIPT"
+        assert notifier.send_signal(sample_signal()) is True
+        assert gateway.return_value.send_entry.call_count == 1
+        assert gateway.return_value.send_entry.call_args.args[0].provenance == "SCANNER_PROSPECTIVE"
     assert ("signals", "signals") in calls
-    assert ("cornix", "cornix") in calls
+    assert ("cornix", "cornix") not in calls
     assert not any(channel == "reports" for _chat, channel in calls)
 
     calls.clear()
@@ -406,18 +410,22 @@ def test_london_long_report_only_routing_and_unaffected_signals() -> None:
     london_short = sample_signal()
     london_short.direction = "SHORT"
     london_short.market_session = "London"
-    assert notifier.send_signal(london_short) is True
+    with patch.object(scanner, "LiveCommandGateway") as gateway:
+        gateway.return_value.send_entry.return_value = "DELIVERY_RECEIPT"
+        assert notifier.send_signal(london_short) is True
     assert ("signals", "signals") in [(chat, channel) for chat, channel, _message in calls]
-    assert ("cornix", "cornix") in [(chat, channel) for chat, channel, _message in calls]
+    assert ("cornix", "cornix") not in [(chat, channel) for chat, channel, _message in calls]
     assert not any(channel == "reports" for _chat, channel, _message in calls)
 
     calls.clear()
     asia_long = sample_signal()
     asia_long.direction = "LONG"
     asia_long.market_session = "Asia"
-    assert notifier.send_signal(asia_long) is True
+    with patch.object(scanner, "LiveCommandGateway") as gateway:
+        gateway.return_value.send_entry.return_value = "DELIVERY_RECEIPT"
+        assert notifier.send_signal(asia_long) is True
     assert ("signals", "signals") in [(chat, channel) for chat, channel, _message in calls]
-    assert ("cornix", "cornix") in [(chat, channel) for chat, channel, _message in calls]
+    assert ("cornix", "cornix") not in [(chat, channel) for chat, channel, _message in calls]
     assert not any(channel == "reports" for _chat, channel, _message in calls)
 
 
@@ -612,25 +620,25 @@ def test_external_signal_approved_routes_to_signals_and_cornix_and_logs() -> Non
     external_signal_analyzer.send_telegram_message = fake_send
     external_signal_analyzer.perform_refine_analysis = fake_refine
     try:
-        analysis = external_signal_analyzer.process_external_signal(
-            _vip_long_text(),
-            message_id=6,
-            token="token",
-            signals_chat_id="signals",
-            cornix_chat_id="cornix",
-            reports_chat_id="reports",
-            log_path=path,
-            send=True,
-        )
+        with patch.object(external_signal_analyzer, "LiveCommandGateway") as gateway:
+            gateway.return_value.send_entry.return_value = "DELIVERY_RECEIPT"
+            analysis = external_signal_analyzer.process_external_signal(
+                _vip_long_text(),
+                message_id=6,
+                token="token",
+                signals_chat_id="signals",
+                cornix_chat_id="cornix",
+                reports_chat_id="reports",
+                log_path=path,
+                send=True,
+            )
+            assert gateway.return_value.send_entry.call_count == 1
         assert analysis.recommendation == "APPROVED"
         assert analysis.sent_to_signals is True
         assert analysis.sent_to_cornix is True
         assert any(call[0] == "signals" and call[1] == "external signals" for call in calls)
-        assert any(call[0] == "cornix" and call[1] == "external cornix" for call in calls)
+        assert not any(call[0] == "cornix" for call in calls)
         assert not any(call[0] == "reports" for call in calls)
-        cornix_message = [call[2] for call in calls if call[0] == "cornix"][0]
-        assert "DRY RUN" not in cornix_message
-        assert "DO NOT AUTO TRADE" not in cornix_message
         logged = pd.read_csv(path)
         assert logged.loc[0, "recommendation"] == "APPROVED"
         assert logged.loc[0, "sent_to_signals"] == "YES"
@@ -3631,23 +3639,19 @@ def test_position_watcher_cornix_command_long_short_and_dedupe() -> None:
         try:
             stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
             assert stats.tp1_reached == 1
-            assert stats.cornix_commands_sent == 1
-            assert len(session.posts) == 2
-            assert session.posts[0][0] == "cornix"
-            assert f"{side} HYPEUSDT" in session.posts[0][1]
-            assert "NEW STOP:" in session.posts[0][1]
-            assert session.posts[1][0] == "reports"
+            assert stats.cornix_commands_sent == 0
+            assert len(session.posts) == 1
+            assert session.posts[0][0] == "reports"
             saved = pd.read_csv(path)
             assert int(saved.loc[0, "tp1_alert_sent"]) == 1
-            assert int(saved.loc[0, "cornix_be_command_sent"]) == 1
-            assert float(saved.loc[0, "cornix_be_stop_price"]) == 70.744
+            assert int(saved.loc[0, "cornix_be_command_sent"]) == 0
             assert int(saved.loc[0, "new_stop_notification_sent"]) == 1
             assert saved.loc[0, "new_stop_notification_key"] == f"HYPEUSDT|{side}|70.744"
-            assert str(saved.loc[0, "cornix_be_command_status"]).startswith("SENT")
+            assert str(saved.loc[0, "cornix_be_command_status"]) == "UNTRUSTED_PROVENANCE"
 
             stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
             assert stats.skipped_duplicates == 1
-            assert len(session.posts) == 2
+            assert len(session.posts) == 1
         finally:
             _reset_position_watcher_test_path(path)
 
@@ -3711,16 +3715,15 @@ def test_position_watcher_cross_row_new_stop_dedupe() -> None:
     try:
         stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
         assert stats.tp1_reached == 1
-        assert stats.cornix_commands_sent == 1
+        assert stats.cornix_commands_sent == 0
         assert stats.skipped_duplicates == 1
-        assert len(session.posts) == 2
-        assert session.posts[0][0] == "cornix"
-        assert session.posts[0][1].count("NEW STOP:") == 1
+        assert len(session.posts) == 1
+        assert session.posts[0][0] == "reports"
 
         stats = position_watcher.process_once(path, session, _watcher_config("cornix_command"))
         assert stats.cornix_commands_sent == 0
         assert stats.skipped_duplicates == 2
-        assert len(session.posts) == 2
+        assert len(session.posts) == 1
     finally:
         _reset_position_watcher_test_path(path)
 
@@ -3885,7 +3888,7 @@ def test_position_watcher_command_safety_modes() -> None:
         pd.DataFrame([_watcher_row()]).to_csv(dry_run, index=False)
         session = WatcherFakeSession("72.500")
         stats = position_watcher.process_once(dry_run, session, _watcher_config("cornix_command", dry_run=True))
-        assert stats.cornix_commands_sent == 1
+        assert stats.cornix_commands_sent == 0
         assert len(session.posts) == 1
         assert session.posts[0][0] == "reports"
         assert "DRY RUN - POSITION WATCHER CORNIX COMMAND COPY" in session.posts[0][1]
@@ -3907,11 +3910,8 @@ def test_position_watcher_cornix_breakeven_formats() -> None:
 def test_position_watcher_cornix_test_command() -> None:
     session = WatcherFakeSession("72.500")
     config = _watcher_config("cornix_command")
-    assert position_watcher.send_cornix_test_command(session, config) is True
-    assert len(session.posts) == 1
-    assert session.posts[0][0] == "cornix"
-    assert "LONG HYPEUSDT" in session.posts[0][1]
-    assert "NEW STOP:" in session.posts[0][1]
+    assert position_watcher.send_cornix_test_command(session, config) is False
+    assert session.posts == []
 
 
 def test_velahub_watchdog_threshold_recovery_and_report() -> None:

@@ -64,6 +64,7 @@ from core.setup_strength_prospective_shadow import SetupStrengthProspectiveShado
 from core.sr_trade_weight_gate import SRGateConfig, SRTradeWeightShadowLogger, evaluate_sr_trade_weight
 from core.wave_structure_analyzer import calculate_wave_score
 import manual_live_pilot
+from live_command_gateway import EntryRequest, LiveCommandGateway, canonical_entry_id
 from position_manager import evaluate_new_signal
 
 try:
@@ -362,7 +363,7 @@ class ScannerConfig:
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             telegram_signals_chat_id=os.getenv("TELEGRAM_SIGNALS_CHAT_ID", "").strip(),
-            telegram_cornix_chat_id=os.getenv("TELEGRAM_CORNIX_CHAT_ID", "").strip(),
+            telegram_cornix_chat_id="",  # live entry route belongs to the gateway
             telegram_reports_chat_id=os.getenv("TELEGRAM_REPORTS_CHAT_ID", "").strip(),
             telegram_external_inbox_chat_id=os.getenv("TELEGRAM_EXTERNAL_INBOX_CHAT_ID", "").strip(),
             enable_tier_c_report_only=env_bool("ENABLE_TIER_C_REPORT_ONLY", True),
@@ -1477,12 +1478,11 @@ class TelegramNotifier:
         self.session = build_retry_session()
         LOGGER.info("REPORTS_CHAT_ID=%s", self.config.telegram_reports_chat_id or "-")
         LOGGER.info("SIGNALS_CHAT_ID=%s", self.config.telegram_signals_chat_id or "-")
-        LOGGER.info("CORNIX_CHAT_ID=%s", self.config.telegram_cornix_chat_id or "-")
+        LOGGER.info("Cornix entry delivery is owned by the live-command gateway")
 
     def _channel_chat_id(self, channel: str) -> str:
         mapping = {
             "signals": self.config.telegram_signals_chat_id,
-            "cornix": self.config.telegram_cornix_chat_id,
             "reports": self.config.telegram_reports_chat_id,
         }
         return mapping.get(channel, "").strip()
@@ -1607,11 +1607,18 @@ class TelegramNotifier:
         else:
             delivered = self._send_message(message, signals_chat_id, "signals") or delivered
 
-        cornix_chat_id = self._channel_chat_id("cornix")
-        if not cornix_chat_id:
-            LOGGER.info("Telegram Cornix chat id missing; skipped Cornix message for %s", signal.symbol)
-        else:
-            delivered = self._send_message(self.build_cornix_message(signal), cornix_chat_id, "cornix") or delivered
+        entry = EntryRequest(
+            canonical_signal_id=canonical_entry_id(signal.timestamp.isoformat(), signal.symbol,
+                                                   signal.direction, signal.entry, signal.tp1),
+            symbol=SymbolFormatter.to_binance_symbol(signal.symbol),
+            side=signal.direction,
+            provenance="SCANNER_PROSPECTIVE",
+            approved=True,
+            live_intent=True,
+            payload=self.build_cornix_message(signal),
+        )
+        status = LiveCommandGateway(LOG_DIR / "live_command_audit.sqlite3").send_entry(entry)
+        delivered = status == "DELIVERY_RECEIPT" or delivered
         return delivered
 
     def send_tier_c_report_signal(self, signal: TradeSignal) -> bool:

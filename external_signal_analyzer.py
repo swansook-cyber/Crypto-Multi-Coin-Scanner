@@ -24,6 +24,7 @@ from cornix_agent import (
     alignment_for_direction,
     classify_trend,
 )
+from live_command_gateway import EntryRequest, LiveCommandGateway, canonical_entry_id
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -868,7 +869,20 @@ def route_analysis(
     if analysis.recommendation == "APPROVED":
         analysis.sent_to_signals = send_telegram_message(token, signals_chat_id, build_signals_message(analysis), "external signals")
         LOGGER.info("External signal routed to signals: message_id=%s success=%s", analysis.parsed.message_id, analysis.sent_to_signals)
-        analysis.sent_to_cornix = send_telegram_message(token, cornix_chat_id, build_cornix_message(analysis), "external cornix")
+        entry = EntryRequest(
+            canonical_signal_id=canonical_entry_id("external", analysis.parsed.message_id,
+                                                   analysis.parsed.symbol, analysis.parsed.side),
+            symbol=analysis.parsed.symbol,
+            side=analysis.parsed.side,
+            provenance="EXTERNAL_APPROVED",
+            approved=True,
+            live_intent=True,
+            payload=build_cornix_message(analysis),
+        )
+        analysis.sent_to_cornix = (
+            LiveCommandGateway(LOG_DIR / "live_command_audit.sqlite3").send_entry(entry)
+            == "DELIVERY_RECEIPT"
+        )
         LOGGER.info("External signal routed to cornix: message_id=%s success=%s", analysis.parsed.message_id, analysis.sent_to_cornix)
     else:
         LOGGER.info(
