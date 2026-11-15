@@ -1,0 +1,12 @@
+[Unit]
+Description=Crypto Outcome Checker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/Crypto-Multi-Coin-Scanner
+Environment=PYTHONUNBUFFERED=1
+Environment=OUTCOME_LOOP_MODE=0
+ExecStart=/opt/Crypto-Multi-Coin-Scanner/.venv/bin/python /opt/Crypto-Multi-Coin-Scanner/review_signals.py --notify
+TimeoutStartSec=10min

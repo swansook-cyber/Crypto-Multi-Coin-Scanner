@@ -8,6 +8,7 @@ import time
 import argparse
 import sys
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +52,7 @@ OUTCOME_EXCHANGE = "Binance"
 OUTCOME_MARKET_TYPE = "USDT-M Futures"
 OUTCOME_TIMEFRAME = "15m"
 ERROR_RETRY_SECONDS = 60
+OUTCOME_LOCK = BASE_DIR / "logs" / "outcome_checker.lock"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,6 +126,10 @@ EXTERNAL_OUTCOME_COLUMNS = {
 
 PROCESSED_OUTCOMES: set[str] = set()
 
+
+class OutcomeCheckerAlreadyRunning(RuntimeError):
+    pass
+
 @dataclass
 class Outcome:
     result: str
@@ -141,6 +147,9 @@ class ReviewStats:
     skipped_alerts: int = 0
     sent_alerts: int = 0
     errors: int = 0
+    scanned_rows: int = 0
+    eligible_rows: int = 0
+    duplicate_rows: int = 0
 
 
 def env_int(name: str, default: int) -> int:
@@ -155,6 +164,40 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+@contextmanager
+def outcome_checker_lock(path: Path = OUTCOME_LOCK):
+    """Prevent timer, operator, and legacy loop invocations from overlapping."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise OutcomeCheckerAlreadyRunning(str(exc)) from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def telegram_channel_ids() -> dict[str, str]:
@@ -296,10 +339,18 @@ def reload_journal() -> pd.DataFrame | None:
 
 def persist_journal(df: pd.DataFrame) -> None:
     JOURNAL.parent.mkdir(parents=True, exist_ok=True)
-    with JOURNAL.open("w", newline="", encoding="utf-8") as handle:
-        df.to_csv(handle, index=False)
-        handle.flush()
-        os.fsync(handle.fileno())
+    temporary = JOURNAL.with_name(f".{JOURNAL.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            df.to_csv(handle, index=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, JOURNAL)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
     LOGGER.info("CSV persisted: %s", JOURNAL)
 
 
@@ -1096,6 +1147,60 @@ def should_skip_outcome_alert(row: pd.Series, outcome_id: str, resend_unsent: bo
     return outcome_id in PROCESSED_OUTCOMES
 
 
+def review_identity(row: pd.Series) -> str:
+    existing = str(row.get("canonical_signal_key", "") or "").strip()
+    if existing.startswith(("sig:v1:", "id:v1:")):
+        return existing
+    return canonical_signal_key(
+        symbol=row.get("symbol"),
+        side=row.get("side"),
+        timestamp=normalize_timestamp(row.get("timestamp")),
+        entry=row.get("entry"),
+    )
+
+
+def review_window_open(row: pd.Series, lookahead_hours: int, now: pd.Timestamp | None = None) -> bool:
+    timestamp = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+    if pd.isna(timestamp):
+        return False
+    current = now if now is not None else pd.Timestamp.now(tz="UTC")
+    return current <= timestamp + pd.Timedelta(hours=lookahead_hours)
+
+
+def needs_incremental_review(
+    row: pd.Series,
+    *,
+    lifecycle_boundary: pd.Timestamp,
+    lookahead_hours: int,
+    notify: bool,
+    resend_unsent: bool,
+    force_resend: bool,
+    now: pd.Timestamp | None = None,
+) -> tuple[bool, bool]:
+    """Return (eligible, needs_lifecycle_evidence) without changing lifecycle rules."""
+    result = str(row.get("result", "OPEN") or "OPEN").strip().upper()
+    state = str(row.get("lifecycle_state", "") or "").strip().upper()
+    candidate_time = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+    prospective = not pd.isna(candidate_time) and not pd.isna(lifecycle_boundary) and candidate_time >= lifecycle_boundary
+    terminal_lifecycle = state in TERMINAL_REPORTING_STATES
+    immutable_ambiguity = str(row.get("lifecycle_same_candle_ambiguous", 0)).strip().lower() in {
+        "1", "1.0", "true", "yes"
+    }
+    evidence_candidate = prospective and not terminal_lifecycle and not immutable_ambiguity and (
+        result == "OPEN"
+        or (result == "WIN" and str(row.get("hit_target", "")).strip().upper() in {"", "TP1"})
+        or state in {"", "TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}
+    )
+    window_open = review_window_open(row, lookahead_hours, now)
+    needs_evidence = evidence_candidate and (not state or window_open)
+    alert_candidate = False
+    if result in {"WIN", "LOSS"} and notify:
+        outcome_id = build_outcome_id(row)
+        alert_candidate = not should_skip_outcome_alert(row, outcome_id, resend_unsent, force_resend)
+    outcome_candidate = result == "OPEN" and (not state or window_open)
+    return outcome_candidate or needs_evidence or alert_candidate, needs_evidence
+
+
 def run_review_cycle(
     notify: bool,
     session: requests.Session,
@@ -1121,12 +1226,16 @@ def run_review_cycle(
 
     open_mask = df["result"].astype(str).str.upper() == "OPEN"
     stats.open_trades = int(open_mask.sum())
+    stats.scanned_rows = len(df)
+    lifecycle_boundary = pd.to_datetime(shadow_start_utc, utc=True, errors="coerce")
+    cycle_now = pd.Timestamp.now(tz="UTC")
+    changed = False
+    seen_review_keys: set[str] = set()
 
     for index, row in df.iterrows():
         previous_result = str(row.get("result", "OPEN")).upper()
         lifecycle_state = str(row.get("lifecycle_state", "") or "").strip().upper()
         candidate_time = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
-        lifecycle_boundary = pd.to_datetime(shadow_start_utc, utc=True, errors="coerce")
         is_prospective_lifecycle = (
             not pd.isna(candidate_time)
             and not pd.isna(lifecycle_boundary)
@@ -1134,18 +1243,43 @@ def run_review_cycle(
         )
         if is_prospective_lifecycle and not lifecycle_state and apply_legacy_terminal_lifecycle(df, index, row):
             lifecycle_state = str(df.at[index, "lifecycle_state"])
-        needs_lifecycle_evidence = is_prospective_lifecycle and (
-            previous_result == "OPEN"
-            or (previous_result == "WIN" and str(row.get("hit_target", "")).upper() in {"", "TP1"})
-            or lifecycle_state in {"", "TP1_TOUCHED_REMAINDER_OPEN", "UNRESOLVED_REMAINDER"}
+            changed = True
+            row = df.loc[index]
+        eligible, needs_lifecycle_evidence = needs_incremental_review(
+            row,
+            lifecycle_boundary=lifecycle_boundary,
+            lookahead_hours=lookahead_hours,
+            notify=notify,
+            resend_unsent=resend_unsent,
+            force_resend=force_resend,
+            now=cycle_now,
         )
+        if not eligible:
+            continue
+        identity = review_identity(row)
+        if identity in seen_review_keys:
+            stats.duplicate_rows += 1
+            LOGGER.warning("Outcome review duplicate canonical key skipped: %s", identity)
+            continue
+        seen_review_keys.add(identity)
+        stats.eligible_rows += 1
         needs_candles = previous_result == "OPEN" or needs_lifecycle_evidence
         candles = pd.DataFrame()
         if needs_candles:
             try:
                 candles = candles_for_signal(session, row, lookahead_hours)
                 if needs_lifecycle_evidence:
+                    tracked = (
+                        "lifecycle_state", "lifecycle_r", "lifecycle_terminal", "tp1_touch_time_utc",
+                        "remainder_resolution_time_utc", "lifecycle_same_candle_ambiguous", "lifecycle_reason",
+                    )
+                    def semantic(value: Any) -> Any:
+                        return "" if value is None or pd.isna(value) else value
+
+                    before = tuple(semantic(df.at[index, column]) for column in tracked)
                     apply_reporting_lifecycle(df, index, row, candles)
+                    after = tuple(semantic(df.at[index, column]) for column in tracked)
+                    changed = changed or before != after
                     record_post_tp1_shadow(telemetry, row, candles, shadow_start_utc)
             except (requests.RequestException, ValueError, KeyError) as exc:
                 stats.errors += 1
@@ -1171,6 +1305,7 @@ def run_review_cycle(
             updated_for_metrics = df.loc[index]
             df.at[index, "holding_minutes"] = f"{holding_minutes(updated_for_metrics):.1f}"
             df.at[index, "net_r_estimate"] = f"{net_r_from_journal(updated_for_metrics):.4f}"
+            changed = True
             if is_tp1_alert_already_sent(row) and outcome.result in {"WIN", "LOSS"}:
                 LOGGER.info(
                     "Outcome review confirmed final result after watcher alert: symbol=%s result=%s hit_target=%s",
@@ -1188,7 +1323,6 @@ def run_review_cycle(
         updated_row = df.loc[index]
         updated_result = str(updated_row.get("result", "")).upper()
         if updated_result not in {"WIN", "LOSS"}:
-            time.sleep(0.2)
             continue
 
         outcome_id = build_outcome_id(updated_row)
@@ -1199,16 +1333,13 @@ def run_review_cycle(
                 updated_row.get("symbol", ""),
                 updated_row.get("tp1_alert_source", ""),
             )
-            time.sleep(0.2)
             continue
         if should_skip_outcome_alert(updated_row, outcome_id, resend_unsent, force_resend):
             stats.skipped_alerts += 1
             LOGGER.info("Outcome duplicate skipped: %s", updated_row.get("outcome_id", outcome_id))
-            time.sleep(0.2)
             continue
         if not notify:
             stats.skipped_alerts += 1
-            time.sleep(0.2)
             continue
 
         LOGGER.info(
@@ -1242,18 +1373,28 @@ def run_review_cycle(
             df.at[index, "outcome_alert_sent_at"] = df.at[index, "outcome_alert_at"]
             df.at[index, "outcome_id"] = outcome_id
             persist_journal(df)
+            changed = True
         else:
             stats.skipped_alerts += 1
             LOGGER.error("Outcome alert not marked sent because Telegram delivery failed: %s", outcome_id)
         time.sleep(0.2)
 
-    persist_journal(df)
-    sync_signal_history(df)
+    if changed:
+        persist_journal(df)
+        sync_signal_history(df)
+    else:
+        LOGGER.info("Outcome cycle made no semantic changes; journal/history write skipped")
     external_stats = review_external_signals(session, lookahead_hours)
     stats.open_trades += external_stats.open_trades
     stats.tp_hits += external_stats.tp_hits
     stats.sl_hits += external_stats.sl_hits
     stats.errors += external_stats.errors
+    LOGGER.info(
+        "Outcome cycle workload scanned=%s eligible=%s canonical_duplicates=%s",
+        stats.scanned_rows,
+        stats.eligible_rows,
+        stats.duplicate_rows,
+    )
     if print_report:
         print_summary(df)
     return stats
@@ -1297,18 +1438,23 @@ def main() -> int:
     if args.test_report:
         return 0 if send_test_report(session) else 1
 
-    if loop_mode:
-        return run_loop(notify=True, lookahead_hours=lookahead_hours, interval_seconds=interval_seconds)
+    try:
+        with outcome_checker_lock():
+            if loop_mode:
+                return run_loop(notify=True, lookahead_hours=lookahead_hours, interval_seconds=interval_seconds)
 
-    notify = (args.notify or args.resend_unsent or args.force_resend_outcome_alerts) and not args.dry_run
-    run_review_cycle(
-        notify=notify,
-        session=session,
-        lookahead_hours=lookahead_hours,
-        print_report=True,
-        resend_unsent=args.resend_unsent,
-        force_resend=args.force_resend_outcome_alerts,
-    )
+            notify = (args.notify or args.resend_unsent or args.force_resend_outcome_alerts) and not args.dry_run
+            run_review_cycle(
+                notify=notify,
+                session=session,
+                lookahead_hours=lookahead_hours,
+                print_report=True,
+                resend_unsent=args.resend_unsent,
+                force_resend=args.force_resend_outcome_alerts,
+            )
+    except OutcomeCheckerAlreadyRunning as exc:
+        LOGGER.error("Outcome checker overlap prevented: %s", exc)
+        return 75
     return 0
 
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Crypto Outcome Checker every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=15min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=crypto-outcome-checker.service
+
+[Install]
+WantedBy=timers.target

@@ -352,12 +352,19 @@ def reconstruct_one(row: Mapping[str, Any], candles: pd.DataFrame, cutoff_utc: s
         name: _value(row, name, "stop_loss" if name == "sl" else name)
         for name in ("entry", "sl", "tp1", "tp2")
     }
-    evidence = [] if ordered.empty else ordered[["open_time", "high", "low", "close_time"]].astype(str).values.tolist()
+    evidence_rows = ordered
+    effective_cutoff = cutoff
+    if terminal_at:
+        terminal_time = parse_utc_mixed(terminal_at)
+        if not pd.isna(terminal_time):
+            evidence_rows = ordered[ordered["close_time"] <= terminal_time]
+            effective_cutoff = terminal_time
+    evidence = [] if evidence_rows.empty else evidence_rows[["open_time", "high", "low", "close_time"]].astype(str).values.tolist()
     return Reconstruction(
         signal_key(row), timestamp, normalize_symbol(_value(row, "symbol")), normalize_side(_value(row, "side", "direction")),
         state, lifecycle_r, tp1_at, terminal_at, 0.5, 0.5, ambiguous, reason, SOURCE,
         RECONSTRUCTION_VERSION, reconstructed_at_utc or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        PRICE_SOURCE, PRICE_INTERVAL, cutoff.isoformat().replace("+00:00", "Z"), _hash(geometry), _hash(evidence),
+        PRICE_SOURCE, PRICE_INTERVAL, effective_cutoff.isoformat().replace("+00:00", "Z"), _hash(geometry), _hash(evidence),
     )
 
 
